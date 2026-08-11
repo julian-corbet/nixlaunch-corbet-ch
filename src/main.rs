@@ -267,6 +267,22 @@ thread_local! {
     static REVEAL: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
 }
 
+/// Start resident but invisible, so the FIRST press of the day is as fast as the second.
+///
+/// Residency only pays from the second open onwards, and the first is the one a person actually
+/// notices -- it is the press after login, when nothing is warm. A session service runs
+/// `nixlaunch --daemon` at start: the process builds everything, asks the machines, decodes what
+/// the icon cache does not have, and then does not show itself. The first real press is already
+/// a map.
+///
+/// Checked from argv directly rather than through GApplication's command line handling, because
+/// the single-instance path must NOT inherit it: `nixlaunch --daemon` starts the primary hidden,
+/// and a later plain `nixlaunch` fires `activate` on that same process, which presents it. Two
+/// different meanings for two different invocations, and only the first one reads a flag.
+fn start_hidden() -> bool {
+    std::env::args().any(|a| a == "--daemon")
+}
+
 fn main() {
     // The renderer choice belongs to the PROGRAM, not to one packaging of it.
     //
@@ -1071,7 +1087,11 @@ fn build(application: &Application) {
     }
     window.add_controller(keys);
 
-    window.present();
+    // `--daemon` builds everything and shows nothing. The window still EXISTS, which is what keeps
+    // the application alive and what makes the later `activate` a present() rather than a start.
+    if !start_hidden() {
+        window.present();
+    }
 }
 
 /// Config if there is one, fixture data if there is not.
