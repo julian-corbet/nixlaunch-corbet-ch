@@ -18,6 +18,12 @@ use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct App {
+    /// WHAT THIS APP IS, as opposed to what it calls itself. Placement and usage are both keyed on
+    /// this and never on `name`, because a display name is not an identity: it is translated, it is
+    /// upstream's choice rather than the packager's, and two entries sharing one is ordinary.
+    /// Keyed on the name, two such apps collapsed into a single row and whichever lost became
+    /// unlaunchable -- and the arrangement of one silently drove the other.
+    pub id: String,
     pub name: String,
     pub icon: String,
     /// The `Exec` line as the inventory reported it, field codes and all. Kept verbatim rather
@@ -112,6 +118,18 @@ pub fn load_placement() -> (Placement, Option<String>) {
 /// the next drag makes that permanent. Write beside it and rename, which is atomic on any POSIX
 /// filesystem, so a reader sees the old file or the new one and never a truncated one.
 pub fn save_placement(p: &Placement) {
+    // NEVER FROM A TEST. `place_app` saves as part of doing its job, so every placement test was
+    // writing the fixture arrangement -- machine "m", apps "Foot" and "Brand New" -- straight over
+    // the real file in the developer's own state directory. Inside the Nix sandbox HOME is a
+    // throwaway and it went unnoticed; anyone running `cargo test` on their own machine lost their
+    // arrangement to it, silently, and this is how one such file was found.
+    //
+    // A cfg guard rather than a redirected path: tests share one process, so pointing
+    // XDG_STATE_HOME somewhere else would race between parallel test threads and leave the
+    // protection depending on which test ran first.
+    if cfg!(test) {
+        return;
+    }
     write_atomic(&placement_path(), p);
 }
 
@@ -203,6 +221,86 @@ impl State {
         usage::save(&self.usage);
     }
 
+    /// Rewrite state written when placement and usage were keyed on the DISPLAY NAME.
+    ///
+    /// Changing a key without migrating is the same thing as deleting the file: every entry stops
+    /// matching, the grid falls back to the computed grouping, and the user's arrangement is gone
+    /// with no error and nothing to restore it from. So the change and the migration ship together.
+    ///
+    /// The test for "is this token an old one" is deliberately not a guess about its shape -- an id
+    /// is opaque by contract, and "it ends in .desktop" is one provider's habit rather than a rule.
+    /// A token is old when it is NOT a known id AND IS a known name. That is self-limiting: after
+    /// the rewrite nothing matches it any more, so running it again is a no-op, and a token that is
+    /// neither (an app since uninstalled) is left exactly where it is, because those entries are
+    /// carried on purpose -- see `materialise`.
+    ///
+    /// AMBIGUITY RESOLVES TO NOTHING. If two apps share a display name, an old entry naming it
+    /// cannot say which was meant, and picking one would silently hand the other's arrangement to
+    /// the wrong app. The entry is left alone instead: the apps then appear in their computed
+    /// folders, which is visible and fixable with a drag, where a wrong guess is neither.
+    pub fn migrate_names_to_ids(&mut self) {
+        let mut touched = false;
+        for m in &self.base {
+            let mut ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut by_name: HashMap<&str, Vec<&str>> = HashMap::new();
+            for lines in &m.cells {
+                for l in lines {
+                    for a in &l.apps {
+                        ids.insert(a.id.as_str());
+                        by_name.entry(a.name.as_str()).or_default().push(a.id.as_str());
+                    }
+                }
+            }
+            let rename = |token: &String| -> Option<String> {
+                if ids.contains(token.as_str()) {
+                    return None;
+                }
+                match by_name.get(token.as_str()) {
+                    Some(candidates) if candidates.len() == 1 => Some(candidates[0].to_string()),
+                    _ => None,
+                }
+            };
+
+            if let Some(folders) = self.placement.get_mut(&m.name) {
+                for lines in folders.values_mut() {
+                    for l in lines.iter_mut() {
+                        for token in l.iter_mut() {
+                            if let Some(id) = rename(token) {
+                                *token = id;
+                                touched = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Usage keys are "<machine>\u{1}<app>", so the same rewrite applies to the second half.
+            let prefix = format!("{}\u{1}", m.name);
+            let moves: Vec<(String, String)> = self
+                .usage
+                .keys()
+                .filter_map(|k| {
+                    let app = k.strip_prefix(&prefix)?;
+                    rename(&app.to_string()).map(|id| (k.clone(), usage::key(&m.name, &id)))
+                })
+                .collect();
+            for (from, to) in moves {
+                if let Some(entry) = self.usage.remove(&from) {
+                    self.usage.insert(to, entry);
+                    touched = true;
+                }
+            }
+        }
+
+        // Written once, so the next start has nothing to do. Skipped entirely when nothing moved,
+        // which is every start after the first -- a migration that rewrote both state files on
+        // every launch would be a needless write on the path this program is judged by.
+        if touched {
+            save_placement(&self.placement);
+            usage::save(&self.usage);
+        }
+    }
+
     /// Re-derive the grid from the pristine inventory plus the user's filings, then re-filter.
     /// Called on startup and after every drop, so there is exactly one path from
     /// (inventory, placement) to what is on screen.
@@ -259,7 +357,7 @@ impl State {
                 // row order, which usage may have permuted -- pairing it with canonical cells would
                 // file every row's contents under a neighbouring row's name.
                 self.canonical_folders[r].clone(),
-                lines.iter().map(|l| l.apps.iter().map(|a| a.name.clone()).collect()).collect(),
+                lines.iter().map(|l| l.apps.iter().map(|a| a.id.clone()).collect()).collect(),
             );
         }
         // MERGE, never replace. An app named in the placement but absent from today's inventory
@@ -507,11 +605,11 @@ impl State {
 pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> Vec<Machine> {
     base.iter()
         .map(|m| {
-            let mut by_name: HashMap<&str, &App> = HashMap::new();
+            let mut by_id: HashMap<&str, &App> = HashMap::new();
             for lines in &m.cells {
                 for l in lines {
                     for app in &l.apps {
-                        by_name.insert(app.name.as_str(), app);
+                        by_id.insert(app.id.as_str(), app);
                     }
                 }
             }
@@ -535,7 +633,7 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
                     let Some(lines) = arranged_folders.get(fname.as_str()) else { continue };
                     for l in lines {
                         let apps: Vec<App> =
-                            l.iter().filter_map(|n| by_name.get(n.as_str()).map(|a| (*a).clone())).collect();
+                            l.iter().filter_map(|n| by_id.get(n.as_str()).map(|a| (*a).clone())).collect();
                         if !apps.is_empty() {
                             cells[fi].push(Line { apps });
                         }
@@ -546,7 +644,7 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
             for (r, lines) in m.cells.iter().enumerate() {
                 for l in lines {
                     let apps: Vec<App> =
-                        l.apps.iter().filter(|a| !placed.contains(a.name.as_str())).cloned().collect();
+                        l.apps.iter().filter(|a| !placed.contains(a.id.as_str())).cloned().collect();
                     if !apps.is_empty() {
                         cells[r].push(Line { apps });
                     }
@@ -634,11 +732,11 @@ pub fn apply_usage(
         let name = m.name.clone();
         for cell in m.cells.iter_mut() {
             for line in cell.iter_mut() {
-                usage::reorder_stable(&mut line.apps, |a| usage::score_of(u, &name, &a.name, now, hl), z);
+                usage::reorder_stable(&mut line.apps, |a| usage::score_of(u, &name, &a.id, now, hl), z);
             }
             usage::reorder_stable(
                 cell,
-                |l| l.apps.iter().map(|a| usage::score_of(u, &name, &a.name, now, hl)).sum::<f64>(),
+                |l| l.apps.iter().map(|a| usage::score_of(u, &name, &a.id, now, hl)).sum::<f64>(),
                 z,
             );
         }
@@ -659,7 +757,7 @@ pub fn apply_usage(
                     .map(|cell| {
                         cell.iter()
                             .flat_map(|l| l.apps.iter())
-                            .map(|a| usage::score_of(u, &m.name, &a.name, now, hl))
+                            .map(|a| usage::score_of(u, &m.name, &a.id, now, hl))
                             .sum::<f64>()
                     })
                     .unwrap_or(0.0)
@@ -685,7 +783,7 @@ pub fn apply_usage(
 }
 
 pub fn a(name: &str, icon: &str) -> App {
-    App { name: name.into(), icon: icon.into(), exec: name.to_lowercase(), terminal: false }
+    App { id: name.into(), name: name.into(), icon: icon.into(), exec: name.to_lowercase(), terminal: false }
 }
 
 pub fn line(apps: Vec<App>) -> Line {
@@ -770,7 +868,7 @@ mod tests {
     }
 
     fn app(n: &str) -> App {
-        App { name: n.into(), icon: "x".into(), exec: n.to_lowercase(), terminal: false }
+        App { id: n.into(), name: n.into(), icon: "x".into(), exec: n.to_lowercase(), terminal: false }
     }
 
     /// One machine, one folder, with the given lines. `folder` indexes DEFAULT_FOLDERS.
@@ -945,7 +1043,7 @@ mod tests {
     }
 
     fn appx(name: &str, exec: &str) -> App {
-        App { name: name.into(), icon: "x".into(), exec: exec.into(), terminal: false }
+        App { id: name.into(), name: name.into(), icon: "x".into(), exec: exec.into(), terminal: false }
     }
 
     /// Unhandled field codes must be REMOVED, not passed through. Left in place, "%U" becomes a
@@ -1197,6 +1295,99 @@ mod tests {
 
         assert_eq!(s.item, 2, "a rebuild is not a query");
         assert_eq!(s.item_goal, 2);
+    }
+
+    /// An app with an id distinct from its name, for the identity tests below.
+    fn app_id(id: &str, name: &str) -> App {
+        App { id: id.into(), name: name.into(), icon: "x".into(), exec: id.into(), terminal: false }
+    }
+
+    /// TWO APPS, ONE DISPLAY NAME. This is the whole reason ids exist.
+    ///
+    /// `org.kde.foo.desktop` and `foo.desktop` both calling themselves "Foo" is ordinary. Keyed on
+    /// the name they were one object: filing one filed both, and whichever the lookup did not
+    /// return became unreachable.
+    #[test]
+    fn two_apps_sharing_a_name_stay_distinct() {
+        let mut m = machine("m", 0, vec![]);
+        m.cells[0] = vec![Line { apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")] }];
+        let mut s = state(vec![m]);
+
+        // File ONE of them somewhere else, by its id.
+        s.place_app(0, "b.desktop", 4, None, None);
+
+        let terminals: Vec<&str> =
+            s.machines[0].cells[0].iter().flat_map(|l| l.apps.iter()).map(|a| a.id.as_str()).collect();
+        let files: Vec<&str> =
+            s.machines[0].cells[4].iter().flat_map(|l| l.apps.iter()).map(|a| a.id.as_str()).collect();
+        assert_eq!(terminals, vec!["a.desktop"], "the other one stayed put");
+        assert_eq!(files, vec!["b.desktop"], "and only the named one moved");
+    }
+
+    /// An arrangement written before ids existed must survive, or the change is a silent delete.
+    #[test]
+    fn an_arrangement_written_under_names_is_migrated() {
+        let mut m = machine("m", 0, vec![]);
+        m.cells[0] = vec![Line { apps: vec![app_id("helix.desktop", "Helix")] }];
+        let mut s = state(vec![m]);
+
+        // What the old code would have written: the DISPLAY NAME, in a different folder.
+        let mut folders = HashMap::new();
+        folders.insert("Editors".to_string(), vec![vec!["Helix".to_string()]]);
+        s.placement.insert("m".to_string(), folders);
+        s.usage.insert(usage::key("m", "Helix"), usage::Entry { score: 9.0, last: 0 });
+
+        s.migrate_names_to_ids();
+        s.rebuild();
+
+        assert_eq!(s.placement["m"]["Editors"], vec![vec!["helix.desktop".to_string()]]);
+        assert!(s.usage.contains_key(&usage::key("m", "helix.desktop")), "the score came too");
+        assert!(!s.usage.contains_key(&usage::key("m", "Helix")), "and did not stay behind");
+        assert_eq!(
+            s.machines[0].cells[1][0].apps[0].id, "helix.desktop",
+            "and the arrangement still applies: it is in Editors, not its computed folder"
+        );
+    }
+
+    /// Running it twice must change nothing the second time, or a later start could rewrite an id
+    /// that happens to collide with some other app's display name.
+    #[test]
+    fn the_migration_is_idempotent() {
+        let mut m = machine("m", 0, vec![]);
+        m.cells[0] = vec![Line { apps: vec![app_id("helix.desktop", "Helix")] }];
+        let mut s = state(vec![m]);
+        let mut folders = HashMap::new();
+        folders.insert("Editors".to_string(), vec![vec!["Helix".to_string()]]);
+        s.placement.insert("m".to_string(), folders);
+
+        s.migrate_names_to_ids();
+        let once = s.placement.clone();
+        s.migrate_names_to_ids();
+        assert_eq!(s.placement, once);
+    }
+
+    /// An AMBIGUOUS old entry is left alone rather than guessed.
+    ///
+    /// If two apps share the display name an old entry records, nothing in the file says which was
+    /// meant. Picking one hands the other's arrangement to the wrong app, silently and with no way
+    /// to notice; leaving it drops both back to their computed folders, which is visible and one
+    /// drag from fixed.
+    #[test]
+    fn an_ambiguous_name_is_not_guessed() {
+        let mut m = machine("m", 0, vec![]);
+        m.cells[0] = vec![Line { apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")] }];
+        let mut s = state(vec![m]);
+        let mut folders = HashMap::new();
+        folders.insert("Editors".to_string(), vec![vec!["Foo".to_string()]]);
+        s.placement.insert("m".to_string(), folders);
+
+        s.migrate_names_to_ids();
+
+        assert_eq!(
+            s.placement["m"]["Editors"],
+            vec![vec!["Foo".to_string()]],
+            "untouched -- an unresolvable entry is left, not resolved to a coin flip"
+        );
     }
 
     /// Dropping an item into the gap it already occupies is a no-op, not a shuffle.

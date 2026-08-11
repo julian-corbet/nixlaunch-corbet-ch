@@ -139,6 +139,11 @@ pub fn load() -> Usage {
 /// Atomic, for the same reason placement is: a truncated score file parses as "never used
 /// anything", which silently discards every ordering the user has earned.
 pub fn save(usage: &Usage) {
+    // Not from a test, for the reason `save_placement` sets out at length: recording a launch
+    // saves, so every test that records one was overwriting the developer's real score file.
+    if cfg!(test) {
+        return;
+    }
     crate::model::write_atomic(&usage_path(), usage);
 }
 

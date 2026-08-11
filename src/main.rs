@@ -292,6 +292,11 @@ fn build(application: &Application) {
         focus: Focus::Outside,
         query: String::new(),
     }));
+    // Carry arrangements written before ids existed. Runs before the first rebuild, because a
+    // rebuild against unmigrated state would find nothing and draw the computed grouping -- which
+    // looks exactly like "my arrangement is gone".
+    state.borrow_mut().migrate_names_to_ids();
+
     // Applies saved filings, then populates `view` with an empty query, i.e. everything.
     state.borrow_mut().rebuild();
 
@@ -603,7 +608,7 @@ fn build(application: &Application) {
                             // transformations away from the placement it would be written to. The
                             // names survive both; see `place_app`'s own account.
                             let names: Vec<String> =
-                                ln.apps.iter().map(|a| a.name.clone()).collect();
+                                ln.apps.iter().map(|a| a.id.clone()).collect();
                             tgt.connect_drop(move |_, value, x, _| {
                                 let Ok(payload) = value.get::<String>() else { return false };
                                 let Some((from_col, name)) = payload.split_once('\u{1}') else {
@@ -642,7 +647,7 @@ fn build(application: &Application) {
                             {
                                 let src = gtk::DragSource::new();
                                 src.set_actions(gtk::gdk::DragAction::MOVE);
-                                let payload = format!("{}\u{1}{}", c, app.name);
+                                let payload = format!("{}\u{1}{}", c, app.id);
                                 src.connect_prepare(move |_, _, _| {
                                     Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
                                 });
@@ -742,7 +747,7 @@ fn build(application: &Application) {
                             if !all.is_empty() {
                                 for app in &all {
                                     spawn(&machine, app, &terminal_cmd);
-                                    s.record_launch(&machine.name, &app.name);
+                                    s.record_launch(&machine.name, &app.id);
                                 }
                                 window.close();
                                 return gtk::glib::Propagation::Stop;
@@ -784,7 +789,7 @@ fn build(application: &Application) {
                         if !apps.is_empty() {
                             for app in &apps {
                                 spawn(&machine, app, &terminal_cmd);
-                                s.record_launch(&machine.name, &app.name);
+                                s.record_launch(&machine.name, &app.id);
                             }
                             // A launcher that stays up after launching is a window you then have
                             // to dismiss. Closing IS the confirmation.
@@ -942,7 +947,16 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
                     cells[r].push(Line {
                         apps: chunk
                             .iter()
-                            .map(|a| App { name: a.name.clone(), icon: a.icon.clone(), exec: a.exec.clone(), terminal: a.terminal })
+                            .map(|a| App {
+                                // No id from this provider means it predates the field, and the
+                                // name is the best identity available -- which is exactly the old
+                                // behaviour, correct until two of its apps share a display name.
+                                id: a.id.clone().unwrap_or_else(|| a.name.clone()),
+                                name: a.name.clone(),
+                                icon: a.icon.clone(),
+                                exec: a.exec.clone(),
+                                terminal: a.terminal,
+                            })
                             .collect(),
                     });
                 }

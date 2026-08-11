@@ -64,6 +64,12 @@ pub struct InventoryFolder {
 #[derive(Deserialize, Debug, Clone)]
 pub struct InventoryApp {
     pub name: String,
+    /// The provider's own stable identity for this application -- `rlaunch --json` emits the
+    /// desktop-entry filename. OPTIONAL, defaulting to the name, so a provider that predates this
+    /// field still parses: such an inventory behaves exactly as the program did before ids
+    /// existed, which is correct until two of its apps share a display name.
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub icon: String,
     #[serde(default)]
