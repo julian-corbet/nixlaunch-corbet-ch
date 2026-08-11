@@ -508,7 +508,14 @@ fn build(application: &Application) {
                 let head = Label::new(None);
                 head.set_xalign(0.0);
                 head.add_css_class("colhead");
-                head.set_hexpand(true);
+                // NOT hexpand. A widget in a horizontal SizeGroup already takes the width of the
+                // widest member, and asking it to ALSO absorb spare width makes the two rules
+                // circular: the group's width depends on the allocation, the allocation depends on
+                // the group's width, and inside a ScrolledWindow propagating its child's natural
+                // size the loop has nothing to damp it. The symptom was not a wrong layout -- it
+                // was a window that repainted ~21 times a second forever and never went idle,
+                // roughly one launch in six. The SizeGroup alone gives equal machine columns; the
+                // window sizes to content regardless, so nothing needs to absorb slack.
                 cols.add_widget(&head);
                 // A machine that could not be asked says so IN ITS OWN HEADING, next to its name.
                 // The alternative -- an empty column -- reads identically to a machine that simply
@@ -543,7 +550,6 @@ fn build(application: &Application) {
                     let lines = &m.cells[r];
                     let cell = GBox::new(Orientation::Vertical, 2);
                     cell.add_css_class("cell");
-                    cell.set_hexpand(true);
                     cols.add_widget(&cell);
                     // Dropping onto a cell files the app into that folder, for that machine,
                     // permanently. Same column only -- see the drag payload's own note.
