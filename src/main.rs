@@ -324,12 +324,19 @@ fn main() {
         }
         build(app);
     });
-    // `run()`, NOT `run_with_args(&[])`. An EMPTY argv is not "no arguments" to GApplication --
+    // OUR flags are ours, and GApplication must never see them. It parses argv itself and rejects
+    // anything it does not recognise: `--daemon` produced "Unknown option --daemon" on stderr and
+    // an immediate exit 0. The symptom was a daemon that started and vanished a moment later,
+    // which reads exactly like a lifetime bug -- and sent me to `hold()` first, which was not the
+    // problem at all. Filtering here is the fix; `start_hidden` still reads the real argv.
+    let argv: Vec<String> = std::env::args().filter(|a| a != "--daemon").collect();
+
+    // `run_with_args(&argv)`, NOT `run_with_args(&[])`. An EMPTY argv is not "no arguments" --
     // argv[0] is the program name and g_application_run treats the vector as malformed without
     // it, returning without ever emitting `activate`. The symptom is the worst kind: the process
     // starts, GTK initialises far enough to probe Vulkan, and then simply exits no window, no
     // error. Cost an iteration to find; noted here so it costs nobody another one.
-    application.run();
+    application.run_with_args(&argv);
 }
 
 fn build(application: &Application) {
@@ -1087,9 +1094,17 @@ fn build(application: &Application) {
     }
     window.add_controller(keys);
 
-    // `--daemon` builds everything and shows nothing. The window still EXISTS, which is what keeps
-    // the application alive and what makes the later `activate` a present() rather than a start.
-    if !start_hidden() {
+    // `--daemon` builds everything and shows nothing, so the later `activate` is a present() and
+    // not a start.
+    //
+    // The HOLD is not belt-and-braces, it is the whole thing: an unpresented window does not keep
+    // a GtkApplication alive. Reasoning said it should -- the application exits when its last
+    // window is DESTROYED, and this one never is -- but the process simply exited three seconds
+    // in, every time. `hold` raises the use count explicitly and is the documented way to say
+    // "stay running with nothing on screen", which is exactly what a daemon is.
+    if start_hidden() {
+        application.hold();
+    } else {
         window.present();
     }
 }
