@@ -144,6 +144,22 @@ in
       '';
     };
 
+    terminal = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "foot" "-e" ];
+      description = ''
+        argv that wraps a program whose desktop entry declares `Terminal=true` — it draws no window
+        of its own and must be given one.
+
+        Not defaulted to any particular emulator on purpose. The right answer is whatever terminal
+        this desktop already uses, and a launcher that opened a DIFFERENT one from the rest of the
+        session would be wrong in a way nobody would think to look for. Left empty, such programs
+        are launched bare, start without a controlling terminal, and exit immediately — which looks
+        exactly like a keypress that did nothing.
+      '';
+    };
+
     machines = lib.mkOption {
       type = lib.types.listOf (lib.types.submodule machineModule);
       default = [ ];
@@ -182,7 +198,7 @@ in
     # schema, so anything that type-checks here serialises correctly by construction and there is
     # no second place for the two to disagree.
     xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
-      inherit (cfg) folders;
+      inherit (cfg) folders terminal;
       machines = map (m: { inherit (m) name accent inventory launch; }) cfg.machines;
     } // lib.optionalAttrs (cfg.theme != { }) { inherit (cfg) theme; });
   };

@@ -24,6 +24,10 @@ pub struct App {
     /// than pre-split: splitting is the launcher's job and the raw string is what a future
     /// provider will keep giving us.
     pub exec: String,
+    /// `Terminal=true` in the desktop entry: this program draws no window of its own and MUST be
+    /// given one. Ignoring it is not a degraded launch, it is no launch at all -- the process
+    /// starts with no controlling terminal and dies immediately, silently.
+    pub terminal: bool,
 }
 
 /// A line IS an appset: the apps on it are meant to be started together, and the fact that they
@@ -409,7 +413,7 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
 ///
 /// Splitting is `shlex`, not `split_whitespace`: an Exec may legitimately quote an argument
 /// containing spaces, and naive splitting turns one path into two broken ones.
-pub fn launch_argv(machine: &Machine, app: &App) -> Vec<String> {
+pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Vec<String> {
     let stripped: String = app
         .exec
         .split_whitespace()
@@ -417,6 +421,13 @@ pub fn launch_argv(machine: &Machine, app: &App) -> Vec<String> {
         .collect::<Vec<_>>()
         .join(" ");
     let mut argv = machine.launch.clone();
+    // ORDER MATTERS, and it is the non-obvious part: the machine prefix comes FIRST, then the
+    // terminal, then the program. A terminal emulator for a remote program has to run on the
+    // remote machine -- `<forward> foot -e helix`, never `foot -e <forward> helix`, which would
+    // open a local window and then try to forward from inside it.
+    if app.terminal {
+        argv.extend(terminal.iter().cloned());
+    }
     argv.extend(shlex::split(&stripped).unwrap_or_else(|| vec![stripped.clone()]));
     argv
 }
@@ -501,7 +512,7 @@ pub fn apply_usage(
 }
 
 pub fn a(name: &str, icon: &str) -> App {
-    App { name: name.into(), icon: icon.into(), exec: name.to_lowercase() }
+    App { name: name.into(), icon: icon.into(), exec: name.to_lowercase(), terminal: false }
 }
 
 pub fn line(apps: Vec<App>) -> Line {
@@ -580,7 +591,7 @@ mod tests {
     use super::*;
 
     fn app(n: &str) -> App {
-        App { name: n.into(), icon: "x".into(), exec: n.to_lowercase() }
+        App { name: n.into(), icon: "x".into(), exec: n.to_lowercase(), terminal: false }
     }
 
     /// One machine, one folder, with the given lines. `folder` indexes DEFAULT_FOLDERS.
@@ -754,7 +765,7 @@ mod tests {
     }
 
     fn appx(name: &str, exec: &str) -> App {
-        App { name: name.into(), icon: "x".into(), exec: exec.into() }
+        App { name: name.into(), icon: "x".into(), exec: exec.into(), terminal: false }
     }
 
     /// Unhandled field codes must be REMOVED, not passed through. Left in place, "%U" becomes a
@@ -762,10 +773,10 @@ mod tests {
     #[test]
     fn field_codes_are_stripped() {
         let m = machine("m", 0, vec![vec!["x"]]);
-        assert_eq!(launch_argv(&m, &appx("Firefox", "firefox %u")), vec!["firefox"]);
-        assert_eq!(launch_argv(&m, &appx("Files", "thunar %F")), vec!["thunar"]);
+        assert_eq!(launch_argv(&m, &appx("Firefox", "firefox %u"), &[]), vec!["firefox"]);
+        assert_eq!(launch_argv(&m, &appx("Files", "thunar %F"), &[]), vec!["thunar"]);
         assert_eq!(
-            launch_argv(&m, &appx("Foot", "foot --server %i")),
+            launch_argv(&m, &appx("Foot", "foot --server %i"), &[]),
             vec!["foot", "--server"],
             "only the codes go, the real flags stay"
         );
@@ -775,7 +786,7 @@ mod tests {
     #[test]
     fn a_bare_percent_is_not_a_field_code() {
         let m = machine("m", 0, vec![vec!["x"]]);
-        assert_eq!(launch_argv(&m, &appx("odd", "prog 100%")), vec!["prog", "100%"]);
+        assert_eq!(launch_argv(&m, &appx("odd", "prog 100%"), &[]), vec!["prog", "100%"]);
     }
 
     /// Splitting is shlex, so a quoted argument containing spaces stays ONE argument. Naive
@@ -784,8 +795,33 @@ mod tests {
     fn quoted_arguments_survive_splitting() {
         let m = machine("m", 0, vec![vec!["x"]]);
         assert_eq!(
-            launch_argv(&m, &appx("q", "prog --path \"/a b/c\" --flag")),
+            launch_argv(&m, &appx("q", "prog --path \"/a b/c\" --flag"), &[]),
             vec!["prog", "--path", "/a b/c", "--flag"]
+        );
+    }
+
+    /// A Terminal=true program is wrapped, and the ORDER is the part worth pinning: machine
+    /// prefix, then terminal, then program. The other order opens a local window and tries to
+    /// forward from inside it.
+    #[test]
+    fn a_terminal_program_is_wrapped_in_the_right_order() {
+        let mut m = machine("remote", 0, vec![vec!["x"]]);
+        m.launch = vec!["fwd@remote".to_string()];
+        let mut app = appx("Helix", "helix %F");
+        app.terminal = true;
+        assert_eq!(
+            launch_argv(&m, &app, &["foot".to_string(), "-e".to_string()]),
+            vec!["fwd@remote", "foot", "-e", "helix"]
+        );
+    }
+
+    /// A graphical program must NOT be wrapped even when a terminal is configured.
+    #[test]
+    fn a_graphical_program_is_not_wrapped() {
+        let m = machine("m", 0, vec![vec!["x"]]);
+        assert_eq!(
+            launch_argv(&m, &appx("Firefox", "firefox %u"), &["foot".to_string(), "-e".to_string()]),
+            vec!["firefox"]
         );
     }
 
@@ -795,7 +831,7 @@ mod tests {
         let mut m = machine("remote", 0, vec![vec!["x"]]);
         m.launch = vec!["waypipe@remote".to_string()];
         assert_eq!(
-            launch_argv(&m, &appx("Helix", "helix %F")),
+            launch_argv(&m, &appx("Helix", "helix %F"), &[]),
             vec!["waypipe@remote", "helix"]
         );
     }

@@ -150,7 +150,7 @@ fn build(application: &Application) {
         window.set_keyboard_mode(KeyboardMode::OnDemand);
     }
 
-    let (folders, base, theme, config_error) = load_world();
+    let (folders, base, theme, terminal_cmd_outer, config_error) = load_world();
 
     let provider = CssProvider::new();
     provider.load_from_string(&css(&theme));
@@ -457,6 +457,7 @@ fn build(application: &Application) {
         let state = state.clone();
         let window = window.clone();
         let render = render.clone();
+        let terminal_cmd = terminal_cmd_outer.clone();
         keys.connect_key_pressed(move |_, key, _, mods| {
             let shift = mods.contains(ModifierType::SHIFT_MASK);
             {
@@ -502,7 +503,7 @@ fn build(application: &Application) {
                                 s.cell().iter().flat_map(|l| l.apps.iter().cloned()).collect();
                             if !all.is_empty() {
                                 for app in &all {
-                                    spawn(&machine, app);
+                                    spawn(&machine, app, &terminal_cmd);
                                     s.record_launch(&machine.name, &app.name);
                                 }
                                 window.close();
@@ -544,7 +545,7 @@ fn build(application: &Application) {
                         };
                         if !apps.is_empty() {
                             for app in &apps {
-                                spawn(&machine, app);
+                                spawn(&machine, app, &terminal_cmd);
                                 s.record_launch(&machine.name, &app.name);
                             }
                             // A launcher that stays up after launching is a window you then have
@@ -584,15 +585,15 @@ fn build(application: &Application) {
 /// repo testable by someone with no fleet. A config that EXISTS but does not parse is a different
 /// thing entirely and is reported rather than silently replaced by fixtures, because silently
 /// showing invented machines when the real ones failed to load is the worst of both.
-fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Option<String>) {
+fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, Option<String>) {
     let default_rows = || DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect::<Vec<_>>();
     match config::load() {
-        Err(e) => (default_rows(), fixture(), config::Theme::default(), Some(e)),
-        Ok(None) => (default_rows(), fixture(), config::Theme::default(), None),
+        Err(e) => (default_rows(), fixture(), config::Theme::default(), vec![], Some(e)),
+        Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
             let machines = cfg.machines.iter().map(|mc| inventory(mc, &rows, cfg.theme.line_width)).collect();
-            (rows, machines, cfg.theme.clone(), None)
+            (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), None)
         }
     }
 }
@@ -647,7 +648,7 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
                     cells[r].push(Line {
                         apps: chunk
                             .iter()
-                            .map(|a| App { name: a.name.clone(), icon: a.icon.clone(), exec: a.exec.clone() })
+                            .map(|a| App { name: a.name.clone(), icon: a.icon.clone(), exec: a.exec.clone(), terminal: a.terminal })
                             .collect(),
                     });
                 }
@@ -668,8 +669,16 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
 ///
 /// Failures are reported, not swallowed: a missing binary is exactly the case where silence would
 /// look like the keypress never registered.
-fn spawn(machine: &Machine, app: &App) {
-    let argv = launch_argv(machine, app);
+fn spawn(machine: &Machine, app: &App, terminal: &[String]) {
+    if app.terminal && terminal.is_empty() {
+        // Say so rather than launching something that will vanish: a terminal program spawned
+        // without one exits immediately, and the user sees a keypress that did nothing.
+        eprintln!(
+            "nixlaunch: {} needs a terminal and none is configured (set `terminal` in config)",
+            app.name
+        );
+    }
+    let argv = launch_argv(machine, app, terminal);
     let Some((bin, args)) = argv.split_first() else {
         eprintln!("nixlaunch: {} has no exec line", app.name);
         return;

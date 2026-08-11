@@ -148,6 +148,14 @@ impl Default for Theme {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub machines: Vec<MachineConfig>,
+    /// argv that wraps a program declaring `Terminal=true` -- e.g. `["foot", "-e"]`.
+    ///
+    /// Not guessed, and not defaulted to some popular emulator: the right answer is whatever
+    /// terminal this desktop already uses, and a launcher that opened a DIFFERENT one than every
+    /// other part of the session would be wrong in a way nobody would think to look for. Empty
+    /// means such programs are launched bare, which is what happens today and why they die.
+    #[serde(default)]
+    pub terminal: Vec<String>,
     #[serde(default)]
     pub theme: Theme,
     /// Row order. "Other" is appended automatically if absent and forced last if present -- it is

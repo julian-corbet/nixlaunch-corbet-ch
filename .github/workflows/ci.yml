@@ -1,0 +1,50 @@
+# CI -- one job, one command. `nix flake check` already builds the package (whose checkPhase is
+# `cargo test`) and evaluates the module checks, so a separate cargo step here would be a second,
+# weaker copy of a gate the flake already owns -- and one that could pass while the flake fails.
+
+name: check
+
+on:
+  push:
+  pull_request:
+
+# A push to a branch that has an open PR fires both triggers. Without this the second run only
+# spends minutes re-proving what the first one is proving right now.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # DeterminateSystems/nix-installer-action@v16 rather than cachix/install-nix-action: it
+      # installs daemon-mode Nix with nix-command and flakes already on. The alternative needs an
+      # `extra_nix_config` block, which puts the decision of *which Nix features exist* in the
+      # workflow file -- so CI and a developer's machine can drift apart without either noticing.
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      # nix-community/cache-nix-action@v6 rather than cachix/cachix-action: Cachix needs a signing
+      # key in repository secrets, and a pull request from a fork cannot read secrets -- so fork PRs
+      # would be the uncached, slow runs, which are exactly the runs that most need to be quick.
+      # This one uses GitHub's own cache, so it works for every contributor with no account.
+      #
+      # The key covers all three things that decide the closure: the nixpkgs pin (flake.lock), the
+      # derivation (*.nix), and the vendored crates (Cargo.lock). Source changes deliberately do not
+      # bust it -- they rebuild one crate against a restored dependency store.
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/*.nix', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          # GitHub evicts a repository's least-recently-used caches once they total 10 GB. A bounded
+          # store keeps this cache from being the reason some other one vanishes.
+          gc-max-store-size-linux: 1G
+
+      # -L streams build logs. Without it a failing `cargo test` surfaces as "derivation failed"
+      # with the assertion folded away, which is the difference between reading CI and rerunning it.
+      - run: nix flake check -L
