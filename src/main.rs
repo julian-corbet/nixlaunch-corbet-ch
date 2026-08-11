@@ -34,11 +34,11 @@ use gtk::{
 };
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 
 mod config;
+mod icons;
 mod model;
 mod usage;
 use model::*;
@@ -174,50 +174,6 @@ impl Painted {
     }
 }
 
-/// Icons at the size they are DRAWN, loaded once.
-///
-/// GTK's own `Image::from_icon_name` resolves the name to a FILE and keeps a texture at that
-/// file's resolution, scaling it down at draw time. That is right for an application showing a few
-/// icons and ruinous here: desktop entries ship whatever size upstream felt like -- 192, 256, many
-/// at 512 -- and this grid holds a couple of hundred of them at twenty pixels. Measured on a real
-/// three-machine inventory, icons were 106MB of the process's 116MB of private dirty memory: the
-/// same 191 applications with their icon names blanked came to 16MB. Ninety percent of a launcher's
-/// footprint was pixels nobody could see.
-///
-/// So: resolve the name, load the file DOWNSCALED, and keep only the small texture. A 20px icon is
-/// 1.6kB where its 512px source is a megabyte.
-///
-/// SVGs are left to GTK deliberately. A vector icon is rasterised at the size it is asked for, so
-/// it never had this problem, and routing it through the pixbuf loader would add a dependency on
-/// librsvg being installed to gain nothing.
-///
-/// CACHED BY NAME, which matters for more than the duplicates: the grid is rebuilt on every
-/// keystroke of a query, and without a cache each rebuild re-read every icon file from disk.
-fn icon_texture(
-    name: &str,
-    px: i32,
-    theme: &gtk::IconTheme,
-    cache: &Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>>,
-) -> Option<gtk::gdk::Texture> {
-    if name.is_empty() {
-        return None;
-    }
-    if let Some(hit) = cache.borrow().get(name) {
-        return hit.clone();
-    }
-    let made = theme
-        .lookup_icon(name, &[], px, 1, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
-        .file()
-        .and_then(|f| f.path())
-        // A miss here is not a failure: no file, or an SVG, both fall through to GTK's own path,
-        // which is correct for them.
-        .filter(|p| p.extension().is_none_or(|e| e != "svg"))
-        .and_then(|p| gtk::gdk_pixbuf::Pixbuf::from_file_at_size(&p, px, px).ok())
-        .map(|pb| gtk::gdk::Texture::for_pixbuf(&pb));
-    cache.borrow_mut().insert(name.to_string(), made.clone());
-    made
-}
-
 fn class<W: IsA<gtk::Widget>>(w: &W, name: &str, on: bool) {
     if on {
         w.add_css_class(name);
@@ -340,6 +296,9 @@ fn build(application: &Application) {
         eprintln!("nixlaunch: {e}");
     }
 
+    // Created before anything can use it, and named apart from the module it comes from.
+    let icon_cache = Rc::new(RefCell::new(icons::Icons::load(theme.icon_size)));
+
     let state = Rc::new(RefCell::new(State {
         canonical_folders: folders.clone(),
         folders,
@@ -372,11 +331,18 @@ fn build(application: &Application) {
     // rather than before it, because the point is to return decode scratch AFTER the decoding is
     // done -- and it is deliberately not on the rebuild path: walking the heap on every keystroke
     // would trade the memory back for the latency this program is judged on.
-    gtk::glib::idle_add_local_once(|| {
-        unsafe {
-            malloc_trim(0);
-        }
-    });
+    {
+        // After the first frame, not before it: writing the cache is worth nothing until the
+        // decoding that fills it has happened, and doing either ahead of the draw would be paying
+        // latency to save latency.
+        let icon_cache = icon_cache.clone();
+        gtk::glib::idle_add_local_once(move || {
+            icon_cache.borrow().save();
+            unsafe {
+                malloc_trim(0);
+            }
+        });
+    }
 
     let root = GBox::new(Orientation::Vertical, 0);
     root.add_css_class("root");
@@ -509,8 +475,6 @@ fn build(application: &Application) {
     let icon_theme = gtk::gdk::Display::default()
         .map(|d| gtk::IconTheme::for_display(&d))
         .unwrap_or_default();
-    let icons: Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>> =
-        Rc::new(RefCell::new(HashMap::new()));
 
     // `render` must be callable from inside a drop handler that `render` itself installed, so it
     // needs a handle to itself. The holder is that indirection -- filled in immediately after
@@ -621,7 +585,7 @@ fn build(application: &Application) {
         let paint = paint.clone();
         let icon_px = theme.icon_size;
         let icon_theme = icon_theme.clone();
-        let icons = icons.clone();
+        let icon_cache = icon_cache.clone();
         move || {
             let s = state.borrow();
 
@@ -790,7 +754,7 @@ fn build(application: &Application) {
                                 });
                                 b.add_controller(src);
                             }
-                            let img = match icon_texture(&app.icon, icon_px, &icon_theme, &icons) {
+                            let img = match icon_cache.borrow_mut().texture(&app.icon, &icon_theme) {
                                 Some(tex) => Image::from_paintable(Some(&tex)),
                                 None => Image::from_icon_name(&app.icon),
                             };
