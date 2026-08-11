@@ -30,7 +30,11 @@ pub struct Line {
 pub struct Machine {
     pub name: String,
     pub accent: String,
-    /// Parallel to `FOLDERS`: cells[r] is this machine's lines for folder r. An empty cell is a
+    /// Why this machine could not be asked, if it could not. Carried rather than raised: an
+    /// unreachable peer is a normal state on a roaming laptop, and a column drawn with a reason on
+    /// it is honest, where an empty column is indistinguishable from a machine that has nothing.
+    pub error: Option<String>,
+    /// Parallel to the row set: cells[r] is this machine's lines for folder r. An empty cell is a
     /// real and common state worth DRAWING rather than collapsing -- it tells you "archlxc has no
     /// chat client" at a glance, which a list-based launcher can only tell you by absence.
     pub cells: Vec<Vec<Line>>,
@@ -44,7 +48,11 @@ pub struct Machine {
 /// silently joining a list of two hundred. Filing it from there is a drag, and the filing sticks
 /// (see `Placement`). The inventory side already agrees -- rlaunch's own bucket() returns "Other"
 /// for anything unmatched and orders it last.
-pub const FOLDERS: &[&str] =
+/// The fallback row set, used only when there is no config to read one from -- a bare checkout
+/// with no fleet still runs. The REAL row set is `State::folders`, supplied by config, because the
+/// grouping table is a per-estate value and hardcoding it here would make this repo carry one
+/// operator's taxonomy as though it were a fact about launchers.
+pub const DEFAULT_FOLDERS: &[&str] =
     &["Terminals", "Editors", "Browsers", "Chat", "Files", "Media", "Other"];
 
 /// The user's own ARRANGEMENT of a machine's apps: machine -> folder label -> lines of app names.
@@ -97,6 +105,8 @@ pub enum Focus {
 }
 
 pub struct State {
+    /// The row set, in order, ending in the inbox. From config; see `DEFAULT_FOLDERS`.
+    pub folders: Vec<String>,
     /// The inventory EXACTLY as the category table produced it. Never mutated: filing an app is
     /// recorded in `placement` and re-applied, so a re-inventory can replace this wholesale and
     /// every filing survives. Mutating the grid in place instead would make the user's decisions
@@ -136,7 +146,7 @@ impl State {
     /// Called on startup and after every drop, so there is exactly one path from
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
-        self.machines = apply_placement(&self.base, &self.placement);
+        self.machines = apply_placement(&self.base, &self.placement, &self.folders);
         self.refilter();
     }
 
@@ -155,7 +165,7 @@ impl State {
                 continue;
             }
             folders.insert(
-                FOLDERS[r].to_string(),
+                self.folders[r].clone(),
                 lines.iter().map(|l| l.apps.iter().map(|a| a.name.clone()).collect()).collect(),
             );
         }
@@ -186,7 +196,7 @@ impl State {
             lines.retain(|l| !l.is_empty());
         }
 
-        let lines = folders.entry(FOLDERS[folder].to_string()).or_default();
+        let lines = folders.entry(self.folders[folder].clone()).or_default();
         match target_line {
             // The target line can have vanished in the removal above (it held only this app), so
             // an out-of-range index degrades to "its own line" rather than panicking.
@@ -214,6 +224,7 @@ impl State {
             .map(|m| Machine {
                 name: m.name.clone(),
                 accent: m.accent.clone(),
+                error: m.error.clone(),
                 cells: m
                     .cells
                     .iter()
@@ -244,7 +255,7 @@ impl State {
         if !self.cell().is_empty() {
             return;
         }
-        for r in 0..FOLDERS.len() {
+        for r in 0..self.folders.len() {
             for c in 0..self.view.len() {
                 if !self.view[c].cells[r].is_empty() {
                     self.row = r;
@@ -262,7 +273,7 @@ impl State {
     /// inventories differ in length between machines, or the moment a filter empties something.
     pub fn clamp(&mut self) {
         self.col = self.col.min(self.view.len().saturating_sub(1));
-        self.row = self.row.min(FOLDERS.len().saturating_sub(1));
+        self.row = self.row.min(self.folders.len().saturating_sub(1));
         let lines = self.cell().len();
         if lines == 0 {
             self.line = 0;
@@ -286,7 +297,7 @@ impl State {
 ///
 /// Names that no longer resolve are skipped rather than removed from the arrangement -- uninstall
 /// something and reinstall it later and it returns to where you put it.
-pub fn apply_placement(base: &[Machine], p: &Placement) -> Vec<Machine> {
+pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> Vec<Machine> {
     base.iter()
         .map(|m| {
             let mut by_name: HashMap<&str, &App> = HashMap::new();
@@ -310,11 +321,11 @@ pub fn apply_placement(base: &[Machine], p: &Placement) -> Vec<Machine> {
                 }
             }
 
-            let mut cells: Vec<Vec<Line>> = vec![Vec::new(); FOLDERS.len()];
+            let mut cells: Vec<Vec<Line>> = vec![Vec::new(); folders.len()];
 
-            if let Some(folders) = arranged {
-                for (fi, fname) in FOLDERS.iter().enumerate() {
-                    let Some(lines) = folders.get(*fname) else { continue };
+            if let Some(arranged_folders) = arranged {
+                for (fi, fname) in folders.iter().enumerate() {
+                    let Some(lines) = arranged_folders.get(fname.as_str()) else { continue };
                     for l in lines {
                         let apps: Vec<App> =
                             l.iter().filter_map(|n| by_name.get(n.as_str()).map(|a| (*a).clone())).collect();
@@ -335,7 +346,7 @@ pub fn apply_placement(base: &[Machine], p: &Placement) -> Vec<Machine> {
                 }
             }
 
-            Machine { name: m.name.clone(), accent: m.accent.clone(), cells }
+            Machine { name: m.name.clone(), accent: m.accent.clone(), error: m.error.clone(), cells }
         })
         .collect()
 }
@@ -361,6 +372,7 @@ pub fn fixture() -> Vec<Machine> {
         Machine {
             name: "elitebook".into(),
             accent: "#166534".into(),
+            error: None,
             cells: vec![
                 vec![line(vec![a("Foot", "foot"), a("Foot Client", "foot")]), line(vec![a("Foot Server", "foot")])],
                 vec![
@@ -379,6 +391,7 @@ pub fn fixture() -> Vec<Machine> {
         Machine {
             name: "archlxc".into(),
             accent: "#B45309".into(),
+            error: None,
             cells: vec![
                 vec![line(vec![a("Foot", "foot"), a("Alacritty", "Alacritty")])],
                 vec![line(vec![a("Helix", "helix"), a("Zed", "dev.zed.Zed")])],
@@ -395,6 +408,7 @@ pub fn fixture() -> Vec<Machine> {
         Machine {
             name: "devhome".into(),
             accent: "#9F1239".into(),
+            error: None,
             cells: vec![
                 vec![line(vec![a("Foot", "foot")])],
                 vec![line(vec![a("Helix", "helix"), a("Nano", "nano")])],
@@ -422,16 +436,17 @@ mod tests {
         App { name: n.into(), icon: "x".into() }
     }
 
-    /// One machine, one folder, with the given lines. `folder` indexes FOLDERS.
+    /// One machine, one folder, with the given lines. `folder` indexes DEFAULT_FOLDERS.
     fn machine(name: &str, folder: usize, lines: Vec<Vec<&str>>) -> Machine {
-        let mut cells: Vec<Vec<Line>> = vec![Vec::new(); FOLDERS.len()];
+        let mut cells: Vec<Vec<Line>> = vec![Vec::new(); DEFAULT_FOLDERS.len()];
         cells[folder] =
             lines.into_iter().map(|l| Line { apps: l.into_iter().map(app).collect() }).collect();
-        Machine { name: name.into(), accent: "#fff".into(), cells }
+        Machine { name: name.into(), accent: "#fff".into(), error: None, cells }
     }
 
     fn state(machines: Vec<Machine>) -> State {
         let mut s = State {
+            folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
             base: machines,
             placement: Placement::new(),
             machines: Vec::new(),
@@ -444,7 +459,7 @@ mod tests {
             focus: Focus::Outside,
             query: String::new(),
         };
-        s.machines = apply_placement(&s.base, &s.placement);
+        s.machines = apply_placement(&s.base, &s.placement, &s.folders);
         s.refilter();
         s
     }
@@ -554,9 +569,10 @@ mod tests {
         let base = vec![machine("m", 0, vec![vec!["a", "b"]])];
         let mut p = Placement::new();
         let mut folders = HashMap::new();
-        folders.insert(FOLDERS[0].to_string(), vec![vec!["a".to_string(), "ghost".to_string(), "b".to_string()]]);
+        folders.insert(DEFAULT_FOLDERS[0].to_string(), vec![vec!["a".to_string(), "ghost".to_string(), "b".to_string()]]);
         p.insert("m".to_string(), folders);
-        let out = apply_placement(&base, &p);
+        let rows: Vec<String> = DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect();
+        let out = apply_placement(&base, &p, &rows);
         let names: Vec<&str> = out[0].cells[0][0].apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"], "ghost skipped, order of the survivors kept");
     }
@@ -579,7 +595,7 @@ mod tests {
         s.item_goal = 99;
         s.clamp();
         assert!(s.col < s.view.len(), "column in range");
-        assert!(s.row < FOLDERS.len(), "row in range");
+        assert!(s.row < s.folders.len(), "row in range");
         if s.cell().is_empty() {
             assert_eq!(s.focus, Focus::Outside, "an empty cell must not hold you inside it");
         } else {

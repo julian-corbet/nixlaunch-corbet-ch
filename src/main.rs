@@ -141,8 +141,14 @@ fn build(application: &Application) {
         window.set_keyboard_mode(KeyboardMode::OnDemand);
     }
 
+    let (folders, base, config_error) = load_world();
+    if let Some(e) = &config_error {
+        eprintln!("nixlaunch: {e}");
+    }
+
     let state = Rc::new(RefCell::new(State {
-        base: fixture(),
+        folders,
+        base,
         placement: load_placement(),
         machines: Vec::new(),
         view: Vec::new(),
@@ -160,12 +166,42 @@ fn build(application: &Application) {
     let root = GBox::new(Orientation::Vertical, 0);
     root.add_css_class("root");
 
+    // The search bar begins where the FIRST MACHINE COLUMN begins, not at the window edge: it
+    // searches the machines, not the folder labels, so starting it over the label gutter would
+    // line it up with the one thing it has nothing to do with. `spacer` is an empty widget put in
+    // the same size group as the folder labels each render, so it tracks that column's real width
+    // instead of guessing a margin that goes wrong the moment a folder is renamed.
+    let searchrow = GBox::new(Orientation::Horizontal, 0);
+    let spacer = Label::new(None);
+    searchrow.append(&spacer);
+
     let search = Label::new(None);
     search.set_xalign(0.0);
+    search.set_hexpand(true);
     search.add_css_class("search");
-    // The one fixed measurement in the layout -- see the window comment above.
-    search.set_width_request(760);
-    root.append(&search);
+    search.set_width_request(560);
+    searchrow.append(&search);
+    root.append(&searchrow);
+
+    // A real inventory is hundreds of applications, and "size to content" -- correct for the
+    // fixture -- turns that into a window taller than the display, clipped at both ends with no
+    // way to reach the middle. The grid keeps its natural size until it hits a ceiling and then
+    // scrolls, so a small estate still gets a window that hugs its content.
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_propagate_natural_width(true);
+    // Relative to the DISPLAY, not a magic number. A launcher that is 820px tall is fine on this
+    // panel and wrong on the next one, and the failure is not cosmetic -- overrun the screen and
+    // the top and bottom are simply unreachable, since a layer surface has no titlebar to drag.
+    // Two thirds leaves the session visible behind it, which is most of why this is an overlay
+    // rather than a window.
+    let screen_h = gtk::gdk::Display::default()
+        .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
+        .map(|m| m.geometry().height())
+        .filter(|h| *h > 0)
+        .unwrap_or(1080);
+    scroller.set_max_content_height((screen_h as f64 * 0.66) as i32);
 
     let grid = gtk::Grid::new();
     // NOT column-homogeneous. That makes EVERY column the same width including column 0, which
@@ -174,7 +210,8 @@ fn build(application: &Application) {
     // Instead the machine columns carry `hexpand` (set per cell below) and share the spare width
     // equally between themselves, while column 0 takes only the width its longest label needs.
     grid.set_column_homogeneous(false);
-    root.append(&grid);
+    scroller.set_child(Some(&grid));
+    root.append(&scroller);
 
     let hint = Label::new(None);
     hint.set_xalign(0.0);
@@ -192,6 +229,7 @@ fn build(application: &Application) {
         let state = state.clone();
         let grid = grid.clone();
         let search = search.clone();
+        let spacer = spacer.clone();
         let hint = hint.clone();
         let holder = render_holder.clone();
         move || {
@@ -215,6 +253,10 @@ fn build(application: &Application) {
             // stops reading as a grid. A horizontal SizeGroup sizes every member to the widest of
             // them and leaves column 0 alone, which is exactly the subset rule Grid cannot express.
             let cols = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+            // Rebuilt every render rather than kept: the row-head widgets are recreated each time,
+            // and a long-lived group would accumulate memberships for widgets that no longer exist.
+            let labelcol = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+            labelcol.add_widget(&spacer);
 
             for (c, m) in s.view.iter().enumerate() {
                 let head = Label::new(None);
@@ -222,19 +264,30 @@ fn build(application: &Application) {
                 head.add_css_class("colhead");
                 head.set_hexpand(true);
                 cols.add_widget(&head);
-                head.set_markup(&format!(
-                    "<span foreground=\"{}\">{}</span>",
-                    m.accent,
-                    escape(&m.name)
-                ));
+                // A machine that could not be asked says so IN ITS OWN HEADING, next to its name.
+                // The alternative -- an empty column -- reads identically to a machine that simply
+                // has nothing installed, which is the one thing it must not be confused with.
+                head.set_markup(&match &m.error {
+                    None => format!("<span foreground=\"{}\">{}</span>", m.accent, escape(&m.name)),
+                    Some(e) => format!(
+                        "<span foreground=\"{}\">{}</span>  <span foreground=\"#B91322\" size=\"small\">{}</span>",
+                        m.accent,
+                        escape(&m.name),
+                        escape(e.lines().next().unwrap_or("unreachable"))
+                    ),
+                });
+                if let Some(e) = &m.error {
+                    head.set_tooltip_text(Some(e));
+                }
                 grid.attach(&head, c as i32 + 1, 0, 1, 1);
             }
 
-            for (r, folder) in FOLDERS.iter().enumerate() {
+            for (r, folder) in s.folders.iter().enumerate() {
                 let rh = Label::new(Some(folder));
                 rh.set_xalign(1.0);
                 rh.set_valign(Align::Center);
                 rh.add_css_class("rowhead");
+                labelcol.add_widget(&rh);
                 if r == s.row {
                     rh.add_css_class("active");
                 }
@@ -404,7 +457,10 @@ fn build(application: &Application) {
                         s.col = (s.col + 1).min(s.view.len().saturating_sub(1))
                     }
                     (Focus::Outside, Key::Up) => s.row = s.row.saturating_sub(1),
-                    (Focus::Outside, Key::Down) => s.row = (s.row + 1).min(FOLDERS.len() - 1),
+                    (Focus::Outside, Key::Down) => {
+                        let last = s.folders.len().saturating_sub(1);
+                        s.row = (s.row + 1).min(last);
+                    }
                     (Focus::Outside, Key::Return) => {
                         if shift {
                             let all: Vec<String> = s
@@ -471,6 +527,91 @@ fn build(application: &Application) {
     window.add_controller(keys);
 
     window.present();
+}
+
+/// Config if there is one, fixture data if there is not.
+///
+/// A MISSING config is not an error -- a bare checkout must still run, which is what keeps this
+/// repo testable by someone with no fleet. A config that EXISTS but does not parse is a different
+/// thing entirely and is reported rather than silently replaced by fixtures, because silently
+/// showing invented machines when the real ones failed to load is the worst of both.
+/// Apps per line when packing a fresh inventory. Not a layout constant so much as a navigation
+/// one: it is how many left/right steps a row costs before up/down is the faster move.
+const LINE_WIDTH: usize = 4;
+
+fn load_world() -> (Vec<String>, Vec<Machine>, Option<String>) {
+    let default_rows = || DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+    match config::load() {
+        Err(e) => (default_rows(), fixture(), Some(e)),
+        Ok(None) => (default_rows(), fixture(), None),
+        Ok(Some(cfg)) => {
+            let rows = cfg.folder_rows();
+            let machines = cfg.machines.iter().map(|mc| inventory(mc, &rows)).collect();
+            (rows, machines, None)
+        }
+    }
+}
+
+/// Ask ONE machine what it has, by running the command config named for it.
+///
+/// Everything this program knows about detection is in these few lines: run argv, read JSON. No
+/// SSH, no .desktop parsing, no package managers -- see config.rs on why that boundary is the
+/// point rather than a simplification.
+fn inventory(mc: &config::MachineConfig, rows: &[String]) -> Machine {
+    let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
+    let mut error = None;
+
+    let parsed = mc
+        .inventory
+        .split_first()
+        .ok_or_else(|| "no inventory command configured".to_string())
+        .and_then(|(bin, args)| {
+            std::process::Command::new(bin)
+                .args(args)
+                .output()
+                .map_err(|e| format!("{bin}: {e}"))
+        })
+        .and_then(|out| {
+            if out.status.success() {
+                serde_json::from_slice::<config::Inventory>(&out.stdout)
+                    .map_err(|e| format!("unreadable inventory: {e}"))
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+            }
+        });
+
+    match parsed {
+        Ok(inv) => {
+            // The machine reporting its own failure outranks anything inferred here.
+            error = inv.error;
+            for folder in inv.folders {
+                // A label this estate does not list falls into the inbox rather than being
+                // dropped: an app nobody categorised must still be reachable.
+                let r = rows
+                    .iter()
+                    .position(|x| *x == folder.label)
+                    .unwrap_or(rows.len().saturating_sub(1));
+                // PACK, do not stack. A fresh inventory has no appsets in it -- an appset is
+                // something the user makes by dragging -- so giving every app a line of its own
+                // produces a cell as tall as the folder is long, and destroys the 2D navigation
+                // inside the box: up/down would step one app at a time and left/right would do
+                // nothing. Chunking into rows of `LINE_WIDTH` makes a cell a small grid, which is
+                // what the inside of a box is supposed to be. The fixture hid this completely,
+                // because hand-written fixtures are always short.
+                for chunk in folder.apps.chunks(LINE_WIDTH) {
+                    cells[r].push(Line {
+                        apps: chunk
+                            .iter()
+                            .map(|a| App { name: a.name.clone(), icon: a.icon.clone() })
+                            .collect(),
+                    });
+                }
+            }
+        }
+        Err(e) => error = Some(e),
+    }
+
+    Machine { name: mc.name.clone(), accent: mc.accent.clone(), error, cells }
 }
 
 fn escape(s: &str) -> String {
