@@ -180,26 +180,27 @@ in
     };
 
     daemon = {
-      enable = lib.mkEnableOption '''a session service that starts the launcher hidden and leaves it running.
+      enable = lib.mkEnableOption ''
+        a session service that starts the launcher hidden and leaves it running.
 
         Residency only pays from the SECOND open onwards, and the first is the one a person
         notices -- the press after login, when nothing is warm. Started at session start, even
         that one is a window being shown rather than a program being launched
-      ''';
+      '';
 
       command = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ "nixlaunch" "--daemon" ];
         example = [ "/usr/bin/nixlaunch" "--daemon" ];
-        description = '''
+        description = ''
           argv for the resident process.
 
-          A bare name by default, resolved against the unit'''s own PATH. Hosts that take the
+          A bare name by default, resolved against the unit's own PATH. Hosts that take the
           binary from their distro rather than from this module (see `package`) should give the
           absolute path, for the same reason every other command on this plane does: a unit does
-          not inherit a login shell'''s PATH, and the failure looks like the service silently not
+          not inherit a login shell's PATH, and the failure looks like the service silently not
           existing rather than like a missing binary.
-        ''';
+        '';
       };
     };
 
