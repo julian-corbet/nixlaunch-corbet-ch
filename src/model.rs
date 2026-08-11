@@ -19,6 +19,10 @@ use std::path::PathBuf;
 pub struct App {
     pub name: String,
     pub icon: String,
+    /// The `Exec` line as the inventory reported it, field codes and all. Kept verbatim rather
+    /// than pre-split: splitting is the launcher's job and the raw string is what a future
+    /// provider will keep giving us.
+    pub exec: String,
 }
 
 /// A line IS an appset: the apps on it are meant to be started together, and the fact that they
@@ -32,6 +36,8 @@ pub struct Line {
 pub struct Machine {
     pub name: String,
     pub accent: String,
+    /// argv prefix that turns "run this" into "run this THERE". Empty is a read-only column.
+    pub launch: Vec<String>,
     /// Why this machine could not be asked, if it could not. Carried rather than raised: an
     /// unreachable peer is a normal state on a roaming laptop, and a column drawn with a reason on
     /// it is honest, where an empty column is indistinguishable from a machine that has nothing.
@@ -240,6 +246,7 @@ impl State {
             .map(|m| Machine {
                 name: m.name.clone(),
                 accent: m.accent.clone(),
+                launch: m.launch.clone(),
                 error: m.error.clone(),
                 cells: m
                     .cells
@@ -362,9 +369,32 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
                 }
             }
 
-            Machine { name: m.name.clone(), accent: m.accent.clone(), error: m.error.clone(), cells }
+            Machine { name: m.name.clone(), accent: m.accent.clone(), launch: m.launch.clone(), error: m.error.clone(), cells }
         })
         .collect()
+}
+
+/// Build the argv that actually starts `app` on `machine`.
+///
+/// FIELD CODES ARE STRIPPED. A `.desktop` Exec carries placeholders the spec defines -- %f %F %u
+/// %U for files and URLs, %i %c %k for icon/name/path -- which are meant to be substituted by
+/// whoever launches with arguments. We launch with none, and the spec is explicit that unhandled
+/// codes must be REMOVED rather than passed through: leave "%U" in place and Firefox opens a tab
+/// for a file literally named "%U". Handled inline rather than by pulling in a whole .desktop
+/// parser, because this program never parses .desktop files at all -- the inventory does.
+///
+/// Splitting is `shlex`, not `split_whitespace`: an Exec may legitimately quote an argument
+/// containing spaces, and naive splitting turns one path into two broken ones.
+pub fn launch_argv(machine: &Machine, app: &App) -> Vec<String> {
+    let stripped: String = app
+        .exec
+        .split_whitespace()
+        .filter(|tok| !(tok.len() == 2 && tok.starts_with('%')))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut argv = machine.launch.clone();
+    argv.extend(shlex::split(&stripped).unwrap_or_else(|| vec![stripped.clone()]));
+    argv
 }
 
 /// Which GAP between a line's items a drop at `x` belongs to.
@@ -373,7 +403,7 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
 /// passes the middle of an item -- the behaviour every reorderable list has, and the reason a drop
 
 pub fn a(name: &str, icon: &str) -> App {
-    App { name: name.into(), icon: icon.into() }
+    App { name: name.into(), icon: icon.into(), exec: name.to_lowercase() }
 }
 
 pub fn line(apps: Vec<App>) -> Line {
@@ -388,6 +418,7 @@ pub fn fixture() -> Vec<Machine> {
         Machine {
             name: "laptop".into(),
             accent: "#166534".into(),
+            launch: vec![],
             error: None,
             cells: vec![
                 vec![line(vec![a("Foot", "foot"), a("Foot Client", "foot")]), line(vec![a("Foot Server", "foot")])],
@@ -407,6 +438,7 @@ pub fn fixture() -> Vec<Machine> {
         Machine {
             name: "workstation".into(),
             accent: "#B45309".into(),
+            launch: vec![],
             error: None,
             cells: vec![
                 vec![line(vec![a("Foot", "foot"), a("Alacritty", "Alacritty")])],
@@ -424,6 +456,7 @@ pub fn fixture() -> Vec<Machine> {
         Machine {
             name: "console".into(),
             accent: "#9F1239".into(),
+            launch: vec![],
             error: None,
             cells: vec![
                 vec![line(vec![a("Foot", "foot")])],
@@ -449,7 +482,7 @@ mod tests {
     use super::*;
 
     fn app(n: &str) -> App {
-        App { name: n.into(), icon: "x".into() }
+        App { name: n.into(), icon: "x".into(), exec: n.to_lowercase() }
     }
 
     /// One machine, one folder, with the given lines. `folder` indexes DEFAULT_FOLDERS.
@@ -457,7 +490,7 @@ mod tests {
         let mut cells: Vec<Vec<Line>> = vec![Vec::new(); DEFAULT_FOLDERS.len()];
         cells[folder] =
             lines.into_iter().map(|l| Line { apps: l.into_iter().map(app).collect() }).collect();
-        Machine { name: name.into(), accent: "#fff".into(), error: None, cells }
+        Machine { name: name.into(), accent: "#fff".into(), launch: vec![], error: None, cells }
     }
 
     fn state(machines: Vec<Machine>) -> State {
@@ -614,6 +647,53 @@ mod tests {
         let out = apply_placement(&base, &p, &rows);
         let names: Vec<&str> = out[0].cells[0][0].apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"], "ghost skipped, order of the survivors kept");
+    }
+
+    fn appx(name: &str, exec: &str) -> App {
+        App { name: name.into(), icon: "x".into(), exec: exec.into() }
+    }
+
+    /// Unhandled field codes must be REMOVED, not passed through. Left in place, "%U" becomes a
+    /// literal argument and the browser opens a tab for a file called "%U".
+    #[test]
+    fn field_codes_are_stripped() {
+        let m = machine("m", 0, vec![vec!["x"]]);
+        assert_eq!(launch_argv(&m, &appx("Firefox", "firefox %u")), vec!["firefox"]);
+        assert_eq!(launch_argv(&m, &appx("Files", "thunar %F")), vec!["thunar"]);
+        assert_eq!(
+            launch_argv(&m, &appx("Foot", "foot --server %i")),
+            vec!["foot", "--server"],
+            "only the codes go, the real flags stay"
+        );
+    }
+
+    /// A percent sign that is not a field code is an ordinary argument.
+    #[test]
+    fn a_bare_percent_is_not_a_field_code() {
+        let m = machine("m", 0, vec![vec!["x"]]);
+        assert_eq!(launch_argv(&m, &appx("odd", "prog 100%")), vec!["prog", "100%"]);
+    }
+
+    /// Splitting is shlex, so a quoted argument containing spaces stays ONE argument. Naive
+    /// whitespace splitting turns one path into two broken ones.
+    #[test]
+    fn quoted_arguments_survive_splitting() {
+        let m = machine("m", 0, vec![vec!["x"]]);
+        assert_eq!(
+            launch_argv(&m, &appx("q", "prog --path \"/a b/c\" --flag")),
+            vec!["prog", "--path", "/a b/c", "--flag"]
+        );
+    }
+
+    /// The machine's prefix is what turns "run this" into "run this THERE".
+    #[test]
+    fn the_launch_prefix_leads() {
+        let mut m = machine("remote", 0, vec![vec!["x"]]);
+        m.launch = vec!["waypipe@remote".to_string()];
+        assert_eq!(
+            launch_argv(&m, &appx("Helix", "helix %F")),
+            vec!["waypipe@remote", "helix"]
+        );
     }
 
     /// clamp() is the only thing standing between a shrinking grid and an index panic.

@@ -463,12 +463,16 @@ fn build(application: &Application) {
                     }
                     (Focus::Outside, Key::Return) => {
                         if shift {
-                            let all: Vec<String> = s
-                                .cell()
-                                .iter()
-                                .flat_map(|l| l.apps.iter().map(|x| x.name.clone()))
-                                .collect();
-                            println!("CELL on {}: {:?}", s.view[s.col].name, all);
+                            let machine = s.view[s.col].clone();
+                            let all: Vec<App> =
+                                s.cell().iter().flat_map(|l| l.apps.iter().cloned()).collect();
+                            if !all.is_empty() {
+                                for app in &all {
+                                    spawn(&machine, app);
+                                }
+                                window.close();
+                                return gtk::glib::Propagation::Stop;
+                            }
                         } else if !s.cell().is_empty() {
                             s.focus = Focus::Inside;
                             s.line = 0;
@@ -493,15 +497,24 @@ fn build(application: &Application) {
                         s.line = (s.line + 1).min(s.cell().len().saturating_sub(1))
                     }
                     (Focus::Inside, Key::Return) => {
-                        let host = s.view[s.col].name.clone();
-                        if shift {
-                            let set: Vec<String> = s
-                                .current_line()
-                                .map(|l| l.apps.iter().map(|x| x.name.clone()).collect())
-                                .unwrap_or_default();
-                            println!("APPSET on {}: {:?}", host, set);
-                        } else if let Some(app) = s.current_line().and_then(|l| l.apps.get(s.item)) {
-                            println!("LAUNCH {} on {}", app.name, host);
+                        let machine = s.view[s.col].clone();
+                        let apps: Vec<App> = if shift {
+                            s.current_line().map(|l| l.apps.clone()).unwrap_or_default()
+                        } else {
+                            s.current_line()
+                                .and_then(|l| l.apps.get(s.item))
+                                .cloned()
+                                .into_iter()
+                                .collect()
+                        };
+                        if !apps.is_empty() {
+                            for app in &apps {
+                                spawn(&machine, app);
+                            }
+                            // A launcher that stays up after launching is a window you then have
+                            // to dismiss. Closing IS the confirmation.
+                            window.close();
+                            return gtk::glib::Propagation::Stop;
                         }
                     }
 
@@ -602,7 +615,7 @@ fn inventory(mc: &config::MachineConfig, rows: &[String]) -> Machine {
                     cells[r].push(Line {
                         apps: chunk
                             .iter()
-                            .map(|a| App { name: a.name.clone(), icon: a.icon.clone() })
+                            .map(|a| App { name: a.name.clone(), icon: a.icon.clone(), exec: a.exec.clone() })
                             .collect(),
                     });
                 }
@@ -611,7 +624,32 @@ fn inventory(mc: &config::MachineConfig, rows: &[String]) -> Machine {
         Err(e) => error = Some(e),
     }
 
-    Machine { name: mc.name.clone(), accent: mc.accent.clone(), error, cells }
+    Machine { name: mc.name.clone(), accent: mc.accent.clone(), launch: mc.launch.clone(), error, cells }
+}
+
+/// Start one application, detached.
+///
+/// DETACHED ON PURPOSE. The launcher exits immediately after launching, and a child in our own
+/// process group would be killed with us -- so the thing you just started would vanish. `setsid`
+/// via `process_group(0)` is what makes the app outlive the launcher, which is the entire point of
+/// a launcher.
+///
+/// Failures are reported, not swallowed: a missing binary is exactly the case where silence would
+/// look like the keypress never registered.
+fn spawn(machine: &Machine, app: &App) {
+    let argv = launch_argv(machine, app);
+    let Some((bin, args)) = argv.split_first() else {
+        eprintln!("nixlaunch: {} has no exec line", app.name);
+        return;
+    };
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args);
+    cmd.process_group(0);
+    match cmd.spawn() {
+        Ok(_) => eprintln!("nixlaunch: started {} on {}", app.name, machine.name),
+        Err(e) => eprintln!("nixlaunch: {} on {}: {e}", app.name, machine.name),
+    }
 }
 
 fn escape(s: &str) -> String {
