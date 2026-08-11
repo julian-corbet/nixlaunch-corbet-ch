@@ -274,12 +274,28 @@ impl Config {
         // DEDUPED, first occurrence wins. A repeated label is not merely untidy: rows are matched
         // by label, so a duplicate makes every app in that folder appear in two rows at once, and
         // a drag onto either writes to whichever the code happens to reach first.
+        // A SUBCATEGORY IS A ROW, spelled `folder/sub`.
+        //
+        // Making it part of the row label rather than a structure inside the cell is what lets the
+        // label sit OUTSIDE the machine columns: the grid already draws one label per row, so a
+        // subcategory drawn as a row gets that for free and lines up across every machine. Nested
+        // inside a cell it could only ever line up with itself.
+        //
+        // The bare folder name is emitted LAST, after its subcategories, and is the catch-all --
+        // which is also what makes this readable by an arrangement written before subcategories
+        // existed: those entries are keyed on the bare folder name and still land in it.
         let mut seen = std::collections::HashSet::new();
         let mut rows: Vec<String> = Vec::new();
-        for f in self.folders.iter().filter(|f| f.as_str() != "Other") {
-            if seen.insert(f.clone()) {
-                rows.push(f.clone());
+        let push = |rows: &mut Vec<String>, r: String, seen: &mut std::collections::HashSet<String>| {
+            if seen.insert(r.clone()) {
+                rows.push(r);
             }
+        };
+        for f in self.folders.iter().filter(|f| f.as_str() != "Other") {
+            for sub in self.subrows.get(f).into_iter().flatten() {
+                push(&mut rows, format!("{f}/{sub}"), &mut seen);
+            }
+            push(&mut rows, f.clone(), &mut seen);
         }
         rows.push("Other".to_string());
         rows

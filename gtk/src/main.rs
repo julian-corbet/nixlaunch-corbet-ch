@@ -90,7 +90,7 @@ window {{ background-color: {ground}; color: {fg}; }}
 .app {{ padding: 3px 6px; border-radius: 4px; }}
 .app.sel {{ background-color: alpha({accent}, 0.20); }}
 .appname {{ font-size: 12px; }}
-.subrow {{ font-size: 10px; color: {muted}; padding-right: 6px; min-width: 54px; }}
+.subrow {{ font-size: 10px; color: {muted}; padding-right: 6px; }}
 .dim {{ color: {dim}; font-size: 12px; font-style: italic; }}
 .hint {{ color: #666666; font-size: 11px; margin-top: 12px; }}
 .hint b {{ color: {accent}; }}
@@ -783,16 +783,33 @@ fn build(application: &Application) {
                 if let Some(e) = &m.error {
                     head.set_tooltip_text(Some(e));
                 }
-                grid.attach(&head, c as i32 + 1, 0, 1, 1);
+                grid.attach(&head, c as i32 + 2, 0, 1, 1);
             }
 
             for (r, folder) in s.folders.iter().enumerate() {
-                let rh = Label::new(Some(folder));
+                // `folder/sub` splits across two label columns, and the folder name is drawn
+                // only on the FIRST row that carries it -- repeating "Chat" down three rows would
+                // be noise, and its absence is what makes the group read as a group.
+                let (fname, sub) = match folder.split_once('/') {
+                    Some((f, s)) => (f, Some(s)),
+                    None => (folder.as_str(), None),
+                };
+                let first_of_group = r == 0
+                    || s.folders[r - 1].split('/').next() != Some(fname);
+                let rh = Label::new(if first_of_group { Some(fname) } else { None });
                 rh.set_xalign(1.0);
                 rh.set_valign(Align::Center);
                 rh.add_css_class("rowhead");
                 labelcol.add_widget(&rh);
                 grid.attach(&rh, 0, r as i32 + 1, 1, 1);
+
+                // The subcategory, in its own column OUTSIDE the machines, so it lines up across
+                // every one of them instead of only with itself.
+                let sublabel = Label::new(sub);
+                sublabel.set_xalign(1.0);
+                sublabel.set_valign(Align::Center);
+                sublabel.add_css_class("subrow");
+                grid.attach(&sublabel, 1, r as i32 + 1, 1, 1);
                 painted.borrow_mut().rowheads.push(rh.clone());
                 let mut row_cells: Vec<CellW> = Vec::with_capacity(s.view.len());
 
@@ -884,12 +901,6 @@ fn build(application: &Application) {
                         // The row's name, when it has one, at its head. Small and muted: it is a
                         // label for what follows, not an entry you can act on, and drawing it like
                         // the applications would invite clicking something that does nothing.
-                        if let Some(sub) = &ln.name {
-                            let tag = Label::new(Some(sub));
-                            tag.set_xalign(0.0);
-                            tag.add_css_class("subrow");
-                            lb.append(&tag);
-                        }
                         let mut line_apps: Vec<GBox> = Vec::with_capacity(ln.apps.len());
                         for app in ln.apps.iter() {
                             let b = GBox::new(Orientation::Horizontal, 4);
@@ -961,7 +972,7 @@ fn build(application: &Application) {
                         cell.append(&lb);
                         cell_lines.push(LineW { bx: lb.clone(), apps: line_apps });
                     }
-                    grid.attach(&cell, c as i32 + 1, r as i32 + 1, 1, 1);
+                    grid.attach(&cell, c as i32 + 2, r as i32 + 1, 1, 1);
                     row_cells.push(CellW { bx: cell.clone(), lines: cell_lines });
                 }
                 painted.borrow_mut().cells.push(row_cells);
@@ -996,7 +1007,7 @@ fn build(application: &Application) {
         let reveal: Rc<dyn Fn()> = Rc::new(move || {
             if let Ok(Some(cfg)) = config::load() {
                 let rows = cfg.folder_rows();
-                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
+                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width);
                 let mut s = state.borrow_mut();
                 s.base = fresh;
                 s.query.clear();
@@ -1196,7 +1207,7 @@ fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, Strin
         Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], "layer".into(), "exclusive".into(), true, None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
-            let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
+            let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width);
             (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), cfg.surface.clone(), cfg.keyboard.clone(), cfg.exit_on_focus_loss, None)
         }
     }
@@ -1226,12 +1237,11 @@ fn inventory_all(
     machines: &[config::MachineConfig],
     rows: &[String],
     line_width: usize,
-    subrows: &std::collections::HashMap<String, Vec<String>>,
 ) -> Vec<Machine> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = machines
             .iter()
-            .map(|mc| scope.spawn(move || inventory(mc, rows, line_width, subrows)))
+            .map(|mc| scope.spawn(move || inventory(mc, rows, line_width)))
             .collect();
         handles
             .into_iter()
@@ -1259,7 +1269,6 @@ fn inventory(
     mc: &config::MachineConfig,
     rows: &[String],
     line_width: usize,
-    subrows: &std::collections::HashMap<String, Vec<String>>,
 ) -> Machine {
     let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
     // Declared without a value: both arms of the match below assign it, so an initial `None`
@@ -1330,14 +1339,6 @@ fn inventory(
     // The declared sub-rows, appended empty. They are drawn so they can be dragged into; an app
     // that has actually been filed into one arrives through the placement instead, which runs
     // after this and matches them by name.
-    for (r, label) in rows.iter().enumerate() {
-        for want in subrows.get(label).into_iter().flatten() {
-            if !cells[r].iter().any(|l| l.name.as_deref() == Some(want.as_str())) {
-                cells[r].push(Line { name: Some(want.clone()), apps: Vec::new() });
-            }
-        }
-    }
-
     Machine {
         name: mc.name.clone(),
         aliases: mc.aliases.clone(),

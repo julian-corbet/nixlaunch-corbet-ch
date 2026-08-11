@@ -638,7 +638,14 @@ impl State {
                                     .filter(|a| keep(&a.name))
                                     .cloned()
                                     .collect();
-                                if apps.is_empty() {
+                                // A NAMED row survives having no matches while there is no
+                                // query, because that is precisely when you need to see it: an
+                                // empty declared row is a place to drag something INTO, and one
+                                // that is invisible until it already has contents can never
+                                // acquire any. Under a query it goes, like any line with nothing
+                                // in it -- a search should show what matched, not the taxonomy.
+                                let keeps_place = l.name.is_some() && pattern.is_none();
+                                if apps.is_empty() && !keeps_place {
                                     None
                                 } else {
                                     Some(Line { name: l.name.clone(), apps })
