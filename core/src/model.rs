@@ -508,9 +508,18 @@ impl State {
     /// throw that away. Lines that lose every app disappear; a cell that loses every line renders
     /// as empty, which is itself the answer to "does that machine have this?".
     pub fn refilter(&mut self) {
+        // "which machine" is a thing you can TYPE, not only a thing you arrow to.
+        //
+        // The grid's whole premise is that a machine is a position -- but the search box was
+        // machine-blind, so the moment you started typing you lost the one axis the layout exists
+        // for, and `foot@devhome` searched for an application literally called that. Naming the
+        // machine in the query keeps both halves of the idea available at once.
+        let names: Vec<String> = self.machines.iter().map(|m| m.name.clone()).collect();
+        let (only, pattern_text) = split_query(&self.query, &names);
+
         let mut matcher = Matcher::new(Config::DEFAULT);
-        let pattern = (!self.query.is_empty())
-            .then(|| Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart));
+        let pattern = (!pattern_text.is_empty())
+            .then(|| Pattern::parse(&pattern_text, CaseMatching::Ignore, Normalization::Smart));
         let mut buf = Vec::new();
         let mut keep = |name: &str| -> bool {
             match &pattern {
@@ -526,8 +535,13 @@ impl State {
                 accent: m.accent.clone(),
                 launch: m.launch.clone(),
                 error: m.error.clone(),
-                cells: m
-                    .cells
+                // A named machine empties the others rather than removing their columns. The
+                // column is the machine's identity in this layout; dropping it would make the grid
+                // reflow under the query and move everything the user had learned the position of.
+                cells: if only.as_deref().is_some_and(|w| w != m.name) {
+                    vec![Vec::new(); m.cells.len()]
+                } else {
+                    m.cells
                     .iter()
                     .map(|lines| {
                         lines
@@ -543,7 +557,8 @@ impl State {
                             })
                             .collect()
                     })
-                    .collect(),
+                    .collect()
+                },
             })
             .collect();
         self.snap_to_content();
@@ -591,6 +606,60 @@ impl State {
         // Aim for the goal column, clamped to THIS line -- never overwrite the goal itself.
         self.item = if items == 0 { 0 } else { self.item_goal.min(items - 1) };
     }
+}
+
+/// Split a typed query into an optional machine and the pattern to match applications against.
+///
+/// ── WHY SEVERAL SPELLINGS, AND WHY EITHER ORDER ──────────────────────────────────────────────
+///
+/// Because people already have a habit and it is not the same habit. `foot@devhome` is the shape
+/// SSH and email taught; `devhome.foot` is the shape a namespace or an object path teaches;
+/// `foot.archlxc` is the shape a hostname teaches. All three mean one thing, none is more correct,
+/// and a launcher that accepted only one would be teaching its own convention for no reason.
+///
+/// So the separator may be any of `@ . : /`, and the machine may be on either side. Which side is
+/// which is decided by the DATA rather than by the syntax: whichever side names a machine is the
+/// machine. That is what lets one rule serve every spelling instead of one rule per spelling.
+///
+/// A prefix is enough as long as it is unambiguous -- `foot@dev` reaches devhome -- because the
+/// point is to type less, and a qualifier you must spell in full is barely faster than arrowing to
+/// the column. An empty pattern (`devhome.`) means "everything on that machine", which falls out
+/// of the same rule rather than needing its own.
+///
+/// AMBIGUITY RESOLVES TO NO MACHINE. If neither side names one, or the query has no separator, the
+/// whole query is the pattern -- so an application whose name happens to contain an `@` or a dot
+/// still searches normally, and the feature can never make an ordinary search stop working.
+pub fn split_query(query: &str, machines: &[String]) -> (Option<String>, String) {
+    let resolve = |token: &str| -> Option<String> {
+        if token.is_empty() {
+            return None;
+        }
+        let lower = token.to_lowercase();
+        if let Some(m) = machines.iter().find(|m| m.to_lowercase() == lower) {
+            return Some(m.clone());
+        }
+        // A unique prefix, or nothing. Two machines starting the same way is not an invitation to
+        // guess -- it is a reason to treat the token as ordinary search text.
+        let mut hits = machines.iter().filter(|m| m.to_lowercase().starts_with(&lower));
+        match (hits.next(), hits.next()) {
+            (Some(m), None) => Some(m.clone()),
+            _ => None,
+        }
+    };
+
+    for sep in ['@', ':', '/', '.'] {
+        let Some((left, right)) = query.split_once(sep) else { continue };
+        // The right side first for `@`, which universally means "the thing after the at is where":
+        // it is the one spelling where the order is not a matter of taste.
+        let (first, second) = if sep == '@' { (right, left) } else { (left, right) };
+        if let Some(m) = resolve(first) {
+            return (Some(m), second.trim().to_string());
+        }
+        if let Some(m) = resolve(second) {
+            return (Some(m), first.trim().to_string());
+        }
+    }
+    (None, query.trim().to_string())
 }
 
 /// Re-derive a machine's grid from the pristine inventory plus the user's arrangement.
@@ -1388,6 +1457,73 @@ mod tests {
             vec![vec!["Foo".to_string()]],
             "untouched -- an unresolvable entry is left, not resolved to a coin flip"
         );
+    }
+
+    fn hosts() -> Vec<String> {
+        vec!["elitebook".into(), "archlxc".into(), "devhome".into()]
+    }
+
+    /// Every spelling a person might already have the habit of, meaning the same thing.
+    #[test]
+    fn a_machine_can_be_named_in_any_of_the_usual_shapes() {
+        let h = hosts();
+        for q in ["foot@devhome", "foot.devhome", "foot:devhome", "foot/devhome", "devhome.foot"] {
+            assert_eq!(split_query(q, &h), (Some("devhome".into()), "foot".into()), "{q}");
+        }
+    }
+
+    /// A prefix is enough, because a qualifier you must spell in full saves nothing over arrowing.
+    #[test]
+    fn an_unambiguous_prefix_is_enough() {
+        assert_eq!(split_query("foot@dev", &hosts()), (Some("devhome".into()), "foot".into()));
+        assert_eq!(split_query("foot@e", &hosts()), (Some("elitebook".into()), "foot".into()));
+    }
+
+    /// ...and an ambiguous one is not a licence to guess.
+    #[test]
+    fn an_ambiguous_prefix_names_no_machine() {
+        let h = vec!["arch".to_string(), "archlxc".to_string()];
+        // "arc" could be either, so it stays ordinary search text rather than picking one.
+        assert_eq!(split_query("foot@arc", &h), (None, "foot@arc".into()));
+    }
+
+    /// An exact name beats a prefix, or a machine could never be reached once another began with
+    /// its whole name.
+    #[test]
+    fn an_exact_name_wins_over_a_longer_one() {
+        let h = vec!["arch".to_string(), "archlxc".to_string()];
+        assert_eq!(split_query("foot@arch", &h), (Some("arch".into()), "foot".into()));
+    }
+
+    /// Naming a machine with no pattern means everything on it -- falling out of the same rule
+    /// rather than being a special case.
+    #[test]
+    fn a_bare_machine_shows_all_of_it() {
+        assert_eq!(split_query("devhome.", &hosts()), (Some("devhome".into()), String::new()));
+        assert_eq!(split_query("@archlxc", &hosts()), (Some("archlxc".into()), String::new()));
+    }
+
+    /// THE SAFETY PROPERTY: a query that names no machine is passed through untouched, so this can
+    /// never make an ordinary search stop working -- including one containing a separator.
+    #[test]
+    fn a_query_naming_no_machine_is_left_alone() {
+        assert_eq!(split_query("foot", &hosts()), (None, "foot".into()));
+        assert_eq!(split_query("some.app", &hosts()), (None, "some.app".into()));
+        assert_eq!(split_query("user@host", &hosts()), (None, "user@host".into()));
+    }
+
+    /// And the whole point: the other machines empty, without their columns disappearing.
+    #[test]
+    fn a_qualified_query_empties_the_other_machines() {
+        let mut s = state(vec![
+            machine("elitebook", 0, vec![vec!["Foot"]]),
+            machine("devhome", 0, vec![vec!["Foot"]]),
+        ]);
+        s.set_query("foot@devhome".into());
+
+        assert_eq!(s.view.len(), 2, "both columns still exist");
+        assert!(s.view[0].cells[0].is_empty(), "elitebook emptied");
+        assert_eq!(s.view[1].cells[0][0].apps[0].name, "Foot", "devhome kept its match");
     }
 
     /// Dropping an item into the gap it already occupies is a no-op, not a shuffle.

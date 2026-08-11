@@ -724,6 +724,11 @@ fn build(application: &Application) {
         let icon_px = theme.icon_size;
         let icon_theme = icon_theme.clone();
         let icon_cache = icon_cache.clone();
+        // For the click path: launching needs the window to dismiss, the terminal wrapper for
+        // programs that draw none, and the state to record the launch against.
+        let window = window.clone();
+        let terminal_cmd = terminal_cmd_outer.clone();
+        let dismiss = dismiss.clone();
         move || {
             let s = state.borrow();
 
@@ -891,6 +896,45 @@ fn build(application: &Application) {
                                     Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
                                 });
                                 b.add_controller(src);
+                            }
+                            // A CLICK LAUNCHES IT. The keyboard could start anything and the mouse
+                            // could only rearrange things: drag and drop worked, clicking did
+                            // nothing at all. For a launcher that is not a missing convenience, it
+                            // is a missing half.
+                            {
+                                let st = state.clone();
+                                let win = window.clone();
+                                let term = terminal_cmd.clone();
+                                let dismiss = dismiss.clone();
+                                // Captured by IDENTITY, never by index: the grid may be rebuilt
+                                // between this being wired and the click arriving -- a query
+                                // filters, a drag reorders, frecency moves a line -- and an index
+                                // would by then name a different application.
+                                let id = app.id.clone();
+                                let click = gtk::GestureClick::new();
+                                click.connect_released(move |g, _, _, _| {
+                                    // Claimed, so the drag source on this same widget does not
+                                    // also read the press as the beginning of a drag.
+                                    g.set_state(gtk::EventSequenceState::Claimed);
+                                    let mut st_mut = st.borrow_mut();
+                                    let Some(machine) = st_mut.view.get(c).cloned() else { return };
+                                    let found = machine
+                                        .cells
+                                        .iter()
+                                        .flatten()
+                                        .flat_map(|l| l.apps.iter())
+                                        .find(|a| a.id == id)
+                                        .cloned();
+                                    let Some(app) = found else { return };
+                                    spawn(&machine, &app, &term);
+                                    st_mut.record_launch(&machine.name, &app.id);
+                                    // The borrow ends before the window is touched: dismissing
+                                    // releases idle pages and can re-enter, and a live borrow
+                                    // here would panic at runtime rather than fail to compile.
+                                    drop(st_mut);
+                                    dismiss(&win);
+                                });
+                                b.add_controller(click);
                             }
                             let img = match icon_cache.borrow_mut().texture(&app.icon, &icon_theme) {
                                 Some(tex) => Image::from_paintable(Some(&tex)),
