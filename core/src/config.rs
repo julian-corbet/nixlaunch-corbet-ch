@@ -92,6 +92,14 @@ pub struct InventoryApp {
 #[derive(Deserialize, Debug, Clone)]
 pub struct MachineConfig {
     pub name: String,
+    /// Shorter things this machine answers to when typed in the search box.
+    ///
+    /// A local convention, which is why it is configuration and not a guess: what an estate
+    /// shortens its hostnames to is not derivable from the hostnames. Declared aliases beat prefix
+    /// matching, so a shortcut somebody relies on cannot be broken later by adding a machine whose
+    /// name happens to begin with the same letters.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// The identity colour for this machine's column. Same value the window frames and
     /// forwarded-window badges use, so a column is recognisable before its label is read.
     #[serde(default = "default_accent")]

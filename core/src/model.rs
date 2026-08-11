@@ -46,6 +46,13 @@ pub struct Line {
 #[derive(Clone)]
 pub struct Machine {
     pub name: String,
+    /// Other things this machine may be called when typed at. A machine's NAME is what it is; an
+    /// alias is what a person in a hurry types, and the two are different needs -- the column
+    /// heading wants to be unambiguous, the search box wants to be short.
+    ///
+    /// Empty by default and supplied by configuration, because a nickname is a local convention:
+    /// what one estate shortens a hostname to is not a fact this program could ever guess.
+    pub aliases: Vec<String>,
     pub accent: String,
     /// argv prefix that turns "run this" into "run this THERE". Empty is a read-only column.
     pub launch: Vec<String>,
@@ -512,9 +519,10 @@ impl State {
         //
         // The grid's whole premise is that a machine is a position -- but the search box was
         // machine-blind, so the moment you started typing you lost the one axis the layout exists
-        // for, and `foot@devhome` searched for an application literally called that. Naming the
+        // for, and `foot@srvhome` searched for an application literally called that. Naming the
         // machine in the query keeps both halves of the idea available at once.
-        let names: Vec<String> = self.machines.iter().map(|m| m.name.clone()).collect();
+        let names: Vec<(String, Vec<String>)> =
+            self.machines.iter().map(|m| (m.name.clone(), m.aliases.clone())).collect();
         let (only, pattern_text) = split_query(&self.query, &names);
 
         let mut matcher = Matcher::new(Config::DEFAULT);
@@ -532,6 +540,7 @@ impl State {
             .iter()
             .map(|m| Machine {
                 name: m.name.clone(),
+                aliases: m.aliases.clone(),
                 accent: m.accent.clone(),
                 launch: m.launch.clone(),
                 error: m.error.clone(),
@@ -612,37 +621,46 @@ impl State {
 ///
 /// ── WHY SEVERAL SPELLINGS, AND WHY EITHER ORDER ──────────────────────────────────────────────
 ///
-/// Because people already have a habit and it is not the same habit. `foot@devhome` is the shape
-/// SSH and email taught; `devhome.foot` is the shape a namespace or an object path teaches;
-/// `foot.archlxc` is the shape a hostname teaches. All three mean one thing, none is more correct,
+/// Because people already have a habit and it is not the same habit. `foot@srvhome` is the shape
+/// SSH and email taught; `server.foot` is the shape a namespace or an object path teaches;
+/// `foot.worklxc` is the shape a hostname teaches. All three mean one thing, none is more correct,
 /// and a launcher that accepted only one would be teaching its own convention for no reason.
 ///
 /// So the separator may be any of `@ . : /`, and the machine may be on either side. Which side is
 /// which is decided by the DATA rather than by the syntax: whichever side names a machine is the
 /// machine. That is what lets one rule serve every spelling instead of one rule per spelling.
 ///
-/// A prefix is enough as long as it is unambiguous -- `foot@dev` reaches devhome -- because the
-/// point is to type less, and a qualifier you must spell in full is barely faster than arrowing to
-/// the column. An empty pattern (`devhome.`) means "everything on that machine", which falls out
-/// of the same rule rather than needing its own.
+/// A prefix is enough as long as it is unambiguous -- `foot@ser` reaches a machine called
+/// `server` -- because the point is to type less, and a qualifier you must spell in full is barely
+/// faster than arrowing to the column. An empty pattern (`server.`) means "everything on that
+/// machine", which falls out of the same rule rather than needing its own.
 ///
 /// AMBIGUITY RESOLVES TO NO MACHINE. If neither side names one, or the query has no separator, the
 /// whole query is the pattern -- so an application whose name happens to contain an `@` or a dot
 /// still searches normally, and the feature can never make an ordinary search stop working.
-pub fn split_query(query: &str, machines: &[String]) -> (Option<String>, String) {
+pub fn split_query(query: &str, machines: &[(String, Vec<String>)]) -> (Option<String>, String) {
     let resolve = |token: &str| -> Option<String> {
         if token.is_empty() {
             return None;
         }
         let lower = token.to_lowercase();
-        if let Some(m) = machines.iter().find(|m| m.to_lowercase() == lower) {
-            return Some(m.clone());
+        // EXACT FIRST, and an alias counts as exact. A declared nickname is a deliberate statement
+        // that this word means this machine, so it must beat any accident of spelling -- otherwise
+        // adding a machine whose name happens to start with someone's alias would quietly break
+        // a shortcut they had been using for months.
+        if let Some((n, _)) = machines
+            .iter()
+            .find(|(n, al)| n.to_lowercase() == lower || al.iter().any(|a| a.to_lowercase() == lower))
+        {
+            return Some(n.clone());
         }
-        // A unique prefix, or nothing. Two machines starting the same way is not an invitation to
-        // guess -- it is a reason to treat the token as ordinary search text.
-        let mut hits = machines.iter().filter(|m| m.to_lowercase().starts_with(&lower));
+        // Then a unique prefix of a name or an alias. Two candidates starting the same way is not
+        // an invitation to guess -- it is a reason to treat the token as ordinary search text.
+        let mut hits = machines.iter().filter(|(n, al)| {
+            n.to_lowercase().starts_with(&lower) || al.iter().any(|a| a.to_lowercase().starts_with(&lower))
+        });
         match (hits.next(), hits.next()) {
-            (Some(m), None) => Some(m.clone()),
+            (Some((n, _)), None) => Some(n.clone()),
             _ => None,
         }
     };
@@ -720,7 +738,7 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
                 }
             }
 
-            Machine { name: m.name.clone(), accent: m.accent.clone(), launch: m.launch.clone(), error: m.error.clone(), cells }
+            Machine { name: m.name.clone(), aliases: m.aliases.clone(), accent: m.accent.clone(), launch: m.launch.clone(), error: m.error.clone(), cells }
         })
         .collect()
 }
@@ -866,6 +884,7 @@ pub fn fixture() -> Vec<Machine> {
     vec![
         Machine {
             name: "laptop".into(),
+            aliases: vec![],
             accent: "#166534".into(),
             launch: vec![],
             error: None,
@@ -886,6 +905,7 @@ pub fn fixture() -> Vec<Machine> {
         },
         Machine {
             name: "workstation".into(),
+            aliases: vec![],
             accent: "#B45309".into(),
             launch: vec![],
             error: None,
@@ -904,6 +924,7 @@ pub fn fixture() -> Vec<Machine> {
         },
         Machine {
             name: "console".into(),
+            aliases: vec![],
             accent: "#9F1239".into(),
             launch: vec![],
             error: None,
@@ -945,7 +966,7 @@ mod tests {
         let mut cells: Vec<Vec<Line>> = vec![Vec::new(); DEFAULT_FOLDERS.len()];
         cells[folder] =
             lines.into_iter().map(|l| Line { apps: l.into_iter().map(app).collect() }).collect();
-        Machine { name: name.into(), accent: "#fff".into(), launch: vec![], error: None, cells }
+        Machine { name: name.into(), aliases: vec![], accent: "#fff".into(), launch: vec![], error: None, cells }
     }
 
     fn state(machines: Vec<Machine>) -> State {
@@ -1459,30 +1480,72 @@ mod tests {
         );
     }
 
-    fn hosts() -> Vec<String> {
-        vec!["elitebook".into(), "archlxc".into(), "devhome".into()]
+    fn hosts() -> Vec<(String, Vec<String>)> {
+        vec![
+            ("laptop".into(), vec![]),
+            ("workstation".into(), vec![]),
+            ("server".into(), vec![]),
+        ]
+    }
+
+    fn hosts_with_aliases() -> Vec<(String, Vec<String>)> {
+        vec![
+            ("laptop".into(), vec!["lap".into()]),
+            ("workstation".into(), vec!["work".into()]),
+            ("server".into(), vec!["srv".into()]),
+        ]
     }
 
     /// Every spelling a person might already have the habit of, meaning the same thing.
     #[test]
     fn a_machine_can_be_named_in_any_of_the_usual_shapes() {
         let h = hosts();
-        for q in ["foot@devhome", "foot.devhome", "foot:devhome", "foot/devhome", "devhome.foot"] {
-            assert_eq!(split_query(q, &h), (Some("devhome".into()), "foot".into()), "{q}");
+        for q in ["foot@server", "foot.server", "foot:server", "foot/server", "server.foot"] {
+            assert_eq!(split_query(q, &h), (Some("server".into()), "foot".into()), "{q}");
         }
     }
 
     /// A prefix is enough, because a qualifier you must spell in full saves nothing over arrowing.
     #[test]
     fn an_unambiguous_prefix_is_enough() {
-        assert_eq!(split_query("foot@dev", &hosts()), (Some("devhome".into()), "foot".into()));
-        assert_eq!(split_query("foot@e", &hosts()), (Some("elitebook".into()), "foot".into()));
+        assert_eq!(split_query("foot@ser", &hosts()), (Some("server".into()), "foot".into()));
+        assert_eq!(split_query("foot@l", &hosts()), (Some("laptop".into()), "foot".into()));
+    }
+
+    /// A declared alias is just another name for the machine, in every spelling.
+    #[test]
+    fn an_alias_names_the_machine() {
+        let h = hosts_with_aliases();
+        for q in ["foot@srv", "foot.srv", "srv.foot", "foot@work", "foot@lap"] {
+            let (m, pat) = split_query(q, &h);
+            assert!(m.is_some(), "{q} should name a machine");
+            assert_eq!(pat, "foot", "{q}");
+        }
+        assert_eq!(split_query("foot@work", &h).0, Some("workstation".into()));
+        assert_eq!(split_query("foot@lap", &h).0, Some("laptop".into()));
+        assert_eq!(split_query("foot@srv", &h).0, Some("server".into()));
+    }
+
+    /// AN ALIAS BEATS A PREFIX, which is the reason to declare one at all: without this, adding a
+    /// machine whose name merely starts with somebody's shortcut would silently break it.
+    #[test]
+    fn a_declared_alias_survives_a_new_machine_that_collides() {
+        let h: Vec<(String, Vec<String>)> = vec![
+            ("workstation".into(), vec!["work".into()]),
+            // Added later, and its NAME begins with the same letters as the alias above.
+            ("workspace-box".into(), vec![]),
+        ];
+        assert_eq!(
+            split_query("foot@work", &h).0,
+            Some("workstation".into()),
+            "the declared alias still wins"
+        );
     }
 
     /// ...and an ambiguous one is not a licence to guess.
     #[test]
     fn an_ambiguous_prefix_names_no_machine() {
-        let h = vec!["arch".to_string(), "archlxc".to_string()];
+        let h: Vec<(String, Vec<String>)> = vec![("work".into(), vec![]), ("workstation".into(), vec![])];
         // "arc" could be either, so it stays ordinary search text rather than picking one.
         assert_eq!(split_query("foot@arc", &h), (None, "foot@arc".into()));
     }
@@ -1491,16 +1554,16 @@ mod tests {
     /// its whole name.
     #[test]
     fn an_exact_name_wins_over_a_longer_one() {
-        let h = vec!["arch".to_string(), "archlxc".to_string()];
-        assert_eq!(split_query("foot@arch", &h), (Some("arch".into()), "foot".into()));
+        let h: Vec<(String, Vec<String>)> = vec![("work".into(), vec![]), ("workstation".into(), vec![])];
+        assert_eq!(split_query("foot@work", &h), (Some("work".into()), "foot".into()));
     }
 
     /// Naming a machine with no pattern means everything on it -- falling out of the same rule
     /// rather than being a special case.
     #[test]
     fn a_bare_machine_shows_all_of_it() {
-        assert_eq!(split_query("devhome.", &hosts()), (Some("devhome".into()), String::new()));
-        assert_eq!(split_query("@archlxc", &hosts()), (Some("archlxc".into()), String::new()));
+        assert_eq!(split_query("server.", &hosts()), (Some("server".into()), String::new()));
+        assert_eq!(split_query("@workstation", &hosts()), (Some("workstation".into()), String::new()));
     }
 
     /// THE SAFETY PROPERTY: a query that names no machine is passed through untouched, so this can
@@ -1516,14 +1579,14 @@ mod tests {
     #[test]
     fn a_qualified_query_empties_the_other_machines() {
         let mut s = state(vec![
-            machine("elitebook", 0, vec![vec!["Foot"]]),
-            machine("devhome", 0, vec![vec!["Foot"]]),
+            machine("laptop", 0, vec![vec!["Foot"]]),
+            machine("server", 0, vec![vec!["Foot"]]),
         ]);
-        s.set_query("foot@devhome".into());
+        s.set_query("foot@server".into());
 
         assert_eq!(s.view.len(), 2, "both columns still exist");
-        assert!(s.view[0].cells[0].is_empty(), "elitebook emptied");
-        assert_eq!(s.view[1].cells[0][0].apps[0].name, "Foot", "devhome kept its match");
+        assert!(s.view[0].cells[0].is_empty(), "the unnamed machine emptied");
+        assert_eq!(s.view[1].cells[0][0].apps[0].name, "Foot", "the named machine kept its match");
     }
 
     /// Dropping an item into the gap it already occupies is a no-op, not a shuffle.

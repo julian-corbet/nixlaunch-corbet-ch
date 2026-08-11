@@ -1224,6 +1224,7 @@ fn inventory_all(machines: &[config::MachineConfig], rows: &[String], line_width
             .map(|(h, mc)| {
                 h.join().unwrap_or_else(|_| Machine {
                     name: mc.name.clone(),
+                    aliases: mc.aliases.clone(),
                     accent: mc.accent.clone(),
                     launch: mc.launch.clone(),
                     error: Some("inventory panicked".into()),
@@ -1303,7 +1304,14 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
         Err(e) => error = Some(e),
     }
 
-    Machine { name: mc.name.clone(), accent: mc.accent.clone(), launch: mc.launch.clone(), error, cells }
+    Machine {
+        name: mc.name.clone(),
+        aliases: mc.aliases.clone(),
+        accent: mc.accent.clone(),
+        launch: mc.launch.clone(),
+        error,
+        cells,
+    }
 }
 
 /// Start one application, detached.

@@ -53,6 +53,25 @@ let
         '';
       };
 
+      aliases = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "short" ];
+        description = ''
+          Shorter names this machine also answers to in the search box, so a query can say WHICH
+          machine as well as which application -- `thing@short` as well as `thing@long-hostname`.
+
+          A local convention rather than anything derivable: what an estate shortens its hostnames
+          to is not a fact this program could work out, which is why it is a value and not a
+          default.
+
+          Declared aliases beat prefix matching. Without a declaration, `@ar` already reaches the
+          only machine starting with those letters -- convenient until a second one is added, at
+          which point a shortcut somebody had relied on for months silently stops working. Naming
+          it here is what makes it survive.
+        '';
+      };
+
       inventory = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         example = [ "rlaunch" "--json" "somehost" ];
@@ -269,7 +288,7 @@ in
     # no second place for the two to disagree.
     xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
       inherit (cfg) folders terminal keyboard;
-      machines = map (m: { inherit (m) name accent inventory launch; }) cfg.machines;
+      machines = map (m: { inherit (m) name aliases accent inventory launch; }) cfg.machines;
     } // lib.optionalAttrs (cfg.theme != { }) { inherit (cfg) theme; });
   };
 }
