@@ -286,6 +286,18 @@ pub struct Config {
     #[serde(default)]
 
     pub subrows: std::collections::HashMap<String, Vec<SubRow>>,
+
+
+    /// Key bindings, as chord -> action. Overrides the defaults rather than replacing them, and a
+
+
+    /// null action unbinds -- see `keymap` for why both matter.
+
+
+    #[serde(default)]
+
+
+    pub keys: std::collections::HashMap<String, Option<crate::keymap::Action>>,
 }
 
 impl Config {

@@ -19,5 +19,6 @@
 // So: one core, many shells. A shell's job is to draw this and to send keystrokes and drops back
 // into it, and nothing here should ever need to know which one is attached.
 pub mod config;
+pub mod keymap;
 pub mod model;
 pub mod usage;

@@ -40,7 +40,7 @@ use std::rc::Rc;
 mod icons;
 // The launcher itself, from the crate that has no toolkit in it. `model::*` is glob-imported
 // because this file speaks in its vocabulary throughout -- App, Line, Machine, Focus, State.
-use nixlaunch_core::{config, model, usage};
+use nixlaunch_core::{config, keymap, model, usage};
 use model::*;
 
 /// never has to land in the thin space between two widgets to mean something.
@@ -89,6 +89,12 @@ window {{ background-color: {ground}; color: {fg}; }}
 .line.sel {{ background-color: alpha({accent}, 0.10); }}
 .app {{ padding: 3px 6px; border-radius: 4px; }}
 .app.sel {{ background-color: alpha({accent}, 0.20); }}
+/* HOVER IS NOT SELECTION. Weaker than .sel and a different weight, so the thing the keyboard is
+   on and the thing the pointer is over can never be mistaken for each other. */
+.app:hover {{ background-color: alpha({fg}, 0.10); }}
+.line:hover {{ background-color: alpha({fg}, 0.04); }}
+.cell:hover {{ border-color: alpha({accent}, 0.45); }}
+.colhead:hover, .rowhead:hover, .subrow:hover {{ color: {fg}; }}
 .appname {{ font-size: 12px; }}
 .subrow {{ font-size: 10px; color: {muted}; padding-right: 6px; }}
 .dim {{ color: {dim}; font-size: 12px; font-style: italic; }}
@@ -607,6 +613,16 @@ fn build(application: &Application) {
     // Arrow keys, Tab and Enter-into-a-cell take the second path, which is the one the user is in
     // for most of a session -- this launcher's whole premise is that you navigate a grid rather
     // than type at it.
+    // The bindings, resolved once. Defaults unless configuration says otherwise -- see the keymap
+    // module on why overriding beats replacing wholesale.
+    let keys_map: Rc<keymap::Keymap> = Rc::new(
+        config::load()
+            .ok()
+            .flatten()
+            .map(|c| keymap::Keymap::from_overrides(&c.keys))
+            .unwrap_or_default(),
+    );
+
     let painted: Rc<RefCell<Painted>> = Rc::new(RefCell::new(Painted::default()));
 
     // One theme handle and one texture cache for the life of the process, so a rebuild costs no
@@ -843,6 +859,30 @@ fn build(application: &Application) {
                         });
                         cell.add_controller(tgt);
                     }
+                    // CLICKING A BOX MOVES THE KEYBOARD CURSOR INTO IT. Without this the mouse
+                    // could launch and rearrange but never change where the keyboard was, so the
+                    // two halves of the interface disagreed about where you are -- click a box,
+                    // press an arrow, and the selection jumped back somewhere else entirely.
+                    {
+                        let st = state.clone();
+                        let paint2 = paint.clone();
+                        let pick = gtk::GestureClick::new();
+                        pick.connect_released(move |_, _, _, _| {
+                            {
+                                let mut s = st.borrow_mut();
+                                s.col = c;
+                                s.row = r;
+                                s.focus = if s.cell().is_empty() { Focus::Outside } else { Focus::Inside };
+                                s.line = 0;
+                                s.item = 0;
+                                s.item_goal = 0;
+                                s.clamp();
+                            }
+                            paint2();
+                        });
+                        cell.add_controller(pick);
+                    }
+
                     let mut cell_lines: Vec<LineW> = Vec::with_capacity(lines.len());
                     if lines.is_empty() {
                         cell.add_css_class("empty");
@@ -933,7 +973,11 @@ fn build(application: &Application) {
                                 // would by then name a different application.
                                 let id = app.id.clone();
                                 let click = gtk::GestureClick::new();
+                                // Every button, so middle and right arrive here too rather than
+                                // only the primary one.
+                                click.set_button(0);
                                 click.connect_released(move |g, _, _, _| {
+                                    let button = g.current_button();
                                     // Claimed, so the drag source on this same widget does not
                                     // also read the press as the beginning of a drag.
                                     g.set_state(gtk::EventSequenceState::Claimed);
@@ -947,8 +991,32 @@ fn build(application: &Application) {
                                         .find(|a| a.id == id)
                                         .cloned();
                                     let Some(app) = found else { return };
-                                    spawn(&machine, &app, &term);
-                                    st_mut.record_launch(&machine.name, &app.id);
+
+                                    // RIGHT starts the whole line -- the appset, which is the
+                                    // point of a line existing. MIDDLE starts one thing and stays
+                                    // open, for when you are opening a handful in a row and having
+                                    // to reopen between each is the whole cost.
+                                    let batch: Vec<App> = if button == 3 {
+                                        machine
+                                            .cells
+                                            .iter()
+                                            .flatten()
+                                            .find(|l| l.apps.iter().any(|a| a.id == app.id))
+                                            .map(|l| l.apps.clone())
+                                            .unwrap_or_else(|| vec![app.clone()])
+                                    } else {
+                                        vec![app.clone()]
+                                    };
+                                    for a in &batch {
+                                        spawn(&machine, a, &term);
+                                        st_mut.record_launch(&machine.name, &a.id);
+                                    }
+                                    if button == 2 {
+                                        // Stay open, and repaint so the frecency reorder this
+                                        // launch may have earned is visible immediately.
+                                        drop(st_mut);
+                                        return;
+                                    }
                                     // The borrow ends before the window is touched: dismissing
                                     // releases idle pages and can re-enter, and a live borrow
                                     // here would panic at runtime rather than fail to compile.
@@ -1031,8 +1099,28 @@ fn build(application: &Application) {
         let render = render.clone();
         let paint = paint.clone();
         let terminal_cmd = terminal_cmd_outer.clone();
+        let keys_map = keys_map.clone();
         keys.connect_key_pressed(move |_, key, _, mods| {
             let shift = mods.contains(ModifierType::SHIFT_MASK);
+            // WHAT the key means comes from the keymap, not from this match. GTK reports the
+            // physical key; `keymap::Action` says what the user asked for, and anything unbound
+            // falls through to the text arm -- which is why typing a name never needs a binding.
+            //
+            // Shift+Tab is asked for as `shift+tab` even though X11 hands it over as a different
+            // keysym entirely (ISO_Left_Tab). Normalising here means a configuration file can say
+            // the obvious thing.
+            let name = match key {
+                Key::ISO_Left_Tab => "tab".to_string(),
+                k => k.name().map(|n| n.to_string()).unwrap_or_default(),
+            };
+            let chord = keymap::Keymap::chord(
+                &name,
+                mods.contains(ModifierType::CONTROL_MASK),
+                mods.contains(ModifierType::ALT_MASK),
+                shift,
+                mods.contains(ModifierType::SUPER_MASK),
+            );
+            let act = keys_map.action(&chord);
             let structural;
             {
                 let mut s = state.borrow_mut();
@@ -1043,10 +1131,10 @@ fn build(application: &Application) {
                 // set by hand would be one `s.query.push` away from being wrong, and the symptom
                 // would be a grid that silently stops matching what was typed.
                 let before = s.query.clone();
-                match (s.focus, key) {
+                match (s.focus, act) {
                     // Esc unwinds one layer at a time rather than always closing: a typed query is
                     // state the user can lose accidentally, so it gets its own step.
-                    (_, Key::Escape) => {
+                    (_, Some(keymap::Action::Cancel)) => {
                         if !s.query.is_empty() {
                             s.set_query(String::new());
                         } else if s.focus == Focus::Inside {
@@ -1056,12 +1144,12 @@ fn build(application: &Application) {
                             return gtk::glib::Propagation::Stop;
                         }
                     }
-                    (_, Key::ISO_Left_Tab) => {
+                    (_, Some(keymap::Action::GoOutside)) => {
                         // Shift+Tab arrives as a DIFFERENT keysym, so the plain Tab arm never saw
                         // it and the binding was simply dead.
                         s.focus = Focus::Outside;
                     }
-                    (_, Key::Tab) => {
+                    (_, Some(keymap::Action::ToggleInside)) => {
                         s.focus = if s.focus == Focus::Outside && !s.cell().is_empty() {
                             Focus::Inside
                         } else {
@@ -1072,16 +1160,16 @@ fn build(application: &Application) {
                         s.item_goal = 0;
                     }
 
-                    (Focus::Outside, Key::Left) => s.col = s.col.saturating_sub(1),
-                    (Focus::Outside, Key::Right) => {
+                    (Focus::Outside, Some(keymap::Action::MoveLeft)) => s.col = s.col.saturating_sub(1),
+                    (Focus::Outside, Some(keymap::Action::MoveRight)) => {
                         s.col = (s.col + 1).min(s.view.len().saturating_sub(1))
                     }
-                    (Focus::Outside, Key::Up) => s.row = s.row.saturating_sub(1),
-                    (Focus::Outside, Key::Down) => {
+                    (Focus::Outside, Some(keymap::Action::MoveUp)) => s.row = s.row.saturating_sub(1),
+                    (Focus::Outside, Some(keymap::Action::MoveDown)) => {
                         let last = s.folders.len().saturating_sub(1);
                         s.row = (s.row + 1).min(last);
                     }
-                    (Focus::Outside, Key::Return) => {
+                    (Focus::Outside, Some(keymap::Action::Enter)) | (Focus::Outside, Some(keymap::Action::LaunchLine)) => {
                         if shift {
                             let machine = s.view[s.col].clone();
                             let all: Vec<App> =
@@ -1104,20 +1192,20 @@ fn build(application: &Application) {
 
                     // Left/right are the only keys that CHOOSE a column, so they are the only ones
                     // that move the goal. Up/down just change line and let `clamp` re-aim.
-                    (Focus::Inside, Key::Left) => {
+                    (Focus::Inside, Some(keymap::Action::MoveLeft)) => {
                         s.item = s.item.saturating_sub(1);
                         s.item_goal = s.item;
                     }
-                    (Focus::Inside, Key::Right) => {
+                    (Focus::Inside, Some(keymap::Action::MoveRight)) => {
                         let n = s.current_line().map(|l| l.apps.len()).unwrap_or(0);
                         s.item = (s.item + 1).min(n.saturating_sub(1));
                         s.item_goal = s.item;
                     }
-                    (Focus::Inside, Key::Up) => s.line = s.line.saturating_sub(1),
-                    (Focus::Inside, Key::Down) => {
+                    (Focus::Inside, Some(keymap::Action::MoveUp)) => s.line = s.line.saturating_sub(1),
+                    (Focus::Inside, Some(keymap::Action::MoveDown)) => {
                         s.line = (s.line + 1).min(s.cell().len().saturating_sub(1))
                     }
-                    (Focus::Inside, Key::Return) => {
+                    (Focus::Inside, Some(keymap::Action::Enter)) | (Focus::Inside, Some(keymap::Action::LaunchLine)) => {
                         let machine = s.view[s.col].clone();
                         let apps: Vec<App> = if shift {
                             s.current_line().map(|l| l.apps.clone()).unwrap_or_default()
@@ -1140,7 +1228,7 @@ fn build(application: &Application) {
                         }
                     }
 
-                    (_, Key::BackSpace) => {
+                    (_, Some(keymap::Action::Backspace)) => {
                         let mut q = s.query.clone();
                         q.pop();
                         s.set_query(q);
