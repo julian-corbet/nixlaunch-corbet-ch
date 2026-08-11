@@ -9,6 +9,7 @@
 // The rule that keeps it that way: nothing in this file may import gtk.
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use crate::usage::{self, Usage};
 use serde_json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -115,6 +116,11 @@ pub enum Focus {
 pub struct State {
     /// The row set, in order, ending in the inbox. From config; see `DEFAULT_FOLDERS`.
     pub folders: Vec<String>,
+    /// How often each thing is reached for. See usage.rs.
+    pub usage: Usage,
+    /// Standard errors an item must lead by before it may move. See `significantly_greater`.
+    pub z: f64,
+    pub half_life_days: f64,
     /// The inventory EXACTLY as the category table produced it. Never mutated: filing an app is
     /// recorded in `placement` and re-applied, so a re-inventory can replace this wholesale and
     /// every filing survives. Mutating the grid in place instead would make the user's decisions
@@ -150,11 +156,29 @@ impl State {
         self.cell().get(self.line)
     }
 
+    /// Record a launch, and persist it.
+    pub fn record_launch(&mut self, machine: &str, app: &str) {
+        usage::record(&mut self.usage, machine, app, usage::now_secs(), self.half_life_days);
+        usage::save(&self.usage);
+    }
+
     /// Re-derive the grid from the pristine inventory plus the user's filings, then re-filter.
     /// Called on startup and after every drop, so there is exactly one path from
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
         self.machines = apply_placement(&self.base, &self.placement, &self.folders);
+        // Placement decides MEMBERSHIP -- which folder, which line. Usage decides ORDER within
+        // that, and only where the evidence justifies a move. Running it here rather than baking
+        // it into the placement file keeps the two separable: the file stays a record of what the
+        // user arranged, never of what the statistics did to it.
+        apply_usage(
+            &mut self.machines,
+            &mut self.folders,
+            &self.usage,
+            usage::now_secs(),
+            self.z,
+            self.half_life_days,
+        );
         self.refilter();
     }
 
@@ -402,6 +426,80 @@ pub fn launch_argv(machine: &Machine, app: &App) -> Vec<String> {
 /// Compared against each child's MIDPOINT, not its edges, so the target flips when the pointer
 /// passes the middle of an item -- the behaviour every reorderable list has, and the reason a drop
 
+/// Order the grid by how often things are actually used -- WITHOUT sorting it.
+///
+/// Three levels, all through the same significance gate, so nothing moves on noise:
+///   * items on a line, by their own score;
+///   * lines within a cell, by the sum of their apps -- an appset you start often should rise as
+///     a unit, since starting the line is one action;
+///   * the rows themselves, by the aggregate across every machine, because a row is one row for
+///     the whole grid and ordering it per-column is not a thing the layout can express.
+///
+/// The inbox is PINNED LAST and never participates. It is not a category competing for position;
+/// it is where uncategorised things wait, and a busy inbox floating to the top would bury the
+/// folders the user actually organised.
+pub fn apply_usage(
+    machines: &mut [Machine],
+    folders: &mut [String],
+    u: &Usage,
+    now: u64,
+    z: f64,
+    hl: f64,
+) {
+    for m in machines.iter_mut() {
+        let name = m.name.clone();
+        for cell in m.cells.iter_mut() {
+            for line in cell.iter_mut() {
+                usage::reorder_stable(&mut line.apps, |a| usage::score_of(u, &name, &a.name, now, hl), z);
+            }
+            usage::reorder_stable(
+                cell,
+                |l| l.apps.iter().map(|a| usage::score_of(u, &name, &a.name, now, hl)).sum::<f64>(),
+                z,
+            );
+        }
+    }
+
+    // Rows. Everything but the inbox, which stays where it is.
+    let n = folders.len();
+    if n < 3 {
+        return;
+    }
+    let inbox = n - 1;
+    let row_score = |r: usize| -> f64 {
+        machines
+            .iter()
+            .map(|m| {
+                m.cells
+                    .get(r)
+                    .map(|cell| {
+                        cell.iter()
+                            .flat_map(|l| l.apps.iter())
+                            .map(|a| usage::score_of(u, &m.name, &a.name, now, hl))
+                            .sum::<f64>()
+                    })
+                    .unwrap_or(0.0)
+            })
+            .sum()
+    };
+
+    let mut order: Vec<usize> = (0..inbox).collect();
+    usage::reorder_stable(&mut order, |r| row_score(*r), z);
+    order.push(inbox);
+
+    // Apply the permutation to the row labels and to every machine's cells together -- they are
+    // parallel by contract, and permuting one without the other silently mislabels the whole grid.
+    let new_folders: Vec<String> = order.iter().map(|&r| folders[r].clone()).collect();
+    for (i, f) in new_folders.into_iter().enumerate() {
+        folders[i] = f;
+    }
+    for m in machines.iter_mut() {
+        let cells: Vec<Vec<Line>> =
+            order.iter().map(|&r| m.cells.get(r).cloned().unwrap_or_default()).collect();
+        m.cells = cells;
+    }
+}
+
 pub fn a(name: &str, icon: &str) -> App {
     App { name: name.into(), icon: icon.into(), exec: name.to_lowercase() }
 }
@@ -496,6 +594,12 @@ mod tests {
     fn state(machines: Vec<Machine>) -> State {
         let mut s = State {
             folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
+            // No usage in the model tests: they are about placement and navigation, and a live
+            // reordering pass would make their expectations depend on statistics they are not
+            // testing. usage.rs owns those, with its own suite.
+            usage: Usage::new(),
+            z: 2.0,
+            half_life_days: crate::usage::HALF_LIFE_DAYS,
             base: machines,
             placement: Placement::new(),
             machines: Vec::new(),

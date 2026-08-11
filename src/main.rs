@@ -39,6 +39,7 @@ use std::rc::Rc;
 
 mod config;
 mod model;
+mod usage;
 use model::*;
 
 /// never has to land in the thin space between two widgets to mean something.
@@ -173,6 +174,11 @@ fn build(application: &Application) {
 
     let state = Rc::new(RefCell::new(State {
         folders,
+        usage: usage::load(),
+        // Two standard errors, ~95% confidence. Lower and the grid twitches; higher and a real
+        // preference takes weeks to show up.
+        z: 2.0,
+        half_life_days: usage::HALF_LIFE_DAYS,
         base,
         placement: load_placement(),
         machines: Vec::new(),
@@ -497,6 +503,7 @@ fn build(application: &Application) {
                             if !all.is_empty() {
                                 for app in &all {
                                     spawn(&machine, app);
+                                    s.record_launch(&machine.name, &app.name);
                                 }
                                 window.close();
                                 return gtk::glib::Propagation::Stop;
@@ -538,6 +545,7 @@ fn build(application: &Application) {
                         if !apps.is_empty() {
                             for app in &apps {
                                 spawn(&machine, app);
+                                s.record_launch(&machine.name, &app.name);
                             }
                             // A launcher that stays up after launching is a window you then have
                             // to dismiss. Closing IS the confirmation.
