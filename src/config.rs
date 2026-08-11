@@ -186,8 +186,16 @@ pub struct Config {
 impl Config {
     /// Row labels, with the inbox guaranteed present and last.
     pub fn folder_rows(&self) -> Vec<String> {
-        let mut rows: Vec<String> =
-            self.folders.iter().filter(|f| f.as_str() != "Other").cloned().collect();
+        // DEDUPED, first occurrence wins. A repeated label is not merely untidy: rows are matched
+        // by label, so a duplicate makes every app in that folder appear in two rows at once, and
+        // a drag onto either writes to whichever the code happens to reach first.
+        let mut seen = std::collections::HashSet::new();
+        let mut rows: Vec<String> = Vec::new();
+        for f in self.folders.iter().filter(|f| f.as_str() != "Other") {
+            if seen.insert(f.clone()) {
+                rows.push(f.clone());
+            }
+        }
         rows.push("Other".to_string());
         rows
     }
@@ -230,6 +238,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.folder_rows(), vec!["Terminals", "Editors", "Other"]);
+    }
+
+    /// A repeated label would make every app in that folder appear in two rows at once.
+    #[test]
+    fn duplicate_folders_are_deduped() {
+        let c: Config = serde_json::from_str(
+            r#"{"machines":[],"folders":["Chat","Editors","Chat"]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.folder_rows(), vec!["Chat", "Editors", "Other"]);
     }
 
     /// A config that names "Other" in the middle must not be able to bury the inbox.

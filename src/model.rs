@@ -92,22 +92,37 @@ pub fn placement_path() -> PathBuf {
     base.join("nixlaunch").join("placement.json")
 }
 
-pub fn load_placement() -> Placement {
-    std::fs::read_to_string(placement_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// A MISSING file is an empty arrangement; a file that exists and does not parse is not, and the
+/// difference matters because the next drag rewrites whatever we decide it was. Say so rather than
+/// silently starting from nothing and overwriting the user's real arrangement with the assumption.
+pub fn load_placement() -> (Placement, Option<String>) {
+    let path = placement_path();
+    match std::fs::read_to_string(&path) {
+        Err(_) => (Placement::new(), None),
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(p) => (p, None),
+            Err(e) => (Placement::new(), Some(format!("{}: {e}", path.display()))),
+        },
+    }
 }
 
-/// Best-effort. A launcher that refused to open because it could not write its placement file
-/// would be trading the whole feature for one of its conveniences.
+/// Best-effort about FAILING, never about corrupting. A launcher that refused to open because it
+/// could not write its placement file would trade the whole feature for one of its conveniences --
+/// but a half-written file is worse than no file, because it parses as an empty arrangement and
+/// the next drag makes that permanent. Write beside it and rename, which is atomic on any POSIX
+/// filesystem, so a reader sees the old file or the new one and never a truncated one.
 pub fn save_placement(p: &Placement) {
-    let path = placement_path();
+    write_atomic(&placement_path(), p);
+}
+
+pub fn write_atomic<T: serde::Serialize>(path: &std::path::Path, value: &T) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(text) = serde_json::to_string_pretty(p) {
-        let _ = std::fs::write(&path, text);
+    let Ok(text) = serde_json::to_string_pretty(value) else { return };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -270,7 +285,24 @@ impl State {
     ) {
         self.materialise(mi);
         let machine = self.machines[mi].name.clone();
+        let target_label = self.folders[folder].clone();
         let folders = self.placement.entry(machine).or_default();
+
+        // REMOVING SHIFTS THE TARGET. If the app is already on the destination line at an index
+        // BEFORE where it is going, taking it out moves every later position down by one -- so
+        // inserting at the originally-computed `pos` lands one place too far right, and dragging
+        // an item one step rightward within its own line silently skipped a neighbour. Work the
+        // correction out BEFORE the removal disturbs the arithmetic.
+        let mut pos = pos;
+        if let Some(li) = target_line {
+            if let Some(existing) = folders.get(&target_label).and_then(|ls| ls.get(li)) {
+                if let Some(was_at) = existing.iter().position(|n| n == app) {
+                    if was_at < pos {
+                        pos -= 1;
+                    }
+                }
+            }
+        }
 
         // Remove it from wherever it currently is, and drop any line that empties as a result.
         for lines in folders.values_mut() {
@@ -280,7 +312,7 @@ impl State {
             lines.retain(|l| !l.is_empty());
         }
 
-        let lines = folders.entry(self.folders[folder].clone()).or_default();
+        let lines = folders.entry(target_label).or_default();
         match target_line {
             // The target line can have vanished in the removal above (it held only this app), so
             // an out-of-range index degrades to "its own line" rather than panicking.
@@ -293,6 +325,8 @@ impl State {
 
         save_placement(&self.placement);
         self.rebuild();
+        // The drop can shrink the line the cursor was on. Nothing else in this path re-checks it.
+        self.clamp();
     }
 
     /// FUZZY, not substring, and not hand-rolled: `nucleo`, the matcher Helix uses. A substring
@@ -361,6 +395,10 @@ impl State {
                     self.col = c;
                     self.line = 0;
                     self.item = 0;
+                    // The goal column belongs to the cell it was chosen in. Carrying it across a
+                    // snap selects the Nth item of an unrelated cell rather than the first match,
+                    // which for a search result is the one thing the user is looking at.
+                    self.item_goal = 0;
                     return;
                 }
             }
@@ -462,12 +500,15 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
 /// Splitting is `shlex`, not `split_whitespace`: an Exec may legitimately quote an argument
 /// containing spaces, and naive splitting turns one path into two broken ones.
 pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Vec<String> {
-    let stripped: String = app
-        .exec
-        .split_whitespace()
-        .filter(|tok| !(tok.len() == 2 && tok.starts_with('%')))
-        .collect::<Vec<_>>()
-        .join(" ");
+    // SPLIT FIRST, then drop field codes. Stripping on whitespace beforehand reached INSIDE
+    // quoted arguments and collapsed runs of spaces, so `prog "a  b"` became `prog "a b"` -- a
+    // path silently altered on its way to exec.
+    let tokens: Vec<String> = shlex::split(&app.exec).unwrap_or_else(|| vec![app.exec.clone()]);
+    let tokens: Vec<String> = tokens
+        .into_iter()
+        .filter(|t| !(t.len() == 2 && t.starts_with('%')))
+        .collect();
+
     let mut argv = machine.launch.clone();
     // ORDER MATTERS, and it is the non-obvious part: the machine prefix comes FIRST, then the
     // terminal, then the program. A terminal emulator for a remote program has to run on the
@@ -476,7 +517,21 @@ pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Vec<Str
     if app.terminal {
         argv.extend(terminal.iter().cloned());
     }
-    argv.extend(shlex::split(&stripped).unwrap_or_else(|| vec![stripped.clone()]));
+    // (4) `{}` is a PLACEHOLDER when present, a prefix when absent. config.rs documented the
+    // placeholder and nothing ever substituted it, so a launch template containing one passed the
+    // two braces to exec as a literal argument.
+    if argv.iter().any(|a| a == "{}") {
+        let mut out = Vec::new();
+        for a in argv {
+            if a == "{}" {
+                out.extend(tokens.iter().cloned());
+            } else {
+                out.push(a);
+            }
+        }
+        return out;
+    }
+    argv.extend(tokens);
     argv
 }
 
@@ -948,6 +1003,52 @@ mod tests {
         let after = &s.placement["m"];
         assert!(after.contains_key("Media"), "the absent app's folder survived: {after:?}");
         assert_eq!(after["Media"], vec![vec!["gone".to_string()]]);
+    }
+
+    /// Dragging rightward within a line must land where the pointer was, not one place further.
+    ///
+    /// `pos` is a GAP index in the line as it currently reads, so gap 2 is "after b". Removing the
+    /// dragged item first shifts every later gap down by one, and not accounting for that is what
+    /// made a rightward drag overshoot its neighbour.
+    #[test]
+    fn rightward_reorder_lands_where_it_was_dropped() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c", "d"]])]);
+        s.place_app(0, "a", 0, Some(0), 2); // gap after b
+        let names: Vec<&str> =
+            s.machines[0].cells[0][0].apps.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "a", "c", "d"], "landed after b, not after c");
+    }
+
+    /// Dropping an item into the gap it already occupies is a no-op, not a shuffle.
+    #[test]
+    fn dropping_an_item_where_it_already_is_changes_nothing() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c"]])]);
+        s.place_app(0, "a", 0, Some(0), 1); // the gap between a and b IS where a lives
+        let names: Vec<&str> =
+            s.machines[0].cells[0][0].apps.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    /// Field codes are dropped AFTER splitting, so a quoted argument keeps its internal spacing.
+    #[test]
+    fn stripping_does_not_reach_inside_a_quoted_argument() {
+        let m = machine("m", 0, vec![vec!["x"]]);
+        assert_eq!(
+            launch_argv(&m, &appx("q", "prog \"/a  b\" %U"), &[]),
+            vec!["prog", "/a  b"],
+            "two spaces preserved, %U gone"
+        );
+    }
+
+    /// `{}` is substituted where it appears rather than reaching exec as a literal argument.
+    #[test]
+    fn the_launch_template_placeholder_is_substituted() {
+        let mut m = machine("m", 0, vec![vec!["x"]]);
+        m.launch = vec!["ssh".into(), "box".into(), "{}".into()];
+        assert_eq!(
+            launch_argv(&m, &appx("Helix", "helix %F"), &[]),
+            vec!["ssh", "box", "helix"]
+        );
     }
 
     /// clamp() is the only thing standing between a shrinking grid and an index panic.

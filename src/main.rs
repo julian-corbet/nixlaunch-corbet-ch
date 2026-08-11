@@ -127,6 +127,10 @@ fn main() {
 
 fn build(application: &Application) {
     let (folders, base, theme, terminal_cmd_outer, keyboard_mode, config_error) = load_world();
+    // A placement that exists and does not parse is reported, never assumed empty: the next drag
+    // rewrites whatever we decide it was, so guessing "nothing" would overwrite a real arrangement.
+    let (placement, placement_error) = load_placement();
+    let startup_error = config_error.clone().or(placement_error);
 
 
     // NO default size. A launcher should be exactly as big as what it is showing: a fixed size
@@ -199,7 +203,7 @@ fn build(application: &Application) {
         z: 2.0,
         half_life_days: usage::HALF_LIFE_DAYS,
         base,
-        placement: load_placement(),
+        placement: placement,
         machines: Vec::new(),
         view: Vec::new(),
         col: 0,
@@ -293,7 +297,8 @@ fn build(application: &Application) {
         let hint = hint.clone();
         let holder = render_holder.clone();
         let theme_error = theme.error.clone();
-        let config_err = config_error.clone();
+        let startup_err = startup_error.clone();
+        let config_err = startup_err.clone();
         let icon_px = theme.icon_size;
         move || {
             let s = state.borrow();
@@ -304,7 +309,7 @@ fn build(application: &Application) {
             // load is precisely the outcome config.rs's own comment says must not happen silently.
             if let Some(err) = &config_err {
                 search.set_markup(&format!(
-                    "<span foreground=\"{}\">config error \u{2014} showing demo data:</span> {}",
+                    "<span foreground=\"{}\">startup problem:</span> {}",
                     theme_error,
                     escape(err)
                 ));
@@ -517,6 +522,11 @@ fn build(application: &Application) {
                             return gtk::glib::Propagation::Stop;
                         }
                     }
+                    (_, Key::ISO_Left_Tab) => {
+                        // Shift+Tab arrives as a DIFFERENT keysym, so the plain Tab arm never saw
+                        // it and the binding was simply dead.
+                        s.focus = Focus::Outside;
+                    }
                     (_, Key::Tab) => {
                         s.focus = if s.focus == Focus::Outside && !s.cell().is_empty() {
                             Focus::Inside
@@ -601,10 +611,17 @@ fn build(application: &Application) {
                         s.refilter();
                     }
                     _ => {
-                        if let Some(ch) = key.to_unicode() {
-                            if !ch.is_control() {
-                                s.query.push(ch);
-                                s.refilter();
+                        // A chord is a command, not text. Without this, Ctrl-W and Alt-F typed a
+                        // literal "w" and "f" into the search box.
+                        let chord = mods.contains(ModifierType::CONTROL_MASK)
+                            || mods.contains(ModifierType::ALT_MASK)
+                            || mods.contains(ModifierType::SUPER_MASK);
+                        if !chord {
+                            if let Some(ch) = key.to_unicode() {
+                                if !ch.is_control() {
+                                    s.query.push(ch);
+                                    s.refilter();
+                                }
                             }
                         }
                     }
@@ -718,6 +735,12 @@ fn spawn(machine: &Machine, app: &App, terminal: &[String]) {
             "nixlaunch: {} needs a terminal and none is configured (set `terminal` in config)",
             app.name
         );
+    }
+    if app.exec.trim().is_empty() {
+        // Without this the argv is just the machine prefix, and a remote column would run its
+        // forwarding wrapper with no command -- opening a stray session instead of an app.
+        eprintln!("nixlaunch: {} has an empty exec line", app.name);
+        return;
     }
     let argv = launch_argv(machine, app, terminal);
     let Some((bin, args)) = argv.split_first() else {
