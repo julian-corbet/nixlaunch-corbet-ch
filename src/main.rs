@@ -695,8 +695,7 @@ fn build(application: &Application) {
                     // state the user can lose accidentally, so it gets its own step.
                     (_, Key::Escape) => {
                         if !s.query.is_empty() {
-                            s.query.clear();
-                            s.refilter();
+                            s.set_query(String::new());
                         } else if s.focus == Focus::Inside {
                             s.focus = Focus::Outside;
                         } else {
@@ -789,8 +788,9 @@ fn build(application: &Application) {
                     }
 
                     (_, Key::BackSpace) => {
-                        s.query.pop();
-                        s.refilter();
+                        let mut q = s.query.clone();
+                        q.pop();
+                        s.set_query(q);
                     }
                     _ => {
                         // A chord is a command, not text. Without this, Ctrl-W and Alt-F typed a
@@ -801,8 +801,9 @@ fn build(application: &Application) {
                         if !chord {
                             if let Some(ch) = key.to_unicode() {
                                 if !ch.is_control() {
-                                    s.query.push(ch);
-                                    s.refilter();
+                                    let mut q = s.query.clone();
+                                    q.push(ch);
+                                    s.set_query(q);
                                 }
                             }
                         }

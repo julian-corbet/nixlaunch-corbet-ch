@@ -377,6 +377,28 @@ impl State {
         self.clamp();
     }
 
+    /// Change the query, and put the cursor back at the top of what is now on screen.
+    ///
+    /// SEPARATE FROM `refilter`, and the distinction is the bug this fixes. `refilter` runs for two
+    /// unrelated reasons -- the query changed, or the grid was rebuilt after a drag -- and only one
+    /// of them should move the cursor. Resetting inside `refilter` would drag the selection away
+    /// from the app the user just dropped; not resetting at all leaves the goal column pointing at
+    /// a position that now holds a different app.
+    ///
+    /// `item_goal` is the column that up/down preserves, and it is only meaningful while a line's
+    /// membership is stable. A query rewrites that membership, so the goal is stale by definition:
+    /// keeping it selects the Nth surviving app rather than the first match, and the first match is
+    /// the one the user is looking at while they type. `snap_to_content` already reasoned this out
+    /// for the case where the cell empties entirely; this is the same rule for the case where it
+    /// does not.
+    pub fn set_query(&mut self, q: String) {
+        self.query = q;
+        self.line = 0;
+        self.item = 0;
+        self.item_goal = 0;
+        self.refilter();
+    }
+
     /// FUZZY, not substring, and not hand-rolled: `nucleo`, the matcher Helix uses. A substring
     /// filter is the obvious thing to write and the wrong thing to ship -- typing "e" matched
     /// almost every application here, because nearly every name contains one. Fuzzy matching with
@@ -565,7 +587,7 @@ pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Vec<Str
     if app.terminal {
         argv.extend(terminal.iter().cloned());
     }
-    // (4) `{}` is a PLACEHOLDER when present, a prefix when absent. config.rs documented the
+    // `{}` is a PLACEHOLDER when present, a prefix when absent. config.rs documented the
     // placeholder and nothing ever substituted it, so a launch template containing one passed the
     // two braces to exec as a literal argument.
     if argv.iter().any(|a| a == "{}") {
@@ -1136,6 +1158,45 @@ mod tests {
             vec![vec!["rare".to_string()], vec!["popular".to_string()]],
             "the FILE kept the arrangement, not the ranking"
         );
+    }
+
+    /// Typing puts the cursor on the first match, not on whatever the goal column happens to hit.
+    ///
+    /// The goal column is what makes up/down preserve your position, and it is only meaningful
+    /// while a line's membership holds still. A query rewrites that membership, so a surviving
+    /// goal selects the Nth survivor -- which is an arbitrary app, while the one the user is
+    /// looking at as they type is the first.
+    #[test]
+    fn a_query_puts_the_cursor_on_the_first_match() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["alpha", "beta", "gamma", "delta"]])]);
+        s.focus = Focus::Inside;
+        s.item = 3;
+        s.item_goal = 3;
+
+        // Every name contains an "a", so nothing is filtered out and only the cursor can move.
+        s.set_query("a".into());
+        s.clamp();
+
+        assert_eq!(s.item, 0, "landed on the first match");
+        assert_eq!(s.item_goal, 0, "and the stale goal column went with it");
+        assert_eq!(s.view[0].cells[0][0].apps[s.item].name, "alpha");
+    }
+
+    /// ...but a REBUILD must not move the cursor, which is why the reset lives in `set_query` and
+    /// not in `refilter`. A drag re-derives the whole grid, and a cursor that jumped to the top
+    /// afterwards would leave the app the user just dropped.
+    #[test]
+    fn a_rebuild_leaves_the_cursor_where_it_was() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c", "d"]])]);
+        s.focus = Focus::Inside;
+        s.item = 2;
+        s.item_goal = 2;
+
+        s.rebuild();
+        s.clamp();
+
+        assert_eq!(s.item, 2, "a rebuild is not a query");
+        assert_eq!(s.item_goal, 2);
     }
 
     /// Dropping an item into the gap it already occupies is a no-op, not a shuffle.
