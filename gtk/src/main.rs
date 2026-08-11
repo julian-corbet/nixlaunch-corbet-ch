@@ -499,21 +499,35 @@ fn build(application: &Application) {
     // places an unanchored layer surface on is not knowable before it maps, so sizing to monitor 0
     // overflows the moment it lands on a shorter panel -- and a layer surface has no titlebar to
     // drag back into view. Fitting the smallest is correct wherever it ends up.
-    let smallest = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| {
+    let extreme = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32, want_max: bool| {
         gtk::gdk::Display::default()
             .map(|d| {
                 let ms = d.monitors();
-                (0..ms.n_items())
+                let vals = (0..ms.n_items())
                     .filter_map(|i| ms.item(i).and_downcast::<gtk::gdk::Monitor>())
                     .map(|m| pick(&m.geometry()))
-                    .filter(|v| *v > 0)
-                    .min()
-                    .unwrap_or(fallback)
+                    .filter(|v| *v > 0);
+                if want_max { vals.max() } else { vals.min() }.unwrap_or(fallback)
             })
             .unwrap_or(fallback)
     };
+    let largest = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| extreme(pick, fallback, true);
+    let smallest = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| extreme(pick, fallback, false);
+    // HEIGHT against the smallest monitor, WIDTH against the largest, and the asymmetry is the
+    // whole lesson of this cap.
+    //
+    // Capping width at 0.9 of the SMALLEST display looked symmetrical and was wrong: the grid
+    // needs about 3270px for three machines, the smallest display here is 1920 wide, so the window
+    // was cut to 1728 and two of the three machines were pushed into the horizontal scroll that
+    // had just been added. The launcher looked like it had lost them. A cap that hides the primary
+    // content is worse than the overflow it was guarding against.
+    //
+    // Width can afford the largest because overflow is now REACHABLE -- the viewport follows the
+    // cursor on both axes, so a column past the edge scrolls into view when you arrow to it.
+    // Height stays on the smallest because a too-tall window is the thing that is genuinely
+    // unpleasant: it covers the session it is supposed to sit over.
     let screen_h = smallest(|g| g.height(), 1080);
-    let screen_w = smallest(|g| g.width(), 1920);
+    let screen_w = largest(|g| g.width(), 1920);
     scroller.set_max_content_height((screen_h as f64 * theme.max_height_fraction) as i32);
     // The width cap is the same rule as the height one and exists for the same reason: content is
     // allowed to decide the window's size right up to the point where it would put part of itself
