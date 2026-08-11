@@ -122,11 +122,12 @@ Working and in daily use against real inventories. Not yet packaged for anything
 
 Known gaps, stated rather than hidden:
 
-- No frecency ordering yet. It is easy to add and it fights muscle memory, which is the thing that
-  makes a spatial launcher fast in the first place — so it needs a decision, not a default.
-- Dragging **across** machines is refused. Filing is per machine, and "Firefox on one box" is not
-  the same object as "Firefox on another"; whether a cross-machine drag should mean anything is
-  genuinely open.
+- No usage-based reordering yet. It is easy to add and it fights muscle memory, which is the thing
+  that makes a spatial launcher fast in the first place — so it needs a decision, not a default.
+- Dragging **across** machines is refused, deliberately and permanently. Filing is per machine and
+  "Firefox on one box" is not the same object as "Firefox on another" — a launcher cannot move an
+  application between machines, so a drag that looked like it did would be lying about what
+  happened.
 - The launch path is wired for the inventory's own `exec`; per-machine `launch` prefixes are
   declared but not yet exercised on every path.
 
