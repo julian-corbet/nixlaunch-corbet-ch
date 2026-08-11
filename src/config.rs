@@ -113,6 +113,17 @@ pub struct Theme {
     pub error: String,
     pub border: String,
     pub icon_size: i32,
+    /// Apps per line when packing a fresh inventory. Taste, not mechanism: it is how many
+    /// left/right steps a row costs before up/down is the faster move, and the answer depends on
+    /// how many machine columns you have and how wide the display is. Two machines on an ultrawide
+    /// want more; six on a laptop want fewer.
+    pub line_width: usize,
+    /// How much of the display the grid may occupy before it scrolls. Display-RELATIVE is
+    /// mechanism and stays; the fraction itself is a preference about how much of the session
+    /// stays visible behind the launcher.
+    pub max_height_fraction: f64,
+    /// Minimum width of the search bar, and so effectively of the window.
+    pub width: i32,
 }
 
 impl Default for Theme {
@@ -127,6 +138,9 @@ impl Default for Theme {
             error: "#B91322".into(),
             border: "#1C1C1C".into(),
             icon_size: 20,
+            line_width: 4,
+            max_height_fraction: 0.66,
+            width: 560,
         }
     }
 }

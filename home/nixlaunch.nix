@@ -125,9 +125,17 @@ in
         icon_size = 20;
       };
       description = ''
-        Palette overrides, written verbatim into the config file. Recognised keys: `ground`,
-        `surface`, `fg`, `muted`, `dim`, `accent`, `error`, `border`, and the integer `icon_size`.
-        Anything omitted keeps the program's own default.
+        Appearance overrides, written verbatim into the config file. Anything omitted keeps the
+        program's own default.
+
+        Colours: `ground`, `surface`, `fg`, `muted`, `dim`, `accent`, `error`, `border`.
+
+        Numbers: `icon_size` (default 20, keep it in proportion to your UI font), `line_width`
+        (default 4 — apps per line, which is how many left/right steps a row costs before up/down
+        is the faster move; more machine columns or a narrower display want fewer),
+        `max_height_fraction` (default 0.66 — how much of the display the grid may take before it
+        scrolls, so how much of the session stays visible behind it), and `width` (default 560,
+        the minimum window width).
 
         The built-in defaults are a working dark set so the launcher is usable the moment it is
         installed — they are NOT a house palette. Override them with whatever the rest of your

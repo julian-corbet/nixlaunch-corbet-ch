@@ -154,7 +154,17 @@ fn build(application: &Application) {
     let provider = CssProvider::new();
     provider.load_from_string(&css(&theme));
     if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &provider, 800);
+        // APPLICATION (600), not 800. 800 is GTK_STYLE_PROVIDER_PRIORITY_USER -- the slot GTK
+        // reserves for the user's OWN ~/.config/gtk-4.0/gtk.css. An application sheet sitting
+        // there outranks the one escape hatch a consumer has left, so a palette they could not
+        // otherwise reach also could not be overridden by the mechanism GTK provides for exactly
+        // that. This is a correctness bug, not a preference: an app must never occupy the user's
+        // priority slot.
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
 
     if let Some(e) = &config_error {
@@ -194,7 +204,7 @@ fn build(application: &Application) {
     search.set_xalign(0.0);
     search.set_hexpand(true);
     search.add_css_class("search");
-    search.set_width_request(560);
+    search.set_width_request(theme.width);
     searchrow.append(&search);
     root.append(&searchrow);
 
@@ -216,7 +226,7 @@ fn build(application: &Application) {
         .map(|m| m.geometry().height())
         .filter(|h| *h > 0)
         .unwrap_or(1080);
-    scroller.set_max_content_height((screen_h as f64 * 0.66) as i32);
+    scroller.set_max_content_height((screen_h as f64 * theme.max_height_fraction) as i32);
 
     let grid = gtk::Grid::new();
     // NOT column-homogeneous. That makes EVERY column the same width including column 0, which
@@ -566,10 +576,6 @@ fn build(application: &Application) {
 /// repo testable by someone with no fleet. A config that EXISTS but does not parse is a different
 /// thing entirely and is reported rather than silently replaced by fixtures, because silently
 /// showing invented machines when the real ones failed to load is the worst of both.
-/// Apps per line when packing a fresh inventory. Not a layout constant so much as a navigation
-/// one: it is how many left/right steps a row costs before up/down is the faster move.
-const LINE_WIDTH: usize = 4;
-
 fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Option<String>) {
     let default_rows = || DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect::<Vec<_>>();
     match config::load() {
@@ -577,7 +583,7 @@ fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Option<String>) {
         Ok(None) => (default_rows(), fixture(), config::Theme::default(), None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
-            let machines = cfg.machines.iter().map(|mc| inventory(mc, &rows)).collect();
+            let machines = cfg.machines.iter().map(|mc| inventory(mc, &rows, cfg.theme.line_width)).collect();
             (rows, machines, cfg.theme.clone(), None)
         }
     }
@@ -588,7 +594,7 @@ fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Option<String>) {
 /// Everything this program knows about detection is in these few lines: run argv, read JSON. No
 /// SSH, no .desktop parsing, no package managers -- see config.rs on why that boundary is the
 /// point rather than a simplification.
-fn inventory(mc: &config::MachineConfig, rows: &[String]) -> Machine {
+fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> Machine {
     let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
     let mut error = None;
 
@@ -626,10 +632,10 @@ fn inventory(mc: &config::MachineConfig, rows: &[String]) -> Machine {
                 // something the user makes by dragging -- so giving every app a line of its own
                 // produces a cell as tall as the folder is long, and destroys the 2D navigation
                 // inside the box: up/down would step one app at a time and left/right would do
-                // nothing. Chunking into rows of `LINE_WIDTH` makes a cell a small grid, which is
+                // nothing. Chunking into rows of `theme.line_width` makes a cell a small grid, which is
                 // what the inside of a box is supposed to be. The fixture hid this completely,
                 // because hand-written fixtures are always short.
-                for chunk in folder.apps.chunks(LINE_WIDTH) {
+                for chunk in folder.apps.chunks(line_width.max(1)) {
                     cells[r].push(Line {
                         apps: chunk
                             .iter()
