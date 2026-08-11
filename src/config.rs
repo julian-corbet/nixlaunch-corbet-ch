@@ -140,6 +140,14 @@ pub struct Theme {
     /// mechanism and stays; the fraction itself is a preference about how much of the session
     /// stays visible behind the launcher.
     pub max_height_fraction: f64,
+    /// How much of the display's WIDTH the grid may take before it scrolls sideways.
+    ///
+    /// The companion to `max_height_fraction`, and it exists for the same reason rather than for
+    /// symmetry: more machine columns than fit meant a window wider than the screen, with the far
+    /// columns unreachable by scrollbar, keyboard or drag. Higher than the height fraction because
+    /// a launcher spanning most of the width still leaves the session legible behind it, where one
+    /// spanning most of the height does not.
+    pub max_width_fraction: f64,
     /// Minimum width of the search bar, and so effectively of the window.
     pub width: i32,
 }
@@ -158,6 +166,7 @@ impl Default for Theme {
             icon_size: 20,
             line_width: 4,
             max_height_fraction: 0.66,
+            max_width_fraction: 0.9,
             width: 560,
         }
     }

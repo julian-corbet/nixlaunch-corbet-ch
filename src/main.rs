@@ -34,6 +34,7 @@ use gtk::{
 };
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 
@@ -173,6 +174,50 @@ impl Painted {
     }
 }
 
+/// Icons at the size they are DRAWN, loaded once.
+///
+/// GTK's own `Image::from_icon_name` resolves the name to a FILE and keeps a texture at that
+/// file's resolution, scaling it down at draw time. That is right for an application showing a few
+/// icons and ruinous here: desktop entries ship whatever size upstream felt like -- 192, 256, many
+/// at 512 -- and this grid holds a couple of hundred of them at twenty pixels. Measured on a real
+/// three-machine inventory, icons were 106MB of the process's 116MB of private dirty memory: the
+/// same 191 applications with their icon names blanked came to 16MB. Ninety percent of a launcher's
+/// footprint was pixels nobody could see.
+///
+/// So: resolve the name, load the file DOWNSCALED, and keep only the small texture. A 20px icon is
+/// 1.6kB where its 512px source is a megabyte.
+///
+/// SVGs are left to GTK deliberately. A vector icon is rasterised at the size it is asked for, so
+/// it never had this problem, and routing it through the pixbuf loader would add a dependency on
+/// librsvg being installed to gain nothing.
+///
+/// CACHED BY NAME, which matters for more than the duplicates: the grid is rebuilt on every
+/// keystroke of a query, and without a cache each rebuild re-read every icon file from disk.
+fn icon_texture(
+    name: &str,
+    px: i32,
+    theme: &gtk::IconTheme,
+    cache: &Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>>,
+) -> Option<gtk::gdk::Texture> {
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(hit) = cache.borrow().get(name) {
+        return hit.clone();
+    }
+    let made = theme
+        .lookup_icon(name, &[], px, 1, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
+        .file()
+        .and_then(|f| f.path())
+        // A miss here is not a failure: no file, or an SVG, both fall through to GTK's own path,
+        // which is correct for them.
+        .filter(|p| p.extension().is_none_or(|e| e != "svg"))
+        .and_then(|p| gtk::gdk_pixbuf::Pixbuf::from_file_at_size(&p, px, px).ok())
+        .map(|pb| gtk::gdk::Texture::for_pixbuf(&pb));
+    cache.borrow_mut().insert(name.to_string(), made.clone());
+    made
+}
+
 fn class<W: IsA<gtk::Widget>>(w: &W, name: &str, on: bool) {
     if on {
         w.add_css_class(name);
@@ -181,7 +226,30 @@ fn class<W: IsA<gtk::Widget>>(w: &W, name: &str, on: bool) {
     }
 }
 
+// glibc's allocator, told to hand image buffers straight back to the kernel.
+//
+// Decoding 95 icons churns large blocks: a 1024x1024 source is 4MB, and even downscaled output is
+// allocated after the full-size buffer exists. glibc frees those to its own arena rather than to
+// the OS, so the process kept ~55MB that nothing referenced -- measured as the gap between the
+// icon cache's 70MB private and the 15MB private of the same grid with icons switched off, which
+// no amount of retained TEXTURE could explain: all 95 at full source size come to 12MB.
+//
+// M_MMAP_THRESHOLD pinned low makes every allocation this size mmap'd, so `free` unmaps it and the
+// memory is gone immediately rather than pooled. The default is adaptive and grows to 32MB, which
+// is right for a server recycling buffers and wrong for a program that decodes images once.
+// M_TRIM_THRESHOLD makes the remaining arena give ground back rather than hold its high-water mark.
+unsafe extern "C" {
+    fn mallopt(param: i32, value: i32) -> i32;
+    fn malloc_trim(pad: usize) -> i32;
+}
+const M_TRIM_THRESHOLD: i32 = -1;
+const M_MMAP_THRESHOLD: i32 = -3;
+
 fn main() {
+    unsafe {
+        mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+        mallopt(M_TRIM_THRESHOLD, 256 * 1024);
+    }
     let application = Application::builder().application_id("io.github.nixlaunch").build();
     application.connect_activate(|app| {
         // GApplication is single-instance by default, so a second launch does not start a second
@@ -300,6 +368,16 @@ fn build(application: &Application) {
     // Applies saved filings, then populates `view` with an empty query, i.e. everything.
     state.borrow_mut().rebuild();
 
+    // Once the grid exists, give back what building it borrowed. This runs after the first frame
+    // rather than before it, because the point is to return decode scratch AFTER the decoding is
+    // done -- and it is deliberately not on the rebuild path: walking the heap on every keystroke
+    // would trade the memory back for the latency this program is judged on.
+    gtk::glib::idle_add_local_once(|| {
+        unsafe {
+            malloc_trim(0);
+        }
+    });
+
     let root = GBox::new(Orientation::Vertical, 0);
     root.add_css_class("root");
 
@@ -325,7 +403,11 @@ fn build(application: &Application) {
     // way to reach the middle. The grid keeps its natural size until it hits a ceiling and then
     // scrolls, so a small estate still gets a window that hugs its content.
     let scroller = gtk::ScrolledWindow::new();
-    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    // BOTH AXES. Horizontal was Never, which is only safe while the content happens to fit: add
+    // machines until the grid is wider than the display and the far columns become unreachable by
+    // any means at all -- no scrollbar, no keyboard, and a layer surface has no titlebar to drag.
+    // The same failure the height cap already existed to prevent, on the axis nobody had hit yet.
+    scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
     scroller.set_propagate_natural_height(true);
     scroller.set_propagate_natural_width(true);
     // Relative to the DISPLAY, not a magic number. A launcher that is 820px tall is fine on this
@@ -337,18 +419,26 @@ fn build(application: &Application) {
     // places an unanchored layer surface on is not knowable before it maps, so sizing to monitor 0
     // overflows the moment it lands on a shorter panel -- and a layer surface has no titlebar to
     // drag back into view. Fitting the smallest is correct wherever it ends up.
-    let screen_h = gtk::gdk::Display::default()
-        .map(|d| {
-            let ms = d.monitors();
-            (0..ms.n_items())
-                .filter_map(|i| ms.item(i).and_downcast::<gtk::gdk::Monitor>())
-                .map(|m| m.geometry().height())
-                .filter(|h| *h > 0)
-                .min()
-                .unwrap_or(1080)
-        })
-        .unwrap_or(1080);
+    let smallest = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| {
+        gtk::gdk::Display::default()
+            .map(|d| {
+                let ms = d.monitors();
+                (0..ms.n_items())
+                    .filter_map(|i| ms.item(i).and_downcast::<gtk::gdk::Monitor>())
+                    .map(|m| pick(&m.geometry()))
+                    .filter(|v| *v > 0)
+                    .min()
+                    .unwrap_or(fallback)
+            })
+            .unwrap_or(fallback)
+    };
+    let screen_h = smallest(|g| g.height(), 1080);
+    let screen_w = smallest(|g| g.width(), 1920);
     scroller.set_max_content_height((screen_h as f64 * theme.max_height_fraction) as i32);
+    // The width cap is the same rule as the height one and exists for the same reason: content is
+    // allowed to decide the window's size right up to the point where it would put part of itself
+    // off the screen, and past that it scrolls instead.
+    scroller.set_max_content_width((screen_w as f64 * theme.max_width_fraction) as i32);
 
     let grid = gtk::Grid::new();
     // NOT column-homogeneous. That makes EVERY column the same width including column 0, which
@@ -414,6 +504,14 @@ fn build(application: &Application) {
     // than type at it.
     let painted: Rc<RefCell<Painted>> = Rc::new(RefCell::new(Painted::default()));
 
+    // One theme handle and one texture cache for the life of the process, so a rebuild costs no
+    // disk reads at all after the first.
+    let icon_theme = gtk::gdk::Display::default()
+        .map(|d| gtk::IconTheme::for_display(&d))
+        .unwrap_or_default();
+    let icons: Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
     // `render` must be callable from inside a drop handler that `render` itself installed, so it
     // needs a handle to itself. The holder is that indirection -- filled in immediately after
     // construction, and only ever read while no other borrow of it is live.
@@ -426,6 +524,8 @@ fn build(application: &Application) {
         let hint = hint.clone();
         let theme_error = theme.error.clone();
         let config_err = startup_error.clone();
+        let scroller = scroller.clone();
+        let grid_for_scroll = grid.clone();
         move || {
             let s = state.borrow();
 
@@ -473,6 +573,41 @@ fn build(application: &Application) {
             }
             p.mark(now, true);
             p.last = Some(now);
+
+            // BRING THE CURSOR INTO VIEW. The grid is capped at a fraction of the display and
+            // scrolls past that, but nothing was ever moving the viewport -- so arrowing down into
+            // a clipped row moved the selection somewhere the user could not see, and the launcher
+            // silently became a thing you navigate blind. A scrollbar reaches those rows; the
+            // keyboard could not, which is the wrong way round for a keyboard-driven launcher.
+            if let Some(cell) = p.cells.get(now.row).and_then(|r| r.get(now.col)) {
+                // DEFERRED, because at this point the widget may have no allocation yet: a repaint
+                // that follows a rebuild runs before layout, and `compute_bounds` on an
+                // unallocated widget answers with nothing (or with zeroes, which would scroll to
+                // the top and look like the viewport jumping on its own).
+                let bx = cell.bx.clone();
+                let scroller = scroller.clone();
+                let grid = grid_for_scroll.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    let Some(b) = bx.compute_bounds(&grid) else { return };
+                    // ONE RULE, BOTH AXES. Moving left and right across machines runs off the
+                    // edge exactly as moving down through folders runs off the bottom, and a fix
+                    // that only followed the cursor vertically would be the same bug left half
+                    // done. Nearest edge only: centring the selection would move the whole grid on
+                    // every keypress, and a spatial launcher is fast precisely because things stay
+                    // where they were learned -- scrolling only when the target is genuinely
+                    // off-screen keeps everything else still.
+                    let reveal = |adj: &gtk::Adjustment, near: f64, far: f64| {
+                        let (view, page) = (adj.value(), adj.page_size());
+                        if near < view {
+                            adj.set_value(near);
+                        } else if far > view + page {
+                            adj.set_value(far - page);
+                        }
+                    };
+                    reveal(&scroller.vadjustment(), b.y() as f64, (b.y() + b.height()) as f64);
+                    reveal(&scroller.hadjustment(), b.x() as f64, (b.x() + b.width()) as f64);
+                });
+            }
         }
     });
 
@@ -485,6 +620,8 @@ fn build(application: &Application) {
         let painted = painted.clone();
         let paint = paint.clone();
         let icon_px = theme.icon_size;
+        let icon_theme = icon_theme.clone();
+        let icons = icons.clone();
         move || {
             let s = state.borrow();
 
@@ -653,7 +790,10 @@ fn build(application: &Application) {
                                 });
                                 b.add_controller(src);
                             }
-                            let img = Image::from_icon_name(&app.icon);
+                            let img = match icon_texture(&app.icon, icon_px, &icon_theme, &icons) {
+                                Some(tex) => Image::from_paintable(Some(&tex)),
+                                None => Image::from_icon_name(&app.icon),
+                            };
                             img.set_pixel_size(icon_px);
                             b.append(&img);
                             let l = Label::new(Some(&app.name));
