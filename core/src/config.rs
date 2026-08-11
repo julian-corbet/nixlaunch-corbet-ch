@@ -50,6 +50,26 @@ pub fn parse_inventory(bytes: &[u8]) -> Result<Inventory, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("unreadable inventory: {e}"))
 }
 
+/// One named row inside a box, and which applications belong in it.
+///
+/// The names alone were half a feature: declaring "biz", "leis" and "priv" builds three empty
+/// shelves and leaves every application in the catch-all, which is more rows to look past rather
+/// than fewer. What makes a subcategory worth having is that things are IN it.
+///
+/// Membership is declared beside the name rather than dragged in one application at a time,
+/// because two hundred applications is not a drag-and-drop job -- and because an arrangement that
+/// exists only in a state file cannot be reviewed, copied to another machine, or explained.
+/// Dragging still works and still wins: it writes to placement, which is applied after this.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct SubRow {
+    pub name: String,
+    /// Matched case-insensitively as a SUBSTRING of the application's id or its display name, so
+    /// `signal` catches `signal-desktop.desktop` without anyone needing to know which spelling a
+    /// package happens to use. Precision is available by writing more of the name.
+    #[serde(default)]
+    pub apps: Vec<String>,
+}
+
 /// The JSON one `inventory` command must print. Deliberately identical to what
 /// `rlaunch --json <host>` already emits, so the common case needs no adapter.
 #[derive(Deserialize, Debug, Clone)]
@@ -265,7 +285,7 @@ pub struct Config {
 
     #[serde(default)]
 
-    pub subrows: std::collections::HashMap<String, Vec<String>>,
+    pub subrows: std::collections::HashMap<String, Vec<SubRow>>,
 }
 
 impl Config {
@@ -293,7 +313,7 @@ impl Config {
         };
         for f in self.folders.iter().filter(|f| f.as_str() != "Other") {
             for sub in self.subrows.get(f).into_iter().flatten() {
-                push(&mut rows, format!("{f}/{sub}"), &mut seen);
+                push(&mut rows, format!("{f}/{}", sub.name), &mut seen);
             }
             push(&mut rows, f.clone(), &mut seen);
         }

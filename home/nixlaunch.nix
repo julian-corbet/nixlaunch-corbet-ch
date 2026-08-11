@@ -136,11 +136,34 @@ in
     };
 
     subrows = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.listOf lib.types.str);
+      type = lib.types.attrsOf (lib.types.listOf (lib.types.submodule {
+        options = {
+          name = lib.mkOption {
+            type = lib.types.str;
+            description = "The row's label. Short: it sits in a narrow column beside every row.";
+          };
+          apps = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              Which applications belong on this row, matched case-insensitively as a SUBSTRING of
+              an application's id or display name -- `signal` catches `signal-desktop.desktop`
+              without anyone needing to know which spelling the package used.
+
+              Declared here rather than dragged in one at a time, because two hundred applications
+              is not a drag-and-drop job, and because an arrangement that exists only in a state
+              file cannot be reviewed, copied to another machine, or explained. Dragging still
+              works and still wins: it writes to placement, which is applied after this.
+            '';
+          };
+        };
+      }));
       default = { };
       example = {
-        Chat = [ "business" "leisure" ];
-        System = [ "hardware" "packages" "monitoring" ];
+        Chat = [
+          { name = "biz"; apps = [ "teams" "zoom" ]; }
+          { name = "priv"; apps = [ "signal" "telegram" ]; }
+        ];
       };
       description = ''
         Named rows INSIDE a box, keyed by folder label.

@@ -1007,7 +1007,7 @@ fn build(application: &Application) {
         let reveal: Rc<dyn Fn()> = Rc::new(move || {
             if let Ok(Some(cfg)) = config::load() {
                 let rows = cfg.folder_rows();
-                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width);
+                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
                 let mut s = state.borrow_mut();
                 s.base = fresh;
                 s.query.clear();
@@ -1207,7 +1207,7 @@ fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, Strin
         Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], "layer".into(), "exclusive".into(), true, None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
-            let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width);
+            let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
             (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), cfg.surface.clone(), cfg.keyboard.clone(), cfg.exit_on_focus_loss, None)
         }
     }
@@ -1237,11 +1237,12 @@ fn inventory_all(
     machines: &[config::MachineConfig],
     rows: &[String],
     line_width: usize,
+    subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
 ) -> Vec<Machine> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = machines
             .iter()
-            .map(|mc| scope.spawn(move || inventory(mc, rows, line_width)))
+            .map(|mc| scope.spawn(move || inventory(mc, rows, line_width, subrows)))
             .collect();
         handles
             .into_iter()
@@ -1269,6 +1270,7 @@ fn inventory(
     mc: &config::MachineConfig,
     rows: &[String],
     line_width: usize,
+    subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
 ) -> Machine {
     let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
     // Declared without a value: both arms of the match below assign it, so an initial `None`
@@ -1300,36 +1302,56 @@ fn inventory(
             for folder in inv.folders {
                 // A label this estate does not list falls into the inbox rather than being
                 // dropped: an app nobody categorised must still be reachable.
-                let r = rows
-                    .iter()
-                    .position(|x| *x == folder.label)
-                    .unwrap_or(rows.len().saturating_sub(1));
-                // PACK, do not stack. A fresh inventory has no appsets in it -- an appset is
-                // something the user makes by dragging -- so giving every app a line of its own
-                // produces a cell as tall as the folder is long, and destroys the 2D navigation
-                // inside the box: up/down would step one app at a time and left/right would do
-                // nothing. Chunking into rows of `theme.line_width` makes a cell a small grid, which is
-                // what the inside of a box is supposed to be. The fixture hid this completely,
-                // because hand-written fixtures are always short.
-                for chunk in folder.apps.chunks(line_width.max(1)) {
-                    cells[r].push(Line {
-                        // Freshly inventoried lines are unnamed. A name is something the operator
-                        // declares or the user creates by filing; discovery has no opinion on it.
-                        name: None,
-                        apps: chunk
-                            .iter()
-                            .map(|a| App {
-                                // No id from this provider means it predates the field, and the
-                                // name is the best identity available -- which is exactly the old
-                                // behaviour, correct until two of its apps share a display name.
-                                id: a.id.clone().unwrap_or_else(|| a.name.clone()),
-                                name: a.name.clone(),
-                                icon: a.icon.clone(),
-                                exec: a.exec.clone(),
-                                terminal: a.terminal,
+                // WHICH ROW, and a declared subcategory beats the catch-all.
+                //
+                // The category table said which BOX this belongs in; the subcategory says which
+                // shelf inside it. Matching happens here, once, against the operator's own list,
+                // rather than each application having to be dragged into place -- two hundred of
+                // them is not a drag-and-drop job.
+                let declared = subrows.get(&folder.label);
+                let row_label = |a: &config::InventoryApp| -> String {
+                    let id = a.id.clone().unwrap_or_default().to_lowercase();
+                    let name = a.name.to_lowercase();
+                    declared
+                        .into_iter()
+                        .flatten()
+                        .find(|sr| {
+                            sr.apps.iter().any(|want| {
+                                let w = want.to_lowercase();
+                                !w.is_empty() && (id.contains(&w) || name.contains(&w))
                             })
-                            .collect(),
-                    });
+                        })
+                        .map(|sr| format!("{}/{}", folder.label, sr.name))
+                        .unwrap_or_else(|| folder.label.clone())
+                };
+                // Grouped by the row each app lands in, so a subcategory's members end up on its
+                // row together rather than scattered by the order the inventory happened to list
+                // them in.
+                let mut by_row: std::collections::HashMap<String, Vec<&config::InventoryApp>> =
+                    std::collections::HashMap::new();
+                for a in &folder.apps {
+                    by_row.entry(row_label(a)).or_default().push(a);
+                }
+                for (label, apps) in by_row {
+                    let r = rows
+                        .iter()
+                        .position(|x| *x == label)
+                        .unwrap_or(rows.len().saturating_sub(1));
+                    for chunk in apps.chunks(line_width.max(1)) {
+                        cells[r].push(Line {
+                            name: None,
+                            apps: chunk
+                                .iter()
+                                .map(|a| App {
+                                    id: a.id.clone().unwrap_or_else(|| a.name.clone()),
+                                    name: a.name.clone(),
+                                    icon: a.icon.clone(),
+                                    exec: a.exec.clone(),
+                                    terminal: a.terminal,
+                                })
+                                .collect(),
+                        });
+                    }
                 }
             }
         }
