@@ -10,6 +10,7 @@
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use crate::usage::{self, Usage};
+use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,6 +41,16 @@ pub struct App {
 /// sit on one line is the whole declaration. No separate "group" concept, no naming ceremony.
 #[derive(Clone)]
 pub struct Line {
+    /// What this row of the box is FOR, when it is for something in particular.
+    ///
+    /// A line was always an appset -- a group you start in one keystroke -- but an anonymous one,
+    /// so the only thing it could say was "these belong together" and never why. Naming it turns a
+    /// box into a small table: Chat becomes business, leisure, private, and a box that had grown
+    /// to twenty-four entries becomes four rows you can read.
+    ///
+    /// `None` is not a lesser case. Most lines are groups nobody needed to explain, and forcing a
+    /// name on them would be ceremony -- an unnamed line renders exactly as it always did.
+    pub name: Option<String>,
     pub apps: Vec<App>,
 }
 
@@ -92,7 +103,58 @@ pub const DEFAULT_FOLDERS: &[&str] =
 /// line, so a newly-installed app still lands in "Other" without any entry existing for it. An app
 /// named here that no longer exists is skipped silently -- uninstalling something must not corrupt
 /// the arrangement of everything around it.
-pub type Placement = HashMap<String, HashMap<String, Vec<Vec<String>>>>;
+pub type Placement = HashMap<String, HashMap<String, Vec<StoredLine>>>;
+
+/// One arranged line as it is written down: the apps on it, and its name if it has one.
+///
+/// ── READS THE OLD SHAPE TOO, AND THAT IS THE WHOLE REASON FOR THE UNTAGGED ENUM ─────────────
+///
+/// This used to be a bare `Vec<String>`. Every arrangement anyone has made is stored in that
+/// shape, and a schema change that cannot read what is already on disk is a schema change that
+/// deletes the user's work -- the file stops parsing, the grid falls back to the computed
+/// grouping, and there is no error because from the program's point of view nothing went wrong.
+///
+/// `#[serde(untagged)]` makes the old form a valid value of the new type, so an existing file
+/// loads as unnamed lines and is rewritten in the new shape the next time anything is dragged.
+/// The migration is the ordinary code path rather than a separate step that could be skipped.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum StoredLine {
+    /// What every placement file written before named rows existed looks like.
+    Bare(Vec<String>),
+    Named {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        apps: Vec<String>,
+    },
+}
+
+impl StoredLine {
+    pub fn apps(&self) -> &Vec<String> {
+        match self {
+            StoredLine::Bare(a) => a,
+            StoredLine::Named { apps, .. } => apps,
+        }
+    }
+    pub fn apps_mut(&mut self) -> &mut Vec<String> {
+        match self {
+            StoredLine::Bare(a) => a,
+            StoredLine::Named { apps, .. } => apps,
+        }
+    }
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            StoredLine::Bare(_) => None,
+            StoredLine::Named { name, .. } => name.as_deref(),
+        }
+    }
+    pub fn new(name: Option<String>, apps: Vec<String>) -> Self {
+        match name {
+            None => StoredLine::Bare(apps),
+            some => StoredLine::Named { name: some, apps },
+        }
+    }
+}
 
 /// STATE, not config: a record of what the user did, written by the program itself, so it belongs
 /// under XDG_STATE_HOME and emphatically not in the Nix store or a config file a rebuild would
@@ -271,7 +333,7 @@ impl State {
             if let Some(folders) = self.placement.get_mut(&m.name) {
                 for lines in folders.values_mut() {
                     for l in lines.iter_mut() {
-                        for token in l.iter_mut() {
+                        for token in l.apps_mut().iter_mut() {
                             if let Some(id) = rename(token) {
                                 *token = id;
                                 touched = true;
@@ -354,7 +416,7 @@ impl State {
         // is true rather than merely stated.
         let placed = apply_placement(&self.base, &self.placement, &self.canonical_folders);
         let m = &placed[mi];
-        let mut folders: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        let mut folders: HashMap<String, Vec<StoredLine>> = HashMap::new();
         for (r, lines) in m.cells.iter().enumerate() {
             if lines.is_empty() {
                 continue;
@@ -364,7 +426,15 @@ impl State {
                 // row order, which usage may have permuted -- pairing it with canonical cells would
                 // file every row's contents under a neighbouring row's name.
                 self.canonical_folders[r].clone(),
-                lines.iter().map(|l| l.apps.iter().map(|a| a.id.clone()).collect()).collect(),
+                lines
+                    .iter()
+                    .map(|l| {
+                        StoredLine::new(
+                            l.name.clone(),
+                            l.apps.iter().map(|a| a.id.clone()).collect(),
+                        )
+                    })
+                    .collect(),
             );
         }
         // MERGE, never replace. An app named in the placement but absent from today's inventory
@@ -373,18 +443,21 @@ impl State {
         // backend that timed out and returned a partial list) the moment the user dragged anything
         // else. Entries for apps we cannot currently see are carried through untouched, which is
         // what makes "uninstall it and it returns to where you put it" true.
-        let seen: std::collections::HashSet<String> = folders
-            .values()
-            .flatten()
-            .flatten()
-            .cloned()
-            .collect();
+        let seen: std::collections::HashSet<String> =
+            folders.values().flatten().flat_map(|l| l.apps().iter().cloned()).collect();
         let previous = self.placement.get(&m.name).cloned().unwrap_or_default();
         for (folder, lines) in previous {
-            let kept: Vec<Vec<String>> = lines
+            // Carried through with their NAMES intact: an app that is not in today's inventory
+            // has not stopped belonging to the row somebody filed it in.
+            let kept: Vec<StoredLine> = lines
                 .into_iter()
-                .map(|l| l.into_iter().filter(|n| !seen.contains(n)).collect::<Vec<_>>())
-                .filter(|l: &Vec<String>| !l.is_empty())
+                .map(|l| {
+                    let name = l.name().map(|n| n.to_string());
+                    let apps: Vec<String> =
+                        l.apps().iter().filter(|n| !seen.contains(*n)).cloned().collect();
+                    StoredLine::new(name, apps)
+                })
+                .filter(|l| !l.apps().is_empty())
                 .collect();
             if !kept.is_empty() {
                 folders.entry(folder).or_default().extend(kept);
@@ -446,9 +519,12 @@ impl State {
         // Remove it from wherever it currently is, and drop any line that empties as a result.
         for lines in folders.values_mut() {
             for l in lines.iter_mut() {
-                l.retain(|n| n != app);
+                l.apps_mut().retain(|n| n != app);
             }
-            lines.retain(|l| !l.is_empty());
+            // An emptied line disappears UNLESS it was named: a declared row is part of the
+            // taxonomy, not a by-product of what happens to be in it, and it has to survive being
+            // emptied or you could never drag the last thing out and put something else back.
+            lines.retain(|l| !l.apps().is_empty() || l.name().is_some());
         }
 
         // Find the target AFTER the removal, never before: taking the app out can empty a line and
@@ -457,7 +533,7 @@ impl State {
         let target_line = anchor.as_ref().and_then(|a| {
             folders
                 .get(&target_label)
-                .and_then(|ls| ls.iter().position(|l| l.iter().any(|n| n == a)))
+                .and_then(|ls| ls.iter().position(|l| l.apps().iter().any(|n| n == a)))
         });
 
         let lines = folders.entry(target_label).or_default();
@@ -467,13 +543,13 @@ impl State {
                 // `before` names what was rendered next, and that app may be filtered out of the
                 // stored line, or on a different one entirely.
                 let at = before
-                    .and_then(|b| lines[li].iter().position(|n| n == b))
-                    .unwrap_or(lines[li].len());
-                lines[li].insert(at, app.to_string());
+                    .and_then(|b| lines[li].apps().iter().position(|n| n == b))
+                    .unwrap_or(lines[li].apps().len());
+                lines[li].apps_mut().insert(at, app.to_string());
             }
             // No anchor, or the line it named is gone: give the app a line of its own, which is
             // also what dropping on a cell's background means.
-            None => lines.push(vec![app.to_string()]),
+            None => lines.push(StoredLine::Bare(vec![app.to_string()])),
         }
 
         save_placement(&self.placement);
@@ -562,7 +638,11 @@ impl State {
                                     .filter(|a| keep(&a.name))
                                     .cloned()
                                     .collect();
-                                if apps.is_empty() { None } else { Some(Line { apps }) }
+                                if apps.is_empty() {
+                                    None
+                                } else {
+                                    Some(Line { name: l.name.clone(), apps })
+                                }
                             })
                             .collect()
                     })
@@ -706,7 +786,7 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
             if let Some(folders) = arranged {
                 for lines in folders.values() {
                     for l in lines {
-                        for n in l {
+                        for n in l.apps() {
                             placed.insert(n.as_str());
                         }
                     }
@@ -719,10 +799,17 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
                 for (fi, fname) in folders.iter().enumerate() {
                     let Some(lines) = arranged_folders.get(fname.as_str()) else { continue };
                     for l in lines {
-                        let apps: Vec<App> =
-                            l.iter().filter_map(|n| by_id.get(n.as_str()).map(|a| (*a).clone())).collect();
-                        if !apps.is_empty() {
-                            cells[fi].push(Line { apps });
+                        let apps: Vec<App> = l
+                            .apps()
+                            .iter()
+                            .filter_map(|n| by_id.get(n.as_str()).map(|a| (*a).clone()))
+                            .collect();
+                        // A NAMED row is drawn even when empty. It is part of the taxonomy the
+                        // operator declared, and a row you cannot see is a row you cannot drag
+                        // anything into -- which would make declaring one pointless.
+                        let name = l.name().map(|n| n.to_string());
+                        if !apps.is_empty() || name.is_some() {
+                            cells[fi].push(Line { name, apps });
                         }
                     }
                 }
@@ -732,8 +819,10 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
                 for l in lines {
                     let apps: Vec<App> =
                         l.apps.iter().filter(|a| !placed.contains(a.id.as_str())).cloned().collect();
-                    if !apps.is_empty() {
-                        cells[r].push(Line { apps });
+                    // The name comes along. A row keeps what it is called even when the pass that
+                    // rebuilt it was only concerned with which apps had not been filed yet.
+                    if !apps.is_empty() || l.name.is_some() {
+                        cells[r].push(Line { name: l.name.clone(), apps });
                     }
                 }
             }
@@ -874,7 +963,7 @@ pub fn a(name: &str, icon: &str) -> App {
 }
 
 pub fn line(apps: Vec<App>) -> Line {
-    Line { apps }
+    Line { name: None, apps }
 }
 
 /// FIXTURE. Deliberately uneven -- different line counts per cell, different item counts per
@@ -965,7 +1054,7 @@ mod tests {
     fn machine(name: &str, folder: usize, lines: Vec<Vec<&str>>) -> Machine {
         let mut cells: Vec<Vec<Line>> = vec![Vec::new(); DEFAULT_FOLDERS.len()];
         cells[folder] =
-            lines.into_iter().map(|l| Line { apps: l.into_iter().map(app).collect() }).collect();
+            lines.into_iter().map(|l| Line { name: None, apps: l.into_iter().map(app).collect() }).collect();
         Machine { name: name.into(), aliases: vec![], accent: "#fff".into(), launch: vec![], error: None, cells }
     }
 
@@ -1089,7 +1178,7 @@ mod tests {
     #[test]
     fn dropping_on_a_line_inserts_at_position() {
         let mut m = machine("m", 0, vec![vec!["a", "b", "c"]]);
-        m.cells[6] = vec![Line { apps: vec![app("new")] }];
+        m.cells[6] = vec![Line { name: None, apps: vec![app("new")] }];
         let mut s = state(vec![m]);
         s.place_app(0, "new", 0, Some(&on(&["a", "b", "c"])), Some("b"));
         let names: Vec<&str> =
@@ -1112,7 +1201,7 @@ mod tests {
     #[test]
     fn unplaced_apps_keep_their_computed_folder() {
         let mut m = machine("m", 0, vec![vec!["Foot"]]);
-        m.cells[6] = vec![Line { apps: vec![app("Brand New")] }];
+        m.cells[6] = vec![Line { name: None, apps: vec![app("Brand New")] }];
         let mut s = state(vec![m]);
         s.place_app(0, "Foot", 1, None, None); // arrange something else entirely
         assert_eq!(s.machines[0].cells[6][0].apps[0].name, "Brand New", "still in the inbox");
@@ -1124,7 +1213,10 @@ mod tests {
         let base = vec![machine("m", 0, vec![vec!["a", "b"]])];
         let mut p = Placement::new();
         let mut folders = HashMap::new();
-        folders.insert(DEFAULT_FOLDERS[0].to_string(), vec![vec!["a".to_string(), "ghost".to_string(), "b".to_string()]]);
+        folders.insert(
+            DEFAULT_FOLDERS[0].to_string(),
+            vec![StoredLine::Bare(vec!["a".into(), "ghost".into(), "b".into()])],
+        );
         p.insert("m".to_string(), folders);
         let rows: Vec<String> = DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect();
         let out = apply_placement(&base, &p, &rows);
@@ -1214,7 +1306,7 @@ mod tests {
     fn rebuilding_is_stable_under_row_reordering() {
         let mut s = state(vec![machine("m", 0, vec![vec!["Foot"]])]);
         // Make a later row decisively outrank row 0, so a permutation really happens.
-        s.base[0].cells[1] = vec![Line { apps: vec![app("Helix")] }];
+        s.base[0].cells[1] = vec![Line { name: None, apps: vec![app("Helix")] }];
         for _ in 0..80 {
             s.record_launch_for_test("m", "Helix");
         }
@@ -1258,7 +1350,7 @@ mod tests {
     fn materialise_keeps_entries_for_apps_it_cannot_see() {
         let mut s = state(vec![machine("m", 0, vec![vec!["here"]])]);
         let mut folders = HashMap::new();
-        folders.insert("Media".to_string(), vec![vec!["gone".to_string()]]);
+        folders.insert("Media".to_string(), vec![StoredLine::Bare(vec!["gone".into()])]);
         s.placement.insert("m".to_string(), folders);
         s.rebuild();
 
@@ -1266,7 +1358,7 @@ mod tests {
 
         let after = &s.placement["m"];
         assert!(after.contains_key("Media"), "the absent app's folder survived: {after:?}");
-        assert_eq!(after["Media"], vec![vec!["gone".to_string()]]);
+        assert_eq!(after["Media"], vec![StoredLine::Bare(vec!["gone".into()])]);
     }
 
     /// Dragging rightward within a line must land where the pointer was, not one place further.
@@ -1293,7 +1385,7 @@ mod tests {
     #[test]
     fn a_drop_under_a_filter_joins_the_line_that_is_visible() {
         let mut m = machine("m", 0, vec![vec!["alpha", "beta"], vec!["gamma"]]);
-        m.cells[6] = vec![Line { apps: vec![app("delta")] }];
+        m.cells[6] = vec![Line { name: None, apps: vec![app("delta")] }];
         let mut s = state(vec![m]);
 
         // Only the gamma line survives this: on screen it is line 0, in the placement it is line 1.
@@ -1306,12 +1398,15 @@ mod tests {
         let lines = &s.placement["m"]["Terminals"];
         let with_gamma = lines
             .iter()
-            .find(|l| l.contains(&"gamma".to_string()))
+            .find(|l| l.apps().contains(&"gamma".to_string()))
             .expect("the gamma line is still there");
-        assert!(with_gamma.contains(&"delta".to_string()), "joined the visible appset: {lines:?}");
-        let with_alpha = lines.iter().find(|l| l.contains(&"alpha".to_string())).unwrap();
         assert!(
-            !with_alpha.contains(&"delta".to_string()),
+            with_gamma.apps().contains(&"delta".to_string()),
+            "joined the visible appset: {lines:?}"
+        );
+        let with_alpha = lines.iter().find(|l| l.apps().contains(&"alpha".to_string())).unwrap();
+        assert!(
+            !with_alpha.apps().contains(&"delta".to_string()),
             "did NOT join the filtered-away one: {lines:?}"
         );
     }
@@ -1325,7 +1420,7 @@ mod tests {
     #[test]
     fn a_drag_does_not_fossilise_the_frecency_order() {
         let mut m = machine("m", 0, vec![vec!["rare"], vec!["popular"]]);
-        m.cells[6] = vec![Line { apps: vec![app("unrelated")] }];
+        m.cells[6] = vec![Line { name: None, apps: vec![app("unrelated")] }];
         let mut s = state(vec![m]);
 
         // Enough launches that the significance gate is cleared and the order really does move.
@@ -1343,7 +1438,10 @@ mod tests {
 
         assert_eq!(
             s.placement["m"]["Terminals"],
-            vec![vec!["rare".to_string()], vec!["popular".to_string()]],
+            vec![
+                StoredLine::Bare(vec!["rare".into()]),
+                StoredLine::Bare(vec!["popular".into()])
+            ],
             "the FILE kept the arrangement, not the ranking"
         );
     }
@@ -1400,7 +1498,7 @@ mod tests {
     #[test]
     fn two_apps_sharing_a_name_stay_distinct() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")] }];
+        m.cells[0] = vec![Line { name: None, apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")] }];
         let mut s = state(vec![m]);
 
         // File ONE of them somewhere else, by its id.
@@ -1418,19 +1516,19 @@ mod tests {
     #[test]
     fn an_arrangement_written_under_names_is_migrated() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { apps: vec![app_id("helix.desktop", "Helix")] }];
+        m.cells[0] = vec![Line { name: None, apps: vec![app_id("helix.desktop", "Helix")] }];
         let mut s = state(vec![m]);
 
         // What the old code would have written: the DISPLAY NAME, in a different folder.
         let mut folders = HashMap::new();
-        folders.insert("Editors".to_string(), vec![vec!["Helix".to_string()]]);
+        folders.insert("Editors".to_string(), vec![StoredLine::Bare(vec!["Helix".into()])]);
         s.placement.insert("m".to_string(), folders);
         s.usage.insert(usage::key("m", "Helix"), usage::Entry { score: 9.0, last: 0 });
 
         s.migrate_names_to_ids();
         s.rebuild();
 
-        assert_eq!(s.placement["m"]["Editors"], vec![vec!["helix.desktop".to_string()]]);
+        assert_eq!(s.placement["m"]["Editors"], vec![StoredLine::Bare(vec!["helix.desktop".into()])]);
         assert!(s.usage.contains_key(&usage::key("m", "helix.desktop")), "the score came too");
         assert!(!s.usage.contains_key(&usage::key("m", "Helix")), "and did not stay behind");
         assert_eq!(
@@ -1444,10 +1542,10 @@ mod tests {
     #[test]
     fn the_migration_is_idempotent() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { apps: vec![app_id("helix.desktop", "Helix")] }];
+        m.cells[0] = vec![Line { name: None, apps: vec![app_id("helix.desktop", "Helix")] }];
         let mut s = state(vec![m]);
         let mut folders = HashMap::new();
-        folders.insert("Editors".to_string(), vec![vec!["Helix".to_string()]]);
+        folders.insert("Editors".to_string(), vec![StoredLine::Bare(vec!["Helix".into()])]);
         s.placement.insert("m".to_string(), folders);
 
         s.migrate_names_to_ids();
@@ -1465,17 +1563,17 @@ mod tests {
     #[test]
     fn an_ambiguous_name_is_not_guessed() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")] }];
+        m.cells[0] = vec![Line { name: None, apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")] }];
         let mut s = state(vec![m]);
         let mut folders = HashMap::new();
-        folders.insert("Editors".to_string(), vec![vec!["Foo".to_string()]]);
+        folders.insert("Editors".to_string(), vec![StoredLine::Bare(vec!["Foo".into()])]);
         s.placement.insert("m".to_string(), folders);
 
         s.migrate_names_to_ids();
 
         assert_eq!(
             s.placement["m"]["Editors"],
-            vec![vec!["Foo".to_string()]],
+            vec![StoredLine::Bare(vec!["Foo".into()])],
             "untouched -- an unresolvable entry is left, not resolved to a coin flip"
         );
     }
@@ -1587,6 +1685,61 @@ mod tests {
         assert_eq!(s.view.len(), 2, "both columns still exist");
         assert!(s.view[0].cells[0].is_empty(), "the unnamed machine emptied");
         assert_eq!(s.view[1].cells[0][0].apps[0].name, "Foot", "the named machine kept its match");
+    }
+
+    /// A PLACEMENT FILE WRITTEN BEFORE NAMED ROWS EXISTED STILL LOADS.
+    ///
+    /// This is the whole reason the stored form is an untagged enum. A schema change that cannot
+    /// read what is already on disk does not fail loudly -- the file stops parsing, the grid falls
+    /// back to the computed grouping, and the user's arrangement is gone with no error at all.
+    #[test]
+    fn the_old_placement_shape_still_parses() {
+        let old = r#"{"m":{"Editors":[["helix.desktop","vim.desktop"],["zed.desktop"]]}}"#;
+        let p: Placement = serde_json::from_str(old).expect("the old shape must still parse");
+        let lines = &p["m"]["Editors"];
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].apps(), &vec!["helix.desktop".to_string(), "vim.desktop".to_string()]);
+        assert_eq!(lines[0].name(), None, "an old line has no name, and that is not an error");
+    }
+
+    /// And the new shape round-trips, with unnamed lines still written in the old form so a file
+    /// nobody has named anything in stays readable by an older build.
+    #[test]
+    fn named_and_unnamed_lines_round_trip() {
+        let mut folders = HashMap::new();
+        folders.insert(
+            "Chat".to_string(),
+            vec![
+                StoredLine::new(Some("business".into()), vec!["teams.desktop".into()]),
+                StoredLine::new(None, vec!["signal.desktop".into()]),
+            ],
+        );
+        let mut p = Placement::new();
+        p.insert("m".to_string(), folders);
+
+        let text = serde_json::to_string(&p).unwrap();
+        assert!(text.contains("business"));
+        let back: Placement = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(back["m"]["Chat"][1].name(), None);
+    }
+
+    /// A named row survives being emptied. It is part of the taxonomy, not a by-product of its
+    /// contents -- otherwise dragging the last thing out would delete the row and you could never
+    /// put anything back.
+    #[test]
+    fn an_emptied_named_row_is_not_deleted() {
+        let mut m = machine("m", 0, vec![]);
+        m.cells[0] = vec![Line { name: Some("business".into()), apps: vec![app("Teams")] }];
+        let mut s = state(vec![m]);
+
+        // Move the only occupant somewhere else entirely.
+        s.place_app(0, "Teams", 4, None, None);
+
+        let chat = &s.placement["m"]["Terminals"];
+        assert_eq!(chat.len(), 1, "the row is still there: {chat:?}");
+        assert_eq!(chat[0].name(), Some("business"));
+        assert!(chat[0].apps().is_empty(), "and it is empty");
     }
 
     /// Dropping an item into the gap it already occupies is a no-op, not a shuffle.

@@ -242,6 +242,30 @@ pub struct Config {
     /// the inbox, not a category, and a config that could bury it in the middle would defeat it.
     #[serde(default)]
     pub folders: Vec<String>,
+
+    /// Named rows INSIDE a box, per folder: `{"Chat": ["business", "leisure", "private"]}`.
+
+    ///
+
+    /// A box with twenty-four things in it is a list wearing a grid's clothes -- the layout stops
+
+    /// paying for itself once a cell is taller than a glance. Sub-rows give the second axis back
+
+    /// inside the cell, and they are declared rather than inferred because a taxonomy is a
+
+    /// judgement: no rule derives "business" from a set of chat clients.
+
+    ///
+
+    /// Declared rows are drawn even when empty, which is what makes them usable -- an invisible
+
+    /// row is one you cannot drag anything into. Apps that were never filed keep appearing in
+
+    /// unnamed lines above them, so declaring a sub-row never hides anything.
+
+    #[serde(default)]
+
+    pub subrows: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Config {

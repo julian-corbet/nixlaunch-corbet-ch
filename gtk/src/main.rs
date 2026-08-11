@@ -90,6 +90,7 @@ window {{ background-color: {ground}; color: {fg}; }}
 .app {{ padding: 3px 6px; border-radius: 4px; }}
 .app.sel {{ background-color: alpha({accent}, 0.20); }}
 .appname {{ font-size: 12px; }}
+.subrow {{ font-size: 10px; color: {muted}; padding-right: 6px; min-width: 54px; }}
 .dim {{ color: {dim}; font-size: 12px; font-style: italic; }}
 .hint {{ color: #666666; font-size: 11px; margin-top: 12px; }}
 .hint b {{ color: {accent}; }}
@@ -880,6 +881,15 @@ fn build(application: &Application) {
                             });
                             lb.add_controller(tgt);
                         }
+                        // The row's name, when it has one, at its head. Small and muted: it is a
+                        // label for what follows, not an entry you can act on, and drawing it like
+                        // the applications would invite clicking something that does nothing.
+                        if let Some(sub) = &ln.name {
+                            let tag = Label::new(Some(sub));
+                            tag.set_xalign(0.0);
+                            tag.add_css_class("subrow");
+                            lb.append(&tag);
+                        }
                         let mut line_apps: Vec<GBox> = Vec::with_capacity(ln.apps.len());
                         for app in ln.apps.iter() {
                             let b = GBox::new(Orientation::Horizontal, 4);
@@ -986,7 +996,7 @@ fn build(application: &Application) {
         let reveal: Rc<dyn Fn()> = Rc::new(move || {
             if let Ok(Some(cfg)) = config::load() {
                 let rows = cfg.folder_rows();
-                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width);
+                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
                 let mut s = state.borrow_mut();
                 s.base = fresh;
                 s.query.clear();
@@ -1186,7 +1196,7 @@ fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, Strin
         Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], "layer".into(), "exclusive".into(), true, None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
-            let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width);
+            let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
             (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), cfg.surface.clone(), cfg.keyboard.clone(), cfg.exit_on_focus_loss, None)
         }
     }
@@ -1212,11 +1222,16 @@ fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, Strin
 /// A panicking thread yields that machine's column as unreachable rather than taking the process
 /// with it. One machine's inventory command is not a reason for the other two to be unavailable,
 /// and an inventory command is arbitrary user-supplied argv.
-fn inventory_all(machines: &[config::MachineConfig], rows: &[String], line_width: usize) -> Vec<Machine> {
+fn inventory_all(
+    machines: &[config::MachineConfig],
+    rows: &[String],
+    line_width: usize,
+    subrows: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<Machine> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = machines
             .iter()
-            .map(|mc| scope.spawn(move || inventory(mc, rows, line_width)))
+            .map(|mc| scope.spawn(move || inventory(mc, rows, line_width, subrows)))
             .collect();
         handles
             .into_iter()
@@ -1240,7 +1255,12 @@ fn inventory_all(machines: &[config::MachineConfig], rows: &[String], line_width
 /// Everything this program knows about detection is in these few lines: run argv, read JSON. No
 /// SSH, no .desktop parsing, no package managers -- see config.rs on why that boundary is the
 /// point rather than a simplification.
-fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> Machine {
+fn inventory(
+    mc: &config::MachineConfig,
+    rows: &[String],
+    line_width: usize,
+    subrows: &std::collections::HashMap<String, Vec<String>>,
+) -> Machine {
     let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
     // Declared without a value: both arms of the match below assign it, so an initial `None`
     // would be a value nothing ever reads -- which is exactly what the compiler was saying.
@@ -1284,6 +1304,9 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
                 // because hand-written fixtures are always short.
                 for chunk in folder.apps.chunks(line_width.max(1)) {
                     cells[r].push(Line {
+                        // Freshly inventoried lines are unnamed. A name is something the operator
+                        // declares or the user creates by filing; discovery has no opinion on it.
+                        name: None,
                         apps: chunk
                             .iter()
                             .map(|a| App {
@@ -1302,6 +1325,17 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
             }
         }
         Err(e) => error = Some(e),
+    }
+
+    // The declared sub-rows, appended empty. They are drawn so they can be dragged into; an app
+    // that has actually been filed into one arrives through the placement instead, which runs
+    // after this and matches them by name.
+    for (r, label) in rows.iter().enumerate() {
+        for want in subrows.get(label).into_iter().flatten() {
+            if !cells[r].iter().any(|l| l.name.as_deref() == Some(want.as_str())) {
+                cells[r].push(Line { name: Some(want.clone()), apps: Vec::new() });
+            }
+        }
     }
 
     Machine {

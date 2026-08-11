@@ -135,6 +135,29 @@ in
       '';
     };
 
+    subrows = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.listOf lib.types.str);
+      default = { };
+      example = {
+        Chat = [ "business" "leisure" ];
+        System = [ "hardware" "packages" "monitoring" ];
+      };
+      description = ''
+        Named rows INSIDE a box, keyed by folder label.
+
+        A box holding two dozen applications is a list wearing a grid's clothes: the layout stops
+        paying for itself the moment a cell is taller than a glance. Sub-rows put the second axis
+        back inside the cell, so a folder reads as a few labelled groups rather than one long run.
+
+        Declared rather than derived, because a taxonomy is a judgement -- no rule extracts
+        "business" from a set of chat clients. And declared rows are drawn even when empty, which
+        is what makes them usable: an invisible row is one nothing can be dragged into.
+
+        Applications nobody has filed keep appearing in unnamed lines, so adding a sub-row never
+        hides anything -- it only gives you somewhere to put things.
+      '';
+    };
+
     theme = lib.mkOption {
       type = lib.types.attrsOf (lib.types.either lib.types.str lib.types.int);
       default = { };
@@ -287,7 +310,7 @@ in
     # schema, so anything that type-checks here serialises correctly by construction and there is
     # no second place for the two to disagree.
     xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
-      inherit (cfg) folders terminal keyboard;
+      inherit (cfg) folders subrows terminal keyboard;
       machines = map (m: { inherit (m) name aliases accent inventory launch; }) cfg.machines;
     } // lib.optionalAttrs (cfg.theme != { }) { inherit (cfg) theme; });
   };
