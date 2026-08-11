@@ -234,14 +234,31 @@ impl State {
     /// and re-appended, so they would visibly jump. Snapshotting first means a drop changes exactly
     /// the one thing the user dragged.
     pub fn materialise(&mut self, mi: usize) {
-        let m = &self.machines[mi];
+        // FROM THE PLACEMENT GRID, NOT THE RENDERED ONE, and the difference is the whole reason
+        // this is not simply `&self.machines[mi]`.
+        //
+        // `self.machines` has been through `apply_usage`, so its lines and rows are in FRECENCY
+        // order. Snapshotting that would write the statistics' opinion into placement.json as
+        // though the user had arranged it -- and once written it is indistinguishable from a real
+        // arrangement, so it never decays and never moves again. Two drags in, the file is a
+        // fossil of whatever the scores happened to say at the moment of the first one.
+        //
+        // `rebuild`'s own comment promises exactly the opposite: placement decides membership,
+        // usage decides order, and the file "stays a record of what the user arranged, never of
+        // what the statistics did to it". This recomputes the placement-only grid so that promise
+        // is true rather than merely stated.
+        let placed = apply_placement(&self.base, &self.placement, &self.canonical_folders);
+        let m = &placed[mi];
         let mut folders: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         for (r, lines) in m.cells.iter().enumerate() {
             if lines.is_empty() {
                 continue;
             }
             folders.insert(
-                self.folders[r].clone(),
+                // Canonical, matching the grid this was read from. `self.folders` is the RENDERED
+                // row order, which usage may have permuted -- pairing it with canonical cells would
+                // file every row's contents under a neighbouring row's name.
+                self.canonical_folders[r].clone(),
                 lines.iter().map(|l| l.apps.iter().map(|a| a.name.clone()).collect()).collect(),
             );
         }
@@ -271,38 +288,55 @@ impl State {
         self.placement.insert(m.name.clone(), folders);
     }
 
-    /// Move `app` on machine `mi` to `folder`, either INTO an existing line at `pos`, or onto a
-    /// new line of its own when `target_line` is None. This one call covers filing into a folder,
-    /// joining an appset at a chosen position, and reordering within a line -- they differ only in
-    /// where the drop landed, which is the point of recording arrangements rather than folders.
+    /// Move `app` on machine `mi` into `folder`, joining the line that `join` names, immediately
+    /// before the app that `before` names. This one call covers filing into a folder, joining an
+    /// appset at a chosen position, and reordering within a line -- they differ only in where the
+    /// drop landed, which is the point of recording arrangements rather than folders.
+    ///
+    /// ── EVERYTHING HERE IS NAMED, NOTHING IS NUMBERED, AND THAT IS THE FIX ────────────────────
+    ///
+    /// This used to take a line INDEX and a position INDEX, read straight off the rendered grid,
+    /// and it was wrong in two independent ways at once:
+    ///
+    ///   * The rendered grid is FILTERED. With a query active, "the second line" on screen might
+    ///     be the fifth line in the placement -- every line whose apps all failed to match is
+    ///     simply absent. Dropping onto a visible appset therefore joined a different one, and the
+    ///     user had no way to see which.
+    ///   * The rendered grid is USAGE-ORDERED. `apply_usage` permutes lines by frecency, so even
+    ///     with no query the on-screen order is not the stored order once anything has been
+    ///     launched a few times.
+    ///
+    /// An index is only meaningful in the space it was computed in, and the drop happened in a
+    /// space that is two transformations away from the one being written to. Names survive both
+    /// transformations, because filtering and reordering move apps around without renaming them.
+    ///
+    /// `join` is the rendered line's membership rather than one chosen app: the first name on it
+    /// may BE the app being dragged, which is gone by the time the target is looked up, so the
+    /// anchor has to be picked as one that will still be there.
     pub fn place_app(
         &mut self,
         mi: usize,
         app: &str,
         folder: usize,
-        target_line: Option<usize>,
-        pos: usize,
+        join: Option<&[String]>,
+        before: Option<&str>,
     ) {
+        // Dropping something into the gap it already occupies is not a move. Worth an early return
+        // rather than letting it fall through: after the removal below, "insert before `app`"
+        // names a position that no longer exists, and the fallback for an unfindable neighbour is
+        // "append to the end" -- so the no-op would silently become a jump to the far right.
+        if before == Some(app) {
+            return;
+        }
+
         self.materialise(mi);
         let machine = self.machines[mi].name.clone();
         let target_label = self.folders[folder].clone();
+        // An anchor that survives the removal: any name on the target line that is not the one
+        // being moved. A line holding only the dragged app has none, and correctly yields None --
+        // moving an app out of its own single-app line and back onto it is a no-op either way.
+        let anchor = join.and_then(|names| names.iter().find(|n| n.as_str() != app).cloned());
         let folders = self.placement.entry(machine).or_default();
-
-        // REMOVING SHIFTS THE TARGET. If the app is already on the destination line at an index
-        // BEFORE where it is going, taking it out moves every later position down by one -- so
-        // inserting at the originally-computed `pos` lands one place too far right, and dragging
-        // an item one step rightward within its own line silently skipped a neighbour. Work the
-        // correction out BEFORE the removal disturbs the arithmetic.
-        let mut pos = pos;
-        if let Some(li) = target_line {
-            if let Some(existing) = folders.get(&target_label).and_then(|ls| ls.get(li)) {
-                if let Some(was_at) = existing.iter().position(|n| n == app) {
-                    if was_at < pos {
-                        pos -= 1;
-                    }
-                }
-            }
-        }
 
         // Remove it from wherever it currently is, and drop any line that empties as a result.
         for lines in folders.values_mut() {
@@ -312,15 +346,29 @@ impl State {
             lines.retain(|l| !l.is_empty());
         }
 
+        // Find the target AFTER the removal, never before: taking the app out can empty a line and
+        // delete it, which shifts every later line down one. A target located beforehand would
+        // then name the wrong line -- the same class of bug as the rendered indices this replaced.
+        let target_line = anchor.as_ref().and_then(|a| {
+            folders
+                .get(&target_label)
+                .and_then(|ls| ls.iter().position(|l| l.iter().any(|n| n == a)))
+        });
+
         let lines = folders.entry(target_label).or_default();
         match target_line {
-            // The target line can have vanished in the removal above (it held only this app), so
-            // an out-of-range index degrades to "its own line" rather than panicking.
-            Some(li) if li < lines.len() => {
-                let at = pos.min(lines[li].len());
+            Some(li) => {
+                // An unfindable neighbour appends rather than panicking. It happens legitimately:
+                // `before` names what was rendered next, and that app may be filtered out of the
+                // stored line, or on a different one entirely.
+                let at = before
+                    .and_then(|b| lines[li].iter().position(|n| n == b))
+                    .unwrap_or(lines[li].len());
                 lines[li].insert(at, app.to_string());
             }
-            _ => lines.push(vec![app.to_string()]),
+            // No anchor, or the line it named is gone: give the app a line of its own, which is
+            // also what dropping on a cell's background means.
+            None => lines.push(vec![app.to_string()]),
         }
 
         save_placement(&self.placement);
@@ -693,6 +741,12 @@ pub fn fixture() -> Vec<Machine> {
 mod tests {
     use super::*;
 
+    /// A rendered line's membership, as `place_app` takes it. Tests name the line by what is on
+    /// it for the same reason the drop handler does -- an index would not survive a filter.
+    fn on(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     fn app(n: &str) -> App {
         App { name: n.into(), icon: "x".into(), exec: n.to_lowercase(), terminal: false }
     }
@@ -816,7 +870,7 @@ mod tests {
     #[test]
     fn filing_into_a_folder_moves_the_app() {
         let mut s = state(vec![machine("m", 6, vec![vec!["Bottles"]])]); // 6 = Other, the inbox
-        s.place_app(0, "Bottles", 4, None, 0); // 4 = Files
+        s.place_app(0, "Bottles", 4, None, None); // 4 = Files
         assert!(s.machines[0].cells[6].is_empty(), "left the inbox");
         assert_eq!(s.machines[0].cells[4][0].apps[0].name, "Bottles");
     }
@@ -827,7 +881,7 @@ mod tests {
         let mut m = machine("m", 0, vec![vec!["a", "b", "c"]]);
         m.cells[6] = vec![Line { apps: vec![app("new")] }];
         let mut s = state(vec![m]);
-        s.place_app(0, "new", 0, Some(0), 1);
+        s.place_app(0, "new", 0, Some(&on(&["a", "b", "c"])), Some("b"));
         let names: Vec<&str> =
             s.machines[0].cells[0][0].apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["a", "new", "b", "c"], "landed between a and b");
@@ -837,7 +891,7 @@ mod tests {
     #[test]
     fn reordering_within_a_line() {
         let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c"]])]);
-        s.place_app(0, "c", 0, Some(0), 0);
+        s.place_app(0, "c", 0, Some(&on(&["a", "b", "c"])), Some("a"));
         let names: Vec<&str> =
             s.machines[0].cells[0][0].apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["c", "a", "b"]);
@@ -850,7 +904,7 @@ mod tests {
         let mut m = machine("m", 0, vec![vec!["Foot"]]);
         m.cells[6] = vec![Line { apps: vec![app("Brand New")] }];
         let mut s = state(vec![m]);
-        s.place_app(0, "Foot", 1, None, 0); // arrange something else entirely
+        s.place_app(0, "Foot", 1, None, None); // arrange something else entirely
         assert_eq!(s.machines[0].cells[6][0].apps[0].name, "Brand New", "still in the inbox");
     }
 
@@ -998,7 +1052,7 @@ mod tests {
         s.placement.insert("m".to_string(), folders);
         s.rebuild();
 
-        s.place_app(0, "here", 1, None, 0);
+        s.place_app(0, "here", 1, None, None);
 
         let after = &s.placement["m"];
         assert!(after.contains_key("Media"), "the absent app's folder survived: {after:?}");
@@ -1007,23 +1061,88 @@ mod tests {
 
     /// Dragging rightward within a line must land where the pointer was, not one place further.
     ///
-    /// `pos` is a GAP index in the line as it currently reads, so gap 2 is "after b". Removing the
-    /// dragged item first shifts every later gap down by one, and not accounting for that is what
-    /// made a rightward drag overshoot its neighbour.
+    /// This used to need explicit correction: with a numeric position, removing the dragged item
+    /// first shifted every later gap down one, so a rightward drag overshot its neighbour. Naming
+    /// the neighbour instead makes the arithmetic disappear rather than get fixed -- "before c"
+    /// means the same thing whether or not anything left the line in between.
     #[test]
     fn rightward_reorder_lands_where_it_was_dropped() {
         let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c", "d"]])]);
-        s.place_app(0, "a", 0, Some(0), 2); // gap after b
+        s.place_app(0, "a", 0, Some(&on(&["a", "b", "c", "d"])), Some("c")); // the gap after b
         let names: Vec<&str> =
             s.machines[0].cells[0][0].apps.iter().map(|x| x.name.as_str()).collect();
         assert_eq!(names, vec!["b", "a", "c", "d"], "landed after b, not after c");
+    }
+
+    /// A drop while a QUERY is active must join the appset the user is looking at.
+    ///
+    /// The rendered grid is filtered, so a line's position on screen is not its position in the
+    /// placement: here the only visible line in the folder is the placement's SECOND one, because
+    /// the first matched nothing. Addressing it by rendered index joined the wrong appset -- and
+    /// silently, since the line it actually joined was the one hidden by the filter.
+    #[test]
+    fn a_drop_under_a_filter_joins_the_line_that_is_visible() {
+        let mut m = machine("m", 0, vec![vec!["alpha", "beta"], vec!["gamma"]]);
+        m.cells[6] = vec![Line { apps: vec![app("delta")] }];
+        let mut s = state(vec![m]);
+
+        // Only the gamma line survives this: on screen it is line 0, in the placement it is line 1.
+        s.query = "gamma".into();
+        s.refilter();
+        assert_eq!(s.machines[0].cells[0].len(), 2, "the model still holds both lines");
+
+        s.place_app(0, "delta", 0, Some(&on(&["gamma"])), None);
+
+        let lines = &s.placement["m"]["Terminals"];
+        let with_gamma = lines
+            .iter()
+            .find(|l| l.contains(&"gamma".to_string()))
+            .expect("the gamma line is still there");
+        assert!(with_gamma.contains(&"delta".to_string()), "joined the visible appset: {lines:?}");
+        let with_alpha = lines.iter().find(|l| l.contains(&"alpha".to_string())).unwrap();
+        assert!(
+            !with_alpha.contains(&"delta".to_string()),
+            "did NOT join the filtered-away one: {lines:?}"
+        );
+    }
+
+    /// Frecency must never be written into the arrangement.
+    ///
+    /// `rebuild` orders the rendered grid by usage; `materialise` freezes the grid into
+    /// placement.json before a move. Snapshotting the RENDERED grid therefore recorded the
+    /// statistics' order as though the user had chosen it -- and once written it is
+    /// indistinguishable from a real arrangement, so it stops decaying and never moves again.
+    #[test]
+    fn a_drag_does_not_fossilise_the_frecency_order() {
+        let mut m = machine("m", 0, vec![vec!["rare"], vec!["popular"]]);
+        m.cells[6] = vec![Line { apps: vec![app("unrelated")] }];
+        let mut s = state(vec![m]);
+
+        // Enough launches that the significance gate is cleared and the order really does move.
+        for _ in 0..60 {
+            s.record_launch_for_test("m", "popular");
+        }
+        s.rebuild();
+        assert_eq!(
+            s.machines[0].cells[0][0].apps[0].name, "popular",
+            "precondition: usage put the popular line first ON SCREEN"
+        );
+
+        // A drag ANYWHERE on this machine materialises the whole of it.
+        s.place_app(0, "unrelated", 1, None, None);
+
+        assert_eq!(
+            s.placement["m"]["Terminals"],
+            vec![vec!["rare".to_string()], vec!["popular".to_string()]],
+            "the FILE kept the arrangement, not the ranking"
+        );
     }
 
     /// Dropping an item into the gap it already occupies is a no-op, not a shuffle.
     #[test]
     fn dropping_an_item_where_it_already_is_changes_nothing() {
         let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c"]])]);
-        s.place_app(0, "a", 0, Some(0), 1); // the gap between a and b IS where a lives
+        s.place_app(0, "a", 0, Some(&on(&["a", "b", "c"])), Some("b")); // the gap a already occupies
         let names: Vec<&str> =
             s.machines[0].cells[0][0].apps.iter().map(|x| x.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);

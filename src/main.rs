@@ -562,7 +562,7 @@ fn build(application: &Application) {
                             }
                             // Dropped on the cell's own background, not on a line: give it a
                             // line to itself. Joining an appset is what dropping ON a line means.
-                            st.borrow_mut().place_app(c, name, r, None, 0);
+                            st.borrow_mut().place_app(c, name, r, None, None);
                             if let Some(rf) = holder2.borrow().as_ref() {
                                 rf();
                             }
@@ -578,7 +578,7 @@ fn build(application: &Application) {
                         dash.add_css_class("dim");
                         cell.append(&dash);
                     }
-                    for (li, ln) in lines.iter().enumerate() {
+                    for ln in lines.iter() {
                         let lb = GBox::new(Orientation::Horizontal, 2);
                         lb.add_css_class("line");
                         // Dropping ON a line inserts INTO it, at the gap nearest the pointer --
@@ -592,6 +592,12 @@ fn build(application: &Application) {
                             let st = state.clone();
                             let holder2 = holder.clone();
                             let lb2 = lb.clone();
+                            // WHAT is on this line, not WHICH line it is. A rendered line index is
+                            // an index into a grid that is filtered and frecency-ordered -- two
+                            // transformations away from the placement it would be written to. The
+                            // names survive both; see `place_app`'s own account.
+                            let names: Vec<String> =
+                                ln.apps.iter().map(|a| a.name.clone()).collect();
                             tgt.connect_drop(move |_, value, x, _| {
                                 let Ok(payload) = value.get::<String>() else { return false };
                                 let Some((from_col, name)) = payload.split_once('\u{1}') else {
@@ -600,8 +606,18 @@ fn build(application: &Application) {
                                 if from_col.parse::<usize>().ok() != Some(c) {
                                     return false;
                                 }
+                                // The gap the pointer is nearest, expressed as "goes before this
+                                // app". Past the last gap there is no such app, and None is
+                                // exactly right: it means the end of the line.
                                 let at = insert_index_at(&lb2, x);
-                                st.borrow_mut().place_app(c, name, r, Some(li), at);
+                                let before = names.get(at).cloned();
+                                st.borrow_mut().place_app(
+                                    c,
+                                    name,
+                                    r,
+                                    Some(&names),
+                                    before.as_deref(),
+                                );
                                 if let Some(rf) = holder2.borrow().as_ref() {
                                     rf();
                                 }
