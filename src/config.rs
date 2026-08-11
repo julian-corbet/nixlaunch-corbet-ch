@@ -88,6 +88,14 @@ pub struct MachineConfig {
     pub launch: Vec<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_surface() -> String {
+    "layer".to_string()
+}
+
 fn default_keyboard() -> String {
     "exclusive".to_string()
 }
@@ -152,7 +160,26 @@ impl Default for Theme {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub machines: Vec<MachineConfig>,
-    /// How the launcher takes the keyboard: "exclusive", "ondemand", or "none".
+    /// "layer" (default) or "window".
+    ///
+    /// A layer surface, like every other Wayland launcher. `window` exists for debugging.
+    ///
+    /// The keyboard question is settled by `exit_on_focus_loss`, not by the surface type. See it.
+    #[serde(default = "default_surface")]
+    pub surface: String,
+
+    /// Close the moment the keyboard focus goes elsewhere. THIS is what makes an exclusive grab
+    /// harmless, and it is exactly what fuzzel does by default.
+    ///
+    /// Exclusive focus alone is a lock screen: it holds the seat for as long as the surface
+    /// exists, so anything you type into another window is swallowed. Exclusive focus PLUS this is
+    /// a launcher: it has the keyboard the instant it opens so you can type immediately, and the
+    /// moment you click elsewhere it is gone and your keystrokes go where you are looking. The
+    /// grab cannot outlive your attention, which is the only property that made it a problem.
+    #[serde(default = "default_true")]
+    pub exit_on_focus_loss: bool,
+
+    /// Layer-surface keyboard mode, used only when `surface = "layer"`.
     ///
     /// EXCLUSIVE IS THE DEFAULT BECAUSE ON-DEMAND DOES NOT WORK, and that is a compositor bug
     /// rather than a preference. On every released sway (1.10-1.12) and its forks, a mapping layer

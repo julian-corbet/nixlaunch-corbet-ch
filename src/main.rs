@@ -126,7 +126,7 @@ fn main() {
 }
 
 fn build(application: &Application) {
-    let (folders, base, theme, terminal_cmd_outer, keyboard_mode, config_error) = load_world();
+    let (folders, base, theme, terminal_cmd_outer, surface_mode, keyboard_mode, exit_on_focus_loss, config_error) = load_world();
     // A placement that exists and does not parse is reported, never assumed empty: the next drag
     // rewrites whatever we decide it was, so guessing "nothing" would overwrite a real arrangement.
     let (placement, placement_error) = load_placement();
@@ -152,7 +152,7 @@ fn build(application: &Application) {
     // is invisible to the compositor's window tree and grabs the keyboard exclusively, which makes
     // it exactly the wrong thing to iterate a layout inside -- a toplevel tiles, appears in
     // `get_tree`, and can be screenshotted and closed like anything else.
-    if std::env::var_os("NIXLAUNCH_NO_LAYER").is_none() {
+    if surface_mode == "layer" && std::env::var_os("NIXLAUNCH_NO_LAYER").is_none() {
         window.init_layer_shell();
         window.set_layer(Layer::Overlay);
         // EXCLUSIVE by default, and this is a correction: on-demand reads like the polite choice
@@ -284,6 +284,23 @@ fn build(application: &Application) {
     root.append(&hint);
 
     window.set_child(Some(&root));
+
+    // CLOSE WHEN THE KEYBOARD GOES ELSEWHERE. This is the half that makes an exclusive grab
+    // acceptable, and leaving it out is what let this thing swallow real typing: a launcher that
+    // holds the seat and stays open is a lock screen with an app list on it.
+    //
+    // Gated on having been active at least once, because a surface is briefly inactive between
+    // mapping and being focused -- closing on that first false would make it flash and vanish.
+    if exit_on_focus_loss {
+        let seen_active = std::cell::Cell::new(false);
+        window.connect_is_active_notify(move |w| {
+            if w.is_active() {
+                seen_active.set(true);
+            } else if seen_active.get() {
+                w.close();
+            }
+        });
+    }
 
     // `render` must be callable from inside a drop handler that `render` itself installed, so it
     // needs a handle to itself. The holder is that indirection -- filled in immediately after
@@ -643,15 +660,15 @@ fn build(application: &Application) {
 /// repo testable by someone with no fleet. A config that EXISTS but does not parse is a different
 /// thing entirely and is reported rather than silently replaced by fixtures, because silently
 /// showing invented machines when the real ones failed to load is the worst of both.
-fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, String, Option<String>) {
+fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, String, String, bool, Option<String>) {
     let default_rows = || DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect::<Vec<_>>();
     match config::load() {
-        Err(e) => (default_rows(), fixture(), config::Theme::default(), vec![], "exclusive".into(), Some(e)),
-        Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], "exclusive".into(), None),
+        Err(e) => (default_rows(), fixture(), config::Theme::default(), vec![], "layer".into(), "exclusive".into(), true, Some(e)),
+        Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], "layer".into(), "exclusive".into(), true, None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
             let machines = cfg.machines.iter().map(|mc| inventory(mc, &rows, cfg.theme.line_width)).collect();
-            (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), cfg.keyboard.clone(), None)
+            (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), cfg.surface.clone(), cfg.keyboard.clone(), cfg.exit_on_focus_loss, None)
         }
     }
 }
