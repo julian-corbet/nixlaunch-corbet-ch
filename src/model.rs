@@ -7,6 +7,8 @@
 // tests at the bottom of this file rather than by opening the launcher and squinting.
 //
 // The rule that keeps it that way: nothing in this file may import gtk.
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use serde_json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -211,13 +213,27 @@ impl State {
         self.rebuild();
     }
 
-    /// Case-insensitive substring over app names, applied to EVERY cell at once -- the whole point
-    /// of a matrix is that you can see "where does this thing exist" across machines, and a filter
-    /// that only searched the current column would throw that away. Lines that lose every app
-    /// disappear; a cell that loses every line renders as empty, which is itself the answer to
-    /// "does archlxc have this?".
+    /// FUZZY, not substring, and not hand-rolled: `nucleo`, the matcher Helix uses. A substring
+    /// filter is the obvious thing to write and the wrong thing to ship -- typing "e" matched
+    /// almost every application here, because nearly every name contains one. Fuzzy matching with
+    /// a real score is what makes "cod" find "Code - OSS" and "gimp" not match "Manage Printing",
+    /// and it is a solved problem with a maintained crate behind it.
+    ///
+    /// Applied to EVERY cell at once -- the whole point of a matrix is seeing "where does this
+    /// thing exist" across machines, and a filter that only searched the current column would
+    /// throw that away. Lines that lose every app disappear; a cell that loses every line renders
+    /// as empty, which is itself the answer to "does that machine have this?".
     pub fn refilter(&mut self) {
-        let q = self.query.to_lowercase();
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let pattern = (!self.query.is_empty())
+            .then(|| Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart));
+        let mut buf = Vec::new();
+        let mut keep = |name: &str| -> bool {
+            match &pattern {
+                None => true,
+                Some(p) => p.score(Utf32Str::new(name, &mut buf), &mut matcher).is_some(),
+            }
+        };
         self.view = self
             .machines
             .iter()
@@ -235,7 +251,7 @@ impl State {
                                 let apps: Vec<App> = l
                                     .apps
                                     .iter()
-                                    .filter(|a| q.is_empty() || a.name.to_lowercase().contains(&q))
+                                    .filter(|a| keep(&a.name))
                                     .cloned()
                                     .collect();
                                 if apps.is_empty() { None } else { Some(Line { apps }) }
@@ -506,6 +522,29 @@ mod tests {
         assert_eq!(s.view[0].cells[0].len(), 1);
         assert_eq!(s.view[0].cells[0][0].apps.len(), 1);
         assert!(s.view[1].cells[0].is_empty(), "the other machine filtered down to nothing");
+    }
+
+    /// Fuzzy, not substring: gaps are allowed, so an acronym-ish prefix finds the real name.
+    #[test]
+    fn search_matches_fuzzily() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["Code - OSS", "Manage Printing"]])]);
+        s.query = "cod".into();
+        s.refilter();
+        let hits: Vec<&str> =
+            s.view[0].cells[0].iter().flat_map(|l| l.apps.iter().map(|a| a.name.as_str())).collect();
+        assert_eq!(hits, vec!["Code - OSS"], "matched across the gap, and did not match the other");
+    }
+
+    /// The regression that motivated dropping substring matching: a single common letter must not
+    /// match nearly everything, which is exactly what `contains` did.
+    #[test]
+    fn a_single_letter_is_not_a_wildcard() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["Zed", "Krita"]])]);
+        s.query = "zd".into();
+        s.refilter();
+        let hits: Vec<&str> =
+            s.view[0].cells[0].iter().flat_map(|l| l.apps.iter().map(|a| a.name.as_str())).collect();
+        assert_eq!(hits, vec!["Zed"]);
     }
 
     /// Typing must never strand the cursor on a cell the filter emptied.
