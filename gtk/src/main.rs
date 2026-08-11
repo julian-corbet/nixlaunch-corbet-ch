@@ -1494,8 +1494,43 @@ fn spawn(machine: &Machine, app: &App, terminal: &[String]) {
         return;
     };
     use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args(args);
+
+    // OUT OF OUR CGROUP, not merely out of our process group.
+    //
+    // A resident launcher runs as a systemd unit, and everything it spawns lands in that unit's
+    // cgroup. Restarting the unit then kills every application ever started from it -- including
+    // forwarded sessions to other machines, which take a visible moment to rebuild.
+    //
+    // `process_group(0)` below does NOT prevent this, and believing it did cost a real afternoon:
+    // setsid escapes the process group, systemd kills by cgroup, and the two look interchangeable
+    // right up until you test them. `KillMode=process` does not save it either -- that governs
+    // which process receives the stop signal, and the cgroup is torn down afterwards regardless.
+    //
+    // A transient scope is a unit of its own, so the application leaves this cgroup entirely.
+    // Measured, not assumed: a child started this way survives its parent unit being stopped,
+    // where the same child started directly does not.
+    //
+    // Falls back to a plain spawn where systemd-run is absent -- a launcher must not require an
+    // init system to start a program.
+    let scoped = std::process::Command::new("systemd-run")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    let mut cmd = if scoped {
+        let mut c = std::process::Command::new("systemd-run");
+        c.args(["--user", "--scope", "--collect", "--quiet", "--", bin]);
+        c.args(args);
+        c
+    } else {
+        let mut c = std::process::Command::new(bin);
+        c.args(args);
+        c
+    };
+    // Still setsid: it is what detaches from the launcher's terminal and controlling process, and
+    // it remains correct on the fallback path where there is no scope to escape into.
     cmd.process_group(0);
     match cmd.spawn() {
         Ok(_) => eprintln!("nixlaunch: started {} on {}", app.name, machine.name),
