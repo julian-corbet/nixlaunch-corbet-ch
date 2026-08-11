@@ -179,6 +179,30 @@ in
       '';
     };
 
+    daemon = {
+      enable = lib.mkEnableOption '''a session service that starts the launcher hidden and leaves it running.
+
+        Residency only pays from the SECOND open onwards, and the first is the one a person
+        notices -- the press after login, when nothing is warm. Started at session start, even
+        that one is a window being shown rather than a program being launched
+      ''';
+
+      command = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ "nixlaunch" "--daemon" ];
+        example = [ "/usr/bin/nixlaunch" "--daemon" ];
+        description = '''
+          argv for the resident process.
+
+          A bare name by default, resolved against the unit'''s own PATH. Hosts that take the
+          binary from their distro rather than from this module (see `package`) should give the
+          absolute path, for the same reason every other command on this plane does: a unit does
+          not inherit a login shell'''s PATH, and the failure looks like the service silently not
+          existing rather than like a missing binary.
+        ''';
+      };
+    };
+
     machines = lib.mkOption {
       type = lib.types.listOf (lib.types.submodule machineModule);
       default = [ ];
@@ -212,6 +236,32 @@ in
     ];
 
     home.packages = lib.optional (cfg.package != null) cfg.package;
+
+    # A UNIT, not a compositor spawn line. A spawn line fires once at session start, so switching
+    # a generation into a session that is already running leaves the old process in place -- or no
+    # process at all if this was just enabled. As a unit, `home-manager switch` starts and
+    # restarts it during activation, which converges the RUNNING session rather than waiting for
+    # the next login.
+    systemd.user.services = lib.mkIf cfg.daemon.enable {
+      nixlaunch = {
+        Unit = {
+          Description = "nixlaunch, resident and hidden";
+          # The launcher needs a compositor to build its surface against, so it cannot usefully
+          # start before one exists.
+          After = [ "graphical-session.target" ];
+          PartOf = [ "graphical-session.target" ];
+        };
+        Service = {
+          ExecStart = lib.escapeShellArgs cfg.daemon.command;
+          # NOT Restart=always. A launcher that cannot build its window will fail the same way on
+          # every retry, and a restart loop against a broken compositor connection is noise that
+          # buries the first, real error.
+          Restart = "on-failure";
+          RestartSec = 3;
+        };
+        Install.WantedBy = [ "graphical-session.target" ];
+      };
+    };
 
     # `toJSON` on the option values directly, not a hand-assembled string: the Nix types ARE the
     # schema, so anything that type-checks here serialises correctly by construction and there is
