@@ -118,7 +118,15 @@ pub enum Focus {
 }
 
 pub struct State {
-    /// The row set, in order, ending in the inbox. From config; see `DEFAULT_FOLDERS`.
+    /// The row set as CONFIG declared it, and the order `base`'s cells are indexed by. Never
+    /// permuted -- `folders` below is re-derived from this on every rebuild.
+    ///
+    /// Keeping these apart is not tidiness. When usage ordering permuted the live row list in
+    /// place, the next rebuild's unplaced pass indexed base's ORIGINAL row numbers into a cells
+    /// vector whose positions had moved, so untouched machines silently swapped rows -- and the
+    /// next drag snapshotted that corruption into placement.json, permanently.
+    pub canonical_folders: Vec<String>,
+    /// The row set as DISPLAYED, after usage ordering. Rebuilt from `canonical_folders` each time.
     pub folders: Vec<String>,
     /// How often each thing is reached for. See usage.rs.
     pub usage: Usage,
@@ -151,13 +159,27 @@ pub struct State {
     pub query: String,
 }
 
+/// Used when there are no machines at all, so `cell()` can answer without indexing into nothing.
+/// A config with an empty machine list is a shape the module can legitimately render (every
+/// machine toggled off), and it must open empty rather than panic on startup.
+static NO_LINES: Vec<Line> = Vec::new();
+
 impl State {
     pub fn cell(&self) -> &Vec<Line> {
-        &self.view[self.col].cells[self.row]
+        match self.view.get(self.col).and_then(|m| m.cells.get(self.row)) {
+            Some(c) => c,
+            None => &NO_LINES,
+        }
     }
 
     pub fn current_line(&self) -> Option<&Line> {
         self.cell().get(self.line)
+    }
+
+    /// Test-only: bump a score without writing to disk.
+    #[cfg(test)]
+    pub fn record_launch_for_test(&mut self, machine: &str, app: &str) {
+        usage::record(&mut self.usage, machine, app, usage::now_secs(), self.half_life_days);
     }
 
     /// Record a launch, and persist it.
@@ -170,7 +192,10 @@ impl State {
     /// Called on startup and after every drop, so there is exactly one path from
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
-        self.machines = apply_placement(&self.base, &self.placement, &self.folders);
+        // Always from canonical: apply_placement indexes base's cells, which are in canonical
+        // order, and a permuted row list here is what desynchronised the two.
+        self.folders = self.canonical_folders.clone();
+        self.machines = apply_placement(&self.base, &self.placement, &self.canonical_folders);
         // Placement decides MEMBERSHIP -- which folder, which line. Usage decides ORDER within
         // that, and only where the evidence justifies a move. Running it here rather than baking
         // it into the placement file keeps the two separable: the file stays a record of what the
@@ -204,6 +229,29 @@ impl State {
                 self.folders[r].clone(),
                 lines.iter().map(|l| l.apps.iter().map(|a| a.name.clone()).collect()).collect(),
             );
+        }
+        // MERGE, never replace. An app named in the placement but absent from today's inventory
+        // has no cell to be snapshotted from, so a wholesale insert would drop it -- silently
+        // discarding the arrangement of everything that happened to be missing (uninstalled, or a
+        // backend that timed out and returned a partial list) the moment the user dragged anything
+        // else. Entries for apps we cannot currently see are carried through untouched, which is
+        // what makes "uninstall it and it returns to where you put it" true.
+        let seen: std::collections::HashSet<String> = folders
+            .values()
+            .flatten()
+            .flatten()
+            .cloned()
+            .collect();
+        let previous = self.placement.get(&m.name).cloned().unwrap_or_default();
+        for (folder, lines) in previous {
+            let kept: Vec<Vec<String>> = lines
+                .into_iter()
+                .map(|l| l.into_iter().filter(|n| !seen.contains(n)).collect::<Vec<_>>())
+                .filter(|l: &Vec<String>| !l.is_empty())
+                .collect();
+            if !kept.is_empty() {
+                folders.entry(folder).or_default().extend(kept);
+            }
         }
         self.placement.insert(m.name.clone(), folders);
     }
@@ -303,7 +351,7 @@ impl State {
     /// it. Rather than leaving it stranded, walk to the first cell that DOES -- reading order,
     /// row-major -- so typing always leaves something selected and Enter always means something.
     pub fn snap_to_content(&mut self) {
-        if !self.cell().is_empty() {
+        if self.view.is_empty() || !self.cell().is_empty() {
             return;
         }
         for r in 0..self.folders.len() {
@@ -604,6 +652,7 @@ mod tests {
 
     fn state(machines: Vec<Machine>) -> State {
         let mut s = State {
+            canonical_folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
             folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
             // No usage in the model tests: they are about placement and navigation, and a live
             // reordering pass would make their expectations depend on statistics they are not
@@ -834,6 +883,71 @@ mod tests {
             launch_argv(&m, &appx("Helix", "helix %F"), &[]),
             vec!["waypipe@remote", "helix"]
         );
+    }
+
+    /// THE REGRESSION THAT MOTIVATED canonical_folders. Usage ordering permuted the live row list
+    /// in place; the next rebuild's unplaced pass then indexed base's ORIGINAL row numbers into a
+    /// cells vector whose positions had moved, so a machine the user never touched silently
+    /// swapped rows -- and the next drag snapshotted that into placement.json permanently.
+    ///
+    /// The invariant: rebuilding twice must produce the same grid as rebuilding once.
+    #[test]
+    fn rebuilding_is_stable_under_row_reordering() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["Foot"]])]);
+        // Make a later row decisively outrank row 0, so a permutation really happens.
+        s.base[0].cells[1] = vec![Line { apps: vec![app("Helix")] }];
+        for _ in 0..80 {
+            s.record_launch_for_test("m", "Helix");
+        }
+        s.rebuild();
+        let first: Vec<(String, Vec<String>)> = snapshot(&s);
+        s.rebuild();
+        s.rebuild();
+        assert_eq!(snapshot(&s), first, "the grid must not drift on repeated rebuilds");
+    }
+
+    fn snapshot(s: &State) -> Vec<(String, Vec<String>)> {
+        s.folders
+            .iter()
+            .enumerate()
+            .map(|(r, f)| {
+                (
+                    f.clone(),
+                    s.machines[0].cells[r]
+                        .iter()
+                        .flat_map(|l| l.apps.iter().map(|a| a.name.clone()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// An empty machine list is a shape the config module can legitimately render -- every machine
+    /// toggled off -- and must open empty rather than panic on the first cursor read.
+    #[test]
+    fn no_machines_does_not_panic() {
+        let mut s = state(vec![]);
+        s.rebuild();
+        assert!(s.cell().is_empty());
+        s.clamp();
+    }
+
+    /// An app named in the placement but absent from today's inventory must survive a drag
+    /// elsewhere -- otherwise uninstalling something, or one partial inventory, silently discards
+    /// the arrangement of everything that was missing at that moment.
+    #[test]
+    fn materialise_keeps_entries_for_apps_it_cannot_see() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["here"]])]);
+        let mut folders = HashMap::new();
+        folders.insert("Media".to_string(), vec![vec!["gone".to_string()]]);
+        s.placement.insert("m".to_string(), folders);
+        s.rebuild();
+
+        s.place_app(0, "here", 1, None, 0);
+
+        let after = &s.placement["m"];
+        assert!(after.contains_key("Media"), "the absent app's folder survived: {after:?}");
+        assert_eq!(after["Media"], vec![vec!["gone".to_string()]]);
     }
 
     /// clamp() is the only thing standing between a shrinking grid and an index panic.

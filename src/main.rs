@@ -173,6 +173,7 @@ fn build(application: &Application) {
     }
 
     let state = Rc::new(RefCell::new(State {
+        canonical_folders: folders.clone(),
         folders,
         usage: usage::load(),
         // Two standard errors, ~95% confidence. Lower and the grid twitches; higher and a real
