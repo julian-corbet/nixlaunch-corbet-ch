@@ -202,6 +202,20 @@ const M_TRIM_THRESHOLD: i32 = -1;
 const M_MMAP_THRESHOLD: i32 = -3;
 
 fn main() {
+    // The renderer choice belongs to the PROGRAM, not to one packaging of it.
+    //
+    // It was set by the Nix wrapper, which is correct there and reaches nobody else: a distro
+    // package, a cargo build, someone running it from a checkout all got GTK's own GPU probe and
+    // therefore Vulkan -- device init, shader compilation and a driver thread pool spent on a
+    // surface made of boxes and labels, all of it between the keypress and the window. Setting it
+    // here means every way of building this program gets the same measured-best default.
+    //
+    // Only when unset, so GSK_RENDERER in the environment still wins and the comparison stays
+    // reproducible without a rebuild.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
+    }
+
     unsafe {
         mallopt(M_MMAP_THRESHOLD, 128 * 1024);
         mallopt(M_TRIM_THRESHOLD, 256 * 1024);
