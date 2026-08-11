@@ -106,7 +106,15 @@ window {{ background-color: {ground}; color: {fg}; }}
 fn main() {
     let application = Application::builder().application_id("io.github.nixlaunch").build();
     application.connect_activate(|app| {
-        eprintln!("nixlaunch: activate");
+        // GApplication is single-instance by default, so a second launch does not start a second
+        // process -- it fires `activate` on the running one. Building unconditionally there
+        // stacked a second layer surface over the first, leaked another style provider, and gave
+        // the two windows independent snapshots of placement.json and usage.json that then
+        // overwrote each other. Present what already exists.
+        if let Some(existing) = app.windows().first() {
+            existing.present();
+            return;
+        }
         build(app);
     });
     // `run()`, NOT `run_with_args(&[])`. An EMPTY argv is not "no arguments" to GApplication --
@@ -118,6 +126,8 @@ fn main() {
 }
 
 fn build(application: &Application) {
+    let (folders, base, theme, terminal_cmd_outer, keyboard_mode, config_error) = load_world();
+
 
     // NO default size. A launcher should be exactly as big as what it is showing: a fixed size
     // leaves dead space under a short grid and clips a tall one, and BOTH are wrong for a surface
@@ -141,16 +151,24 @@ fn build(application: &Application) {
     if std::env::var_os("NIXLAUNCH_NO_LAYER").is_none() {
         window.init_layer_shell();
         window.set_layer(Layer::Overlay);
-        // OnDemand, NOT Exclusive. Exclusive takes the keyboard away from everything else for as
-        // long as the surface exists, which is correct for a lock screen and wrong for a launcher
-        // -- it means the rest of the session cannot be typed into while this is open, and it
-        // feels like the window has seized the machine rather than been given focus. OnDemand
-        // asks the compositor for focus the normal way, so it behaves like any other window and
-        // clicking away actually works.
-        window.set_keyboard_mode(KeyboardMode::OnDemand);
+        // EXCLUSIVE by default, and this is a correction: on-demand reads like the polite choice
+        // and does not work. On every released sway (1.10-1.12) and its forks, `handle_map` grants
+        // a mapping layer surface focus and then the `arrange_layers` call at the end of the SAME
+        // handler takes it straight back for anything that is not EXCLUSIVE -- so the launcher
+        // maps and never receives a key. Every shipping launcher defaults to exclusive for this
+        // reason. Configurable, because the day a compositor fixes it, on-demand is the nicer
+        // behaviour and nobody should need a new build to use it.
+        //
+        // SET BEFORE `present()`, always: sway reads the mode at map time out of the surface's
+        // INITIAL commit, and gtk4-layer-shell only puts it there if it was set on the window
+        // before the surface was created. A mode applied after presenting is silently ignored.
+        window.set_keyboard_mode(match keyboard_mode.as_str() {
+            "ondemand" => KeyboardMode::OnDemand,
+            "none" => KeyboardMode::None,
+            _ => KeyboardMode::Exclusive,
+        });
     }
 
-    let (folders, base, theme, terminal_cmd_outer, config_error) = load_world();
 
     let provider = CssProvider::new();
     provider.load_from_string(&css(&theme));
@@ -228,10 +246,20 @@ fn build(application: &Application) {
     // the top and bottom are simply unreachable, since a layer surface has no titlebar to drag.
     // Two thirds leaves the session visible behind it, which is most of why this is an overlay
     // rather than a window.
+    // The SMALLEST attached monitor, not the first-enumerated one. Which output the compositor
+    // places an unanchored layer surface on is not knowable before it maps, so sizing to monitor 0
+    // overflows the moment it lands on a shorter panel -- and a layer surface has no titlebar to
+    // drag back into view. Fitting the smallest is correct wherever it ends up.
     let screen_h = gtk::gdk::Display::default()
-        .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
-        .map(|m| m.geometry().height())
-        .filter(|h| *h > 0)
+        .map(|d| {
+            let ms = d.monitors();
+            (0..ms.n_items())
+                .filter_map(|i| ms.item(i).and_downcast::<gtk::gdk::Monitor>())
+                .map(|m| m.geometry().height())
+                .filter(|h| *h > 0)
+                .min()
+                .unwrap_or(1080)
+        })
         .unwrap_or(1080);
     scroller.set_max_content_height((screen_h as f64 * theme.max_height_fraction) as i32);
 
@@ -265,11 +293,23 @@ fn build(application: &Application) {
         let hint = hint.clone();
         let holder = render_holder.clone();
         let theme_error = theme.error.clone();
+        let config_err = config_error.clone();
         let icon_px = theme.icon_size;
         move || {
             let s = state.borrow();
 
-            if s.query.is_empty() {
+            // A config that EXISTS but does not parse is shown IN THE WINDOW, not just on stderr.
+            // This surface is launched from a compositor keybind, so nothing is watching stderr,
+            // and the fallback is fixture data -- inventing machines while the real ones failed to
+            // load is precisely the outcome config.rs's own comment says must not happen silently.
+            if let Some(err) = &config_err {
+                search.set_markup(&format!(
+                    "<span foreground=\"{}\">config error \u{2014} showing demo data:</span> {}",
+                    theme_error,
+                    escape(err)
+                ));
+                search.remove_css_class("empty");
+            } else if s.query.is_empty() {
                 search.set_text("type to search\u{2026}");
                 search.add_css_class("empty");
             } else {
@@ -586,15 +626,15 @@ fn build(application: &Application) {
 /// repo testable by someone with no fleet. A config that EXISTS but does not parse is a different
 /// thing entirely and is reported rather than silently replaced by fixtures, because silently
 /// showing invented machines when the real ones failed to load is the worst of both.
-fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, Option<String>) {
+fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, String, Option<String>) {
     let default_rows = || DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect::<Vec<_>>();
     match config::load() {
-        Err(e) => (default_rows(), fixture(), config::Theme::default(), vec![], Some(e)),
-        Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], None),
+        Err(e) => (default_rows(), fixture(), config::Theme::default(), vec![], "exclusive".into(), Some(e)),
+        Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], "exclusive".into(), None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
             let machines = cfg.machines.iter().map(|mc| inventory(mc, &rows, cfg.theme.line_width)).collect();
-            (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), None)
+            (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), cfg.keyboard.clone(), None)
         }
     }
 }

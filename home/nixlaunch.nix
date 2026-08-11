@@ -144,6 +144,25 @@ in
       '';
     };
 
+    keyboard = lib.mkOption {
+      type = lib.types.enum [ "exclusive" "ondemand" "none" ];
+      default = "exclusive";
+      description = ''
+        How the launcher takes the keyboard.
+
+        `exclusive` is the default because on-demand DOES NOT WORK, and that is a compositor bug
+        rather than a matter of taste: on every released sway (1.10–1.12) and its forks, a mapping
+        layer surface is granted focus in `handle_map` and then has it revoked again by the
+        `arrange_layers` call at the end of that same handler unless its keyboard_interactive is
+        EXCLUSIVE. The surface maps and never receives a key. Every shipping launcher defaults to
+        exclusive for this reason.
+
+        Set `ondemand` only on a compositor known to have fixed it — it is the nicer behaviour,
+        since exclusive holds the keyboard away from the rest of the session while the launcher is
+        open.
+      '';
+    };
+
     terminal = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -198,7 +217,7 @@ in
     # schema, so anything that type-checks here serialises correctly by construction and there is
     # no second place for the two to disagree.
     xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
-      inherit (cfg) folders terminal;
+      inherit (cfg) folders terminal keyboard;
       machines = map (m: { inherit (m) name accent inventory launch; }) cfg.machines;
     } // lib.optionalAttrs (cfg.theme != { }) { inherit (cfg) theme; });
   };

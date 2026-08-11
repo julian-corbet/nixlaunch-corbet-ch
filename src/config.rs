@@ -88,6 +88,10 @@ pub struct MachineConfig {
     pub launch: Vec<String>,
 }
 
+fn default_keyboard() -> String {
+    "exclusive".to_string()
+}
+
 fn default_accent() -> String {
     "#22C55E".to_string()
 }
@@ -148,6 +152,21 @@ impl Default for Theme {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub machines: Vec<MachineConfig>,
+    /// How the launcher takes the keyboard: "exclusive", "ondemand", or "none".
+    ///
+    /// EXCLUSIVE IS THE DEFAULT BECAUSE ON-DEMAND DOES NOT WORK, and that is a compositor bug
+    /// rather than a preference. On every released sway (1.10-1.12) and its forks, a mapping layer
+    /// surface is granted focus in `handle_map`, and then the `arrange_layers` call at the end of
+    /// that same handler revokes it again for anything whose keyboard_interactive is not
+    /// EXCLUSIVE. The surface maps and simply never receives a key. Every shipping launcher
+    /// defaults to exclusive for this reason -- fuzzel additionally hard-falls-back to it when the
+    /// protocol is too old to offer on-demand at all.
+    ///
+    /// The mode must also be set BEFORE the window is presented: sway reads it at map time from
+    /// the surface's initial commit, and a mode applied after that is silently ignored.
+    #[serde(default = "default_keyboard")]
+    pub keyboard: String,
+
     /// argv that wraps a program declaring `Terminal=true` -- e.g. `["foot", "-e"]`.
     ///
     /// Not guessed, and not defaulted to some popular emulator: the right answer is whatever
