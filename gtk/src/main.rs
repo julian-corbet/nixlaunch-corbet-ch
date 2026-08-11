@@ -1199,8 +1199,7 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
         })
         .and_then(|out| {
             if out.status.success() {
-                serde_json::from_slice::<config::Inventory>(&out.stdout)
-                    .map_err(|e| format!("unreadable inventory: {e}"))
+                config::parse_inventory(&out.stdout)
             } else {
                 Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
             }

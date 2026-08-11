@@ -39,6 +39,17 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Read what an inventory command printed.
+///
+/// HERE RATHER THAN IN A SHELL, because the shape of this JSON is the contract and the contract is
+/// the core's. A shell's job is to run the command and hand over the bytes; if each one parsed for
+/// itself, each would own a copy of the schema and they would drift the first time a field was
+/// added. It also means a shell needs no JSON library of its own -- the GTK one carried serde_json
+/// solely for this call.
+pub fn parse_inventory(bytes: &[u8]) -> Result<Inventory, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("unreadable inventory: {e}"))
+}
+
 /// The JSON one `inventory` command must print. Deliberately identical to what
 /// `rlaunch --json <host>` already emits, so the common case needs no adapter.
 #[derive(Deserialize, Debug, Clone)]

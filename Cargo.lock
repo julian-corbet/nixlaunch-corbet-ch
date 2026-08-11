@@ -487,7 +487,6 @@ dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "nixlaunch-core",
- "serde_json",
 ]
 
 [[package]]
