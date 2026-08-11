@@ -1,0 +1,74 @@
+# Maintainer: see the repository
+#
+# ── WHY A DISTRO PACKAGE AT ALL, WHEN A NIX BUILD ALREADY EXISTS ─────────────────────────────
+#
+# Because a second copy of GTK4 in RAM is the largest single cost this program has, and packaging
+# is the only honest way to avoid it. Measured on one machine, same configuration, same renderer,
+# 191 applications, in a headless compositor:
+#
+#                       private    dirty    clean     PSS
+#   nix-built           52.5 MB     14.7     37.8     54.9
+#   distro-built        22.3 MB     15.2      7.1     28.3
+#
+# The dirty figure -- the program's own data -- is unchanged, as it should be: nothing about the
+# application differs. The whole saving is `clean`, the file-backed library pages, and it appears
+# because this build maps /usr/lib/libgtk-4.so.1, the same file every other GTK4 program on the
+# system already has resident. The nix build maps /nix/store/...-gtk4-4.22.4/lib/libgtk-4.so.1 --
+# byte-identical in content, a different inode, and therefore shared with nobody.
+#
+# That is not a Nix criticism. A store path is the right answer to reproducibility and the wrong
+# answer to residency, and the two goals genuinely conflict here. The resolution is to let each
+# plane do what it is good at: Nix builds it for NixOS hosts where the store IS the system, and
+# this builds it for Arch hosts where the distro's libraries are already in memory.
+#
+# ── ON NOT POINTING A NIX BUILD AT /usr ──────────────────────────────────────────────────────
+#
+# The obvious shortcut -- keep the nix derivation and make it link the system GTK -- is the trap
+# that has bitten this estate before: a binary built against one glibc and run against another is
+# undefined, and the symptoms arrive later and elsewhere. Building the whole thing with the
+# distro's own toolchain is slower to set up and correct by construction.
+pkgname=nixlaunch
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A Wayland launcher whose layout is a matrix: machines across, folders down, appsets within"
+arch=('x86_64' 'aarch64')
+url="https://github.com/julian-corbet/nixlaunch-corbet-ch"
+license=('MIT')
+depends=('gtk4' 'gtk4-layer-shell')
+makedepends=('cargo' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-corbet-ch-$pkgver"
+  # Vendor with the target already selected, so the build itself needs no network -- which is what
+  # makes this reproducible in a clean chroot rather than only on a developer's machine.
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-corbet-ch-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # The layer-shell module is `gtk4-layer-shell-0`, not `gtk4-layer-shell`. Worth stating because
+  # searching for the obvious name reports the library as absent when it is installed, headers and
+  # all, and that mistake cost real time here.
+  export PKG_CONFIG_PATH="/usr/lib/pkgconfig:${PKG_CONFIG_PATH}"
+  cargo build --frozen --release --all-features
+}
+
+check() {
+  cd "$pkgname-corbet-ch-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # The suite is pure model and cache logic -- no display needed, and none available in a chroot.
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-corbet-ch-$pkgver"
+  install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm0644 LICENCE "$pkgdir/usr/share/licenses/$pkgname/LICENCE" 2>/dev/null ||
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
