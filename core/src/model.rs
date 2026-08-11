@@ -687,6 +687,34 @@ impl State {
     /// Every cursor move funnels through here, so no key handler can leave the cursor pointing
     /// into a cell or line that shrank under it -- the class of bug that only appears once real
     /// inventories differ in length between machines, or the moment a filter empties something.
+    /// Does any machine have anything on this row?
+    ///
+    /// A row nobody has anything on is not information, it is a gap with a label. It arises
+    /// honestly: every folder emits a catch-all row alongside its subcategories, so sorting every
+    /// chat client into biz/leis/priv leaves the bare `Chat` row empty everywhere -- and a
+    /// subcategory whose members are installed on no machine does the same.
+    pub fn row_has_content(&self, r: usize) -> bool {
+        self.view.iter().any(|m| m.cells.get(r).is_some_and(|c| !c.is_empty()))
+    }
+
+    /// The next row in `dir` that has something on it, or the current one if none does.
+    ///
+    /// Skipping rather than hiding-and-reindexing: the row indices stay aligned with
+    /// `canonical_folders` and the placement, which is the alignment that has broken twice before.
+    /// An empty row is simply never landed on.
+    pub fn next_row(&self, from: usize, dir: i32) -> usize {
+        let last = self.folders.len().saturating_sub(1);
+        let mut r = from;
+        loop {
+            let next = if dir < 0 { r.checked_sub(1) } else { (r + 1).le(&last).then_some(r + 1) };
+            let Some(next) = next else { return from };
+            r = next;
+            if self.row_has_content(r) {
+                return r;
+            }
+        }
+    }
+
     pub fn clamp(&mut self) {
         self.col = self.col.min(self.view.len().saturating_sub(1));
         self.row = self.row.min(self.folders.len().saturating_sub(1));
@@ -1747,6 +1775,36 @@ mod tests {
         assert_eq!(chat.len(), 1, "the row is still there: {chat:?}");
         assert_eq!(chat[0].name(), Some("business"));
         assert!(chat[0].apps().is_empty(), "and it is empty");
+    }
+
+    /// A row nobody has anything on is never shown and never landed on.
+    ///
+    /// It arises honestly rather than by accident: every folder emits a catch-all row beside its
+    /// subcategories, so sorting every member into one leaves the catch-all empty everywhere.
+    #[test]
+    fn a_row_empty_on_every_machine_is_skipped() {
+        let mut a = machine("a", 0, vec![vec!["one"]]);
+        let mut b = machine("b", 0, vec![vec!["two"]]);
+        // Row 2 has something; row 1 has nothing on either machine.
+        a.cells[2] = vec![Line { name: None, apps: vec![app("three")] }];
+        b.cells[2] = vec![Line { name: None, apps: vec![app("four")] }];
+        let s = state(vec![a, b]);
+
+        assert!(s.row_has_content(0));
+        assert!(!s.row_has_content(1), "nobody has anything on row 1");
+        assert!(s.row_has_content(2));
+
+        // Moving down from row 0 lands on 2, never on 1.
+        assert_eq!(s.next_row(0, 1), 2);
+        assert_eq!(s.next_row(2, -1), 0);
+    }
+
+    /// And at the end there is nowhere to go, which must not wrap or run off.
+    #[test]
+    fn moving_past_the_last_populated_row_stays_put() {
+        let s = state(vec![machine("a", 0, vec![vec!["one"]])]);
+        assert_eq!(s.next_row(0, 1), 0, "no populated row below");
+        assert_eq!(s.next_row(0, -1), 0, "and none above");
     }
 
     /// Dropping an item into the gap it already occupies is a no-op, not a shuffle.

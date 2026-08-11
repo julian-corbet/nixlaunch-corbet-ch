@@ -803,6 +803,14 @@ fn build(application: &Application) {
             }
 
             for (r, folder) in s.folders.iter().enumerate() {
+                // A row nobody has anything on is a gap with a label. Skipped rather than removed,
+                // so row indices stay aligned with the placement -- the alignment that has gone
+                // wrong twice already.
+                if !s.row_has_content(r) {
+                    painted.borrow_mut().rowheads.push(Label::new(None));
+                    painted.borrow_mut().cells.push(Vec::new());
+                    continue;
+                }
                 // `folder/sub` splits across two label columns, and the folder name is drawn
                 // only on the FIRST row that carries it -- repeating "Chat" down three rows would
                 // be noise, and its absence is what makes the group read as a group.
@@ -1164,11 +1172,8 @@ fn build(application: &Application) {
                     (Focus::Outside, Some(keymap::Action::MoveRight)) => {
                         s.col = (s.col + 1).min(s.view.len().saturating_sub(1))
                     }
-                    (Focus::Outside, Some(keymap::Action::MoveUp)) => s.row = s.row.saturating_sub(1),
-                    (Focus::Outside, Some(keymap::Action::MoveDown)) => {
-                        let last = s.folders.len().saturating_sub(1);
-                        s.row = (s.row + 1).min(last);
-                    }
+                    (Focus::Outside, Some(keymap::Action::MoveUp)) => s.row = s.next_row(s.row, -1),
+                    (Focus::Outside, Some(keymap::Action::MoveDown)) => s.row = s.next_row(s.row, 1),
                     (Focus::Outside, Some(keymap::Action::Enter)) | (Focus::Outside, Some(keymap::Action::LaunchLine)) => {
                         if shift {
                             let machine = s.view[s.col].clone();
