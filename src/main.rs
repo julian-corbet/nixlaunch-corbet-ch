@@ -37,6 +37,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 
+mod config;
 mod model;
 use model::*;
 
