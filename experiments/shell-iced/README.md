@@ -87,3 +87,20 @@ non-activating panel that Alfred and Raycast use.
 So the answer is not "one shell" or "two shells" but: **the core was worth separating, and the
 right shell is a per-platform decision that the split now lets us take independently.** Which is
 what the split was for, arrived at by measuring rather than by preferring.
+
+## What was decided
+
+**Linux only. GTK stays, and there is no macOS port.**
+
+Which retires the second of the two reasons the core was split out. The first one stands on its
+own and has already paid: within an hour of the boundary existing, the compiler caught a
+dependency the shell had never declared and an `application.hold()` that had been inert since the
+day it was written, and writing a second shell exposed that the inventory parser was living on the
+wrong side of the line. A rule in a comment is a hope; a rule the build enforces is a rule.
+
+This probe is finished. It is kept for the number and for the reason behind the number -- that a
+shared library beats a smaller static one whenever something else on the machine is already using
+it -- which is the same fact that made the distro-linked build worth 30MB, seen from the other
+side. The `target/` directory is not kept; it is 3000 files, and a root-anchored `/target` in
+`.gitignore` cheerfully let them into a commit, where they did not fail anything and simply made
+the push hang.
