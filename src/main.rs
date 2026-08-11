@@ -292,11 +292,21 @@ fn build(application: &Application) {
     // Gated on having been active at least once, because a surface is briefly inactive between
     // mapping and being focused -- closing on that first false would make it flash and vanish.
     if exit_on_focus_loss {
-        let seen_active = std::cell::Cell::new(false);
+        // A GRACE PERIOD, not just a "has been active" flag. Launching from a bar button or a dock
+        // means something else held focus at the moment of the click, and focus can bounce once
+        // before it settles -- so a handler that closes on the FIRST inactive edge closes the
+        // launcher immediately and it reads as "the button does nothing". Ignore focus loss for a
+        // moment after mapping; after that, losing the keyboard means the user looked elsewhere
+        // and the window should go.
+        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let armed = armed.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+                armed.set(true);
+            });
+        }
         window.connect_is_active_notify(move |w| {
-            if w.is_active() {
-                seen_active.set(true);
-            } else if seen_active.get() {
+            if !w.is_active() && armed.get() {
                 w.close();
             }
         });
