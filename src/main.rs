@@ -3,7 +3,7 @@
 // The shape is the point. Every other launcher on Wayland is a search box over ONE list, so the
 // only way it can express "which machine" or "which kind of thing" is by making you narrow a
 // single flat set. A screen is two-dimensional; a matrix uses both axes, so "the editors on
-// archlxc" is a POSITION you move to rather than a query you compose.
+// that workstation" is a POSITION you move to rather than a query you compose.
 //
 // THREE LEVELS, TWO OF THEM SIMULTANEOUS ON SCREEN:
 //
@@ -378,8 +378,8 @@ fn build(application: &Application) {
                             b.add_css_class("app");
                             // The payload carries the COLUMN it came from as well as the name, so
                             // the drop side can refuse a cross-machine drag without having to ask
-                            // anyone: filing is per machine, and "Firefox on archlxc" is not the
-                            // same object as "Firefox on elitebook".
+                            // anyone: filing is per machine, and "Firefox on one machine" is not the
+                            // same object as "Firefox on another".
                             {
                                 let src = gtk::DragSource::new();
                                 src.set_actions(gtk::gdk::DragAction::MOVE);

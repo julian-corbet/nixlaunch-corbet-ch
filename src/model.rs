@@ -37,7 +37,7 @@ pub struct Machine {
     /// it is honest, where an empty column is indistinguishable from a machine that has nothing.
     pub error: Option<String>,
     /// Parallel to the row set: cells[r] is this machine's lines for folder r. An empty cell is a
-    /// real and common state worth DRAWING rather than collapsing -- it tells you "archlxc has no
+    /// real and common state worth DRAWING rather than collapsing -- it tells you "that machine has no
     /// chat client" at a glance, which a list-based launcher can only tell you by absence.
     pub cells: Vec<Vec<Line>>,
 }
@@ -386,7 +386,7 @@ pub fn line(apps: Vec<App>) -> Line {
 pub fn fixture() -> Vec<Machine> {
     vec![
         Machine {
-            name: "elitebook".into(),
+            name: "laptop".into(),
             accent: "#166534".into(),
             error: None,
             cells: vec![
@@ -405,7 +405,7 @@ pub fn fixture() -> Vec<Machine> {
             ],
         },
         Machine {
-            name: "archlxc".into(),
+            name: "workstation".into(),
             accent: "#B45309".into(),
             error: None,
             cells: vec![
@@ -422,7 +422,7 @@ pub fn fixture() -> Vec<Machine> {
             ],
         },
         Machine {
-            name: "devhome".into(),
+            name: "console".into(),
             accent: "#9F1239".into(),
             error: None,
             cells: vec![
@@ -620,7 +620,7 @@ mod tests {
     ///
     /// NOTE THE SHAPE OF THIS INVARIANT, which a first version of this test got wrong: resting on
     /// an EMPTY cell is legal and reachable on purpose. Empty cells are drawn rather than
-    /// collapsed, because "archlxc has no chat client" is an answer worth seeing, and you have to
+    /// collapsed, because "that machine has no chat client" is an answer worth seeing, and you have to
     /// be able to arrow onto one to read it. So the guarantee is not "there is always an item" --
     /// it is that indices are in range whenever there IS something to point at, and that an empty
     /// cell cannot leave you inside it.

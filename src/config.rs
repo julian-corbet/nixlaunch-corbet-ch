@@ -173,12 +173,12 @@ mod tests {
     #[test]
     fn inventory_parses_the_rlaunch_shape() {
         let inv: Inventory = serde_json::from_str(
-            r#"{"host":"devhome","error":null,"folders":[
+            r#"{"host":"console","error":null,"folders":[
                  {"label":"Terminals","apps":[
                    {"name":"Foot","icon":"foot","exec":"foot","terminal":false}]}]}"#,
         )
         .unwrap();
-        assert_eq!(inv.host, "devhome");
+        assert_eq!(inv.host, "console");
         assert!(inv.error.is_none());
         assert_eq!(inv.folders[0].apps[0].name, "Foot");
     }
