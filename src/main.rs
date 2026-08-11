@@ -103,6 +103,84 @@ window {{ background-color: {ground}; color: {fg}; }}
     )
 }
 
+/// Where the highlight is. Everything a repaint needs to know, and nothing it does not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    col: usize,
+    row: usize,
+    line: usize,
+    item: usize,
+    inside: bool,
+}
+
+struct LineW {
+    bx: GBox,
+    apps: Vec<GBox>,
+}
+
+struct CellW {
+    bx: GBox,
+    lines: Vec<LineW>,
+}
+
+/// Handles for the widgets that carry selection state, so moving the cursor does not have to
+/// rebuild the grid to find them again.
+///
+/// Deliberately NOT a mirror of the whole tree: nothing here is the icons, the labels or the drop
+/// targets, because a repaint never touches those. It holds exactly the widgets whose CSS classes
+/// change when the cursor moves, which is what keeps a repaint O(1) in the size of the grid.
+#[derive(Default)]
+struct Painted {
+    rowheads: Vec<Label>,
+    /// `[row][col]`, matching the grid's own indexing so a Cursor reads straight through.
+    cells: Vec<Vec<CellW>>,
+    /// What was highlighted at the last paint. The un-highlight step reads this rather than
+    /// searching, which is the whole reason a repaint costs the same on a full grid as an empty one.
+    last: Option<Cursor>,
+}
+
+impl Painted {
+    fn reset(&mut self) {
+        self.rowheads.clear();
+        self.cells.clear();
+        self.last = None;
+    }
+
+    /// Add (`on`) or remove (`!on`) the selection classes for one cursor position.
+    ///
+    /// Every lookup is fallible and simply does nothing when it misses. A cursor can legitimately
+    /// point past the end -- an app filtered away by a query, a line emptied by a drag -- and the
+    /// clamp that fixes it runs against the model, not against the widgets. Painting must not be
+    /// the thing that panics on a state the model considers ordinary.
+    fn mark(&self, c: Cursor, on: bool) {
+        if let Some(rh) = self.rowheads.get(c.row) {
+            class(rh, "active", on);
+        }
+        let Some(cell) = self.cells.get(c.row).and_then(|r| r.get(c.col)) else {
+            return;
+        };
+        class(&cell.bx, "cursor", on);
+        if !c.inside {
+            return;
+        }
+        class(&cell.bx, "inside", on);
+        if let Some(line) = cell.lines.get(c.line) {
+            class(&line.bx, "sel", on);
+            if let Some(app) = line.apps.get(c.item) {
+                class(app, "sel", on);
+            }
+        }
+    }
+}
+
+fn class<W: IsA<gtk::Widget>>(w: &W, name: &str, on: bool) {
+    if on {
+        w.add_css_class(name);
+    } else {
+        w.remove_css_class(name);
+    }
+}
+
 fn main() {
     let application = Application::builder().application_id("io.github.nixlaunch").build();
     application.connect_activate(|app| {
@@ -312,21 +390,37 @@ fn build(application: &Application) {
         });
     }
 
+    // ── TWO KINDS OF UPDATE, AND WHY THEY ARE NOT THE SAME FUNCTION ──────────────────────────
+    //
+    // Moving the cursor and changing the query are utterly different amounts of work, and treating
+    // them alike is what made this slow. The grid is ~900 widgets on a real three-machine
+    // inventory; rebuilding it costs hundreds of milliseconds, and it used to happen on EVERY
+    // keypress -- including the arrow keys, whose entire effect is to move one highlight.
+    //
+    //   `render`  STRUCTURAL. Tears the grid down and builds it again. Needed only when the set of
+    //             things on screen changes: a new query filters apps out, a drag re-files one, a
+    //             launch reorders by frecency.
+    //   `paint`   COSMETIC. Moves the selection classes from where they were to where they now
+    //             are, and updates the two text labels. Touches at most eight widgets regardless
+    //             of how many are on screen, because it remembers what it highlighted last time.
+    //
+    // Arrow keys, Tab and Enter-into-a-cell take the second path, which is the one the user is in
+    // for most of a session -- this launcher's whole premise is that you navigate a grid rather
+    // than type at it.
+    let painted: Rc<RefCell<Painted>> = Rc::new(RefCell::new(Painted::default()));
+
     // `render` must be callable from inside a drop handler that `render` itself installed, so it
     // needs a handle to itself. The holder is that indirection -- filled in immediately after
     // construction, and only ever read while no other borrow of it is live.
     let render_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
-    let render: Rc<dyn Fn()> = Rc::new({
+
+    let paint: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
-        let grid = grid.clone();
+        let painted = painted.clone();
         let search = search.clone();
-        let spacer = spacer.clone();
         let hint = hint.clone();
-        let holder = render_holder.clone();
         let theme_error = theme.error.clone();
-        let startup_err = startup_error.clone();
-        let config_err = startup_err.clone();
-        let icon_px = theme.icon_size;
+        let config_err = startup_error.clone();
         move || {
             let s = state.borrow();
 
@@ -348,6 +442,52 @@ fn build(application: &Application) {
                 search.set_text(&s.query);
                 search.remove_css_class("empty");
             }
+
+            hint.set_markup(match s.focus {
+                Focus::Outside =>
+                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> folder   <b>Tab</b>/<b>Enter</b> go inside   <b>Shift+Enter</b> launch the whole cell   <b>drag</b> onto a folder to file  \u{2022}  onto a line to join/reorder it   <b>Esc</b> close",
+                Focus::Inside =>
+                    "<b>\u{2190}\u{2192}</b> app   <b>\u{2191}\u{2193}</b> line (appset)   <b>Enter</b> launch app   <b>Shift+Enter</b> launch the line   <b>Tab</b>/<b>Esc</b> back out",
+            });
+
+            let now = Cursor {
+                col: s.col,
+                row: s.row,
+                line: s.line,
+                item: s.item,
+                inside: s.focus == Focus::Inside,
+            };
+            let mut p = painted.borrow_mut();
+            if p.last == Some(now) {
+                return;
+            }
+            // Un-highlight exactly what was highlighted, then highlight the new place. Walking the
+            // whole grid to clear stale classes would put the cost back that this exists to remove.
+            if let Some(was) = p.last {
+                p.mark(was, false);
+            }
+            p.mark(now, true);
+            p.last = Some(now);
+        }
+    });
+
+    let render: Rc<dyn Fn()> = Rc::new({
+        let state = state.clone();
+        let grid = grid.clone();
+        let spacer = spacer.clone();
+        let holder = render_holder.clone();
+        let theme_error = theme.error.clone();
+        let painted = painted.clone();
+        let paint = paint.clone();
+        let icon_px = theme.icon_size;
+        move || {
+            let s = state.borrow();
+
+            // Every handle recorded below belongs to a widget that is about to be destroyed, so the
+            // record is cleared FIRST. Leaving the old ones in place would have the next repaint
+            // remove a class from a widget that is no longer in the tree -- harmless, and a silent
+            // way for the real selection to keep a highlight it should have lost.
+            painted.borrow_mut().reset();
 
             while let Some(c) = grid.first_child() {
                 grid.remove(&c);
@@ -395,10 +535,9 @@ fn build(application: &Application) {
                 rh.set_valign(Align::Center);
                 rh.add_css_class("rowhead");
                 labelcol.add_widget(&rh);
-                if r == s.row {
-                    rh.add_css_class("active");
-                }
                 grid.attach(&rh, 0, r as i32 + 1, 1, 1);
+                painted.borrow_mut().rowheads.push(rh.clone());
+                let mut row_cells: Vec<CellW> = Vec::with_capacity(s.view.len());
 
                 for (c, m) in s.view.iter().enumerate() {
                     let lines = &m.cells[r];
@@ -431,14 +570,7 @@ fn build(application: &Application) {
                         });
                         cell.add_controller(tgt);
                     }
-                    let is_cursor = c == s.col && r == s.row;
-                    let inside = is_cursor && s.focus == Focus::Inside;
-                    if is_cursor {
-                        cell.add_css_class("cursor");
-                    }
-                    if inside {
-                        cell.add_css_class("inside");
-                    }
+                    let mut cell_lines: Vec<LineW> = Vec::with_capacity(lines.len());
                     if lines.is_empty() {
                         cell.add_css_class("empty");
                         let dash = Label::new(Some("\u{2014}"));
@@ -477,10 +609,8 @@ fn build(application: &Application) {
                             });
                             lb.add_controller(tgt);
                         }
-                        if inside && li == s.line {
-                            lb.add_css_class("sel");
-                        }
-                        for (ii, app) in ln.apps.iter().enumerate() {
+                        let mut line_apps: Vec<GBox> = Vec::with_capacity(ln.apps.len());
+                        for app in ln.apps.iter() {
                             let b = GBox::new(Orientation::Horizontal, 4);
                             b.add_css_class("app");
                             // The payload carries the COLUMN it came from as well as the name, so
@@ -496,9 +626,6 @@ fn build(application: &Application) {
                                 });
                                 b.add_controller(src);
                             }
-                            if inside && li == s.line && ii == s.item {
-                                b.add_css_class("sel");
-                            }
                             let img = Image::from_icon_name(&app.icon);
                             img.set_pixel_size(icon_px);
                             b.append(&img);
@@ -506,19 +633,22 @@ fn build(application: &Application) {
                             l.add_css_class("appname");
                             b.append(&l);
                             lb.append(&b);
+                            line_apps.push(b);
                         }
                         cell.append(&lb);
+                        cell_lines.push(LineW { bx: lb.clone(), apps: line_apps });
                     }
                     grid.attach(&cell, c as i32 + 1, r as i32 + 1, 1, 1);
+                    row_cells.push(CellW { bx: cell.clone(), lines: cell_lines });
                 }
+                painted.borrow_mut().cells.push(row_cells);
             }
 
-            hint.set_markup(match s.focus {
-                Focus::Outside =>
-                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> folder   <b>Tab</b>/<b>Enter</b> go inside   <b>Shift+Enter</b> launch the whole cell   <b>drag</b> onto a folder to file  \u{2022}  onto a line to join/reorder it   <b>Esc</b> close",
-                Focus::Inside =>
-                    "<b>\u{2190}\u{2192}</b> app   <b>\u{2191}\u{2193}</b> line (appset)   <b>Enter</b> launch app   <b>Shift+Enter</b> launch the line   <b>Tab</b>/<b>Esc</b> back out",
-            });
+            // The selection classes are NOT set above. Painting them is the other function's job,
+            // and doing it here as well would be a second implementation of the same rule, free to
+            // disagree with the first the moment either changes.
+            drop(s);
+            paint();
         }
     });
     *render_holder.borrow_mut() = Some(render.clone());
@@ -530,11 +660,20 @@ fn build(application: &Application) {
         let state = state.clone();
         let window = window.clone();
         let render = render.clone();
+        let paint = paint.clone();
         let terminal_cmd = terminal_cmd_outer.clone();
         keys.connect_key_pressed(move |_, key, _, mods| {
             let shift = mods.contains(ModifierType::SHIFT_MASK);
+            let structural;
             {
                 let mut s = state.borrow_mut();
+                // THE test for "did the grid's contents change", and it is exact rather than a
+                // guess: every arm that calls `refilter` does so because the query moved, and no
+                // other arm touches it. Comparing the query afterwards therefore identifies the
+                // structural keys without each arm having to remember to declare itself -- a flag
+                // set by hand would be one `s.query.push` away from being wrong, and the symptom
+                // would be a grid that silently stops matching what was typed.
+                let before = s.query.clone();
                 match (s.focus, key) {
                     // Esc unwinds one layer at a time rather than always closing: a typed query is
                     // state the user can lose accidentally, so it gets its own step.
@@ -654,8 +793,13 @@ fn build(application: &Application) {
                     }
                 }
                 s.clamp();
+                structural = s.query != before;
             }
-            render();
+            if structural {
+                render();
+            } else {
+                paint();
+            }
             gtk::glib::Propagation::Stop
         });
     }
@@ -677,10 +821,52 @@ fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, Strin
         Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], "layer".into(), "exclusive".into(), true, None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
-            let machines = cfg.machines.iter().map(|mc| inventory(mc, &rows, cfg.theme.line_width)).collect();
+            let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width);
             (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), cfg.surface.clone(), cfg.keyboard.clone(), cfg.exit_on_focus_loss, None)
         }
     }
+}
+
+/// Ask EVERY machine what it has, all at once.
+///
+/// One thread per machine, because the answer for a remote one is an SSH round trip and asking
+/// them in turn makes the launcher wait for the sum of them. Measured on a three-machine config
+/// with a cold inventory cache: 66ms + 269ms + 324ms sequentially, where the two remote ones are
+/// each a fresh SSH connection. Concurrently that is bounded by the slowest, not the total, and
+/// the launcher opens a third of a second sooner.
+///
+/// This is the ONLY place in the program where concurrency buys anything. Everything downstream of
+/// here is GTK, which is single-threaded by construction -- so nothing else is a candidate, and the
+/// rest of the startup cost has to come out of doing less work rather than doing it in more places.
+///
+/// Scoped threads specifically: they can borrow `rows` and the configs directly, so nothing has to
+/// be cloned into each thread, and the scope cannot outlive the data by construction. The results
+/// are joined IN ORDER, so the column order the user declared survives -- which matters, because
+/// the first column is the one the launcher opens on.
+///
+/// A panicking thread yields that machine's column as unreachable rather than taking the process
+/// with it. One machine's inventory command is not a reason for the other two to be unavailable,
+/// and an inventory command is arbitrary user-supplied argv.
+fn inventory_all(machines: &[config::MachineConfig], rows: &[String], line_width: usize) -> Vec<Machine> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = machines
+            .iter()
+            .map(|mc| scope.spawn(move || inventory(mc, rows, line_width)))
+            .collect();
+        handles
+            .into_iter()
+            .zip(machines)
+            .map(|(h, mc)| {
+                h.join().unwrap_or_else(|_| Machine {
+                    name: mc.name.clone(),
+                    accent: mc.accent.clone(),
+                    launch: mc.launch.clone(),
+                    error: Some("inventory panicked".into()),
+                    cells: vec![Vec::new(); rows.len()],
+                })
+            })
+            .collect()
+    })
 }
 
 /// Ask ONE machine what it has, by running the command config named for it.

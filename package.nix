@@ -32,6 +32,27 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config wrapGAppsHook4 ];
   buildInputs = [ gtk4 gtk4-layer-shell ];
 
+  # THE CAIRO RENDERER, BY DEFAULT.
+  #
+  # GTK4 picks its GSK renderer by probing the GPU, and on a machine with a working Vulkan driver it
+  # picks Vulkan. For this program that is the wrong trade in both directions, measured on a
+  # three-machine, 191-application inventory:
+  #
+  #   cairo    settles in 0.52-0.55s, ~560ms CPU, 10 Wayland frames -- every run
+  #   vulkan   one run was still burning CPU at 4.6s and had emitted 80 frames when it was killed
+  #
+  # Vulkan never reaching idle is its own bug and is being chased separately, but the renderer
+  # choice is not a workaround for it: a launcher draws boxes, labels and icons, and there is
+  # nothing here for a GPU pipeline to do. Bringing one up costs device init, shader compilation and
+  # a driver thread pool -- entirely on the path between the keystroke and the window, which is the
+  # only latency this program is judged on.
+  #
+  # `--set-default`, so this is a default and not a decree: GSK_RENDERER in the environment still
+  # wins, which is what makes it possible to reproduce the comparison above without rebuilding.
+  preFixup = ''
+    gappsWrapperArgs+=(--set-default GSK_RENDERER cairo)
+  '';
+
   meta = {
     description = "A Wayland launcher whose layout is a matrix: machines across, folders down, appsets within";
     longDescription = ''

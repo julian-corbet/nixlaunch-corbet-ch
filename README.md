@@ -122,14 +122,47 @@ Working and in daily use against real inventories. Not yet packaged for anything
 
 Known gaps, stated rather than hidden:
 
-- No usage-based reordering yet. It is easy to add and it fights muscle memory, which is the thing
-  that makes a spatial launcher fast in the first place — so it needs a decision, not a default.
 - Dragging **across** machines is refused, deliberately and permanently. Filing is per machine and
   "Firefox on one box" is not the same object as "Firefox on another" — a launcher cannot move an
   application between machines, so a drag that looked like it did would be lying about what
   happened.
 - The launch path is wired for the inventory's own `exec`; per-machine `launch` prefixes are
   declared but not yet exercised on every path.
+
+## Speed
+
+A launcher is judged on the gap between the keystroke and the window, so the startup path is
+measured rather than assumed. On a three-machine, 191-application inventory:
+
+| Phase | Cost | Why it is what it is |
+|---|---|---|
+| exec, dynamic link, GTK init | ~85 ms | The floor. GTK4 is not a small library. |
+| inventory | bounded by the **slowest** machine | One thread per machine. Sequentially this was the sum — 66 + 269 + 324 ms, because two of the three are SSH round trips. |
+| build the grid | ~400 ms | ~900 widgets. The one that still wants work. |
+
+Three things follow from those numbers, and they are the reason the code looks the way it does:
+
+**Concurrency buys exactly one thing.** Asking the machines is the only part that waits on something
+external, so it is the only part threaded. Everything after it is GTK, which is single-threaded by
+construction — no amount of parallelism touches it, and the cost there has to come out of doing less
+work instead.
+
+**The cairo renderer, by default.** GTK4 picks its GSK renderer by probing the GPU and chooses Vulkan
+where one is available. For a program that draws boxes, labels and icons that is device init, shader
+compilation and a driver thread pool spent on nothing — entirely on the latency path. Measured here,
+cairo settles in 0.52–0.55 s every run; one Vulkan run was still burning CPU at 4.6 s. `GSK_RENDERER`
+in the environment still overrides it.
+
+**Moving the cursor is not rebuilding the grid.** The two updates are separate functions: `render`
+tears the grid down and builds it again, `paint` moves the selection classes from where they were to
+where they are now. A repaint touches at most eight widgets no matter how large the grid is, because
+it remembers what it highlighted last time. Arrow keys, Tab and Enter-into-a-cell take the cheap
+path — which is where a spatial launcher spends most of its life.
+
+If your inventory command reaches other machines, cache its answer. The reference one
+(`rlaunch --json`) does, and the TTL is worth setting to minutes rather than seconds: nobody opens a
+launcher twice within a minute, so a short TTL means paying the full round trip on essentially every
+launch.
 
 ## Built on
 

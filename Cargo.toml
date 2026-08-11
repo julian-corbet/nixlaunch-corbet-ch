@@ -3,6 +3,18 @@ name = "nixlaunch"
 version = "0.1.0"
 edition = "2024"
 
+# A launcher is judged on the delay between the keystroke and the window, so the build is tuned for
+# the run rather than for the compile. Cross-crate inlining matters here because the hot path is
+# thousands of small GTK wrapper calls, each of which is a thin shim over one C function -- exactly
+# the shape LTO exists to collapse.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+# `panic = "abort"` is NOT set, and that is a decision rather than an omission: the inventory
+# threads catch a panicking inventory command and turn it into one unreachable column, which needs
+# unwinding to work at all. Aborting would trade three working columns for none.
+
 [dependencies]
 gtk4 = { version = "0.11.4", features = ["v4_12"] }
 gtk4-layer-shell = "0.8.1"
