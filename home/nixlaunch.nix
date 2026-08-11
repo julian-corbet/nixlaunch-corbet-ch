@@ -324,6 +324,20 @@ in
           # buries the first, real error.
           Restart = "on-failure";
           RestartSec = 3;
+
+          # KILL THE LAUNCHER, NOT WHAT IT LAUNCHED.
+          #
+          # systemd's default is `control-group`: stopping a unit kills every process in its
+          # cgroup. Applications started from a resident launcher are in that cgroup, so every
+          # restart of this unit also killed everything the user had opened through it -- including
+          # forwarded sessions to other machines, which take a visible moment to rebuild and are
+          # the last thing anyone expects a launcher restart to touch.
+          #
+          # The launcher already detaches what it starts with setsid, which is what makes an
+          # application outlive the launcher PROCESS. That is a process group, and systemd does not
+          # kill by process group; it kills by cgroup, which setsid does not escape. The two
+          # mechanisms look interchangeable and are not.
+          KillMode = "process";
         };
         Install.WantedBy = [ "graphical-session.target" ];
       };
