@@ -201,6 +201,72 @@ unsafe extern "C" {
 const M_TRIM_THRESHOLD: i32 = -1;
 const M_MMAP_THRESHOLD: i32 = -3;
 
+unsafe extern "C" {
+    fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
+}
+/// Linux's "reclaim this now, I am done with it" -- the volunteer form of what memory pressure
+/// would eventually do anyway.
+const MADV_PAGEOUT: i32 = 21;
+
+/// Hand the idle heap back to the kernel, which on this class of machine means handing it to a
+/// compressor.
+///
+/// A resident launcher spends almost all of its life hidden. What it holds then is ~7MB of clean
+/// file-backed pages -- GTK's own code, which the kernel can simply drop and re-read, so it costs
+/// nothing to leave alone -- and ~15MB of dirty anonymous pages: the widget tree, the textures,
+/// the model. Anonymous pages have no file behind them, so the only way to reclaim them is swap,
+/// and they are therefore the entire cost of staying resident.
+///
+/// MADV_PAGEOUT offers them up at the moment the window hides, rather than waiting for the machine
+/// to come under pressure and find them. Where swap is fronted by zswap or backed by zram -- zstd
+/// here -- they land compressed in RAM.
+///
+/// MEASURED, because the estimate was wrong: 56 regions advised, resident 84.6MB -> 83.0MB. About
+/// 1.6MB, not the ten-plus this was projected to save. `malloc_trim` above had already returned the
+/// bulk of it (52MB of dirty down to 35MB when it was introduced), and what remains is genuinely
+/// live -- the widget tree GTK is still holding, which is the whole point of staying resident.
+/// Kept because it costs nothing and a hidden launcher should not sit on what it is not using, but
+/// the case for residency rests on the 22MB it occupies, not on this.
+///
+/// Anonymous and writable only, and never the stack: this is about data the program is finished
+/// with for now, not about pages it is standing on. A failure anywhere is ignored -- the kernel
+/// declining to reclaim is not a reason for a launcher to misbehave.
+fn release_idle_pages() {
+    unsafe {
+        malloc_trim(0);
+    }
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return };
+    for line in maps.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(range), Some(perms)) = (parts.next(), parts.next()) else { continue };
+        // A fourth field beyond the offset/dev/inode means the mapping is file-backed, and those
+        // are the ones already cheap to reclaim.
+        if parts.clone().count() > 3 {
+            continue;
+        }
+        if !perms.starts_with("rw") {
+            continue;
+        }
+        let Some((lo, hi)) = range.split_once('-') else { continue };
+        let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16)) else {
+            continue;
+        };
+        // The stack grows; advising it away is asking for a fault on the way back out of here.
+        let sp = &lo as *const usize as usize;
+        if sp >= lo && sp < hi {
+            continue;
+        }
+        unsafe {
+            madvise(lo as *mut core::ffi::c_void, hi - lo, MADV_PAGEOUT);
+        }
+    }
+}
+
+/// The way back in, published so the single-instance path can reach the window that already exists.
+thread_local! {
+    static REVEAL: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
 fn main() {
     // The renderer choice belongs to the PROGRAM, not to one packaging of it.
     //
@@ -228,7 +294,16 @@ fn main() {
         // the two windows independent snapshots of placement.json and usage.json that then
         // overwrote each other. Present what already exists.
         if let Some(existing) = app.windows().first() {
+            // RESIDENT. The window is hidden rather than destroyed when the launcher is dismissed,
+            // so this is a map and not a start: no exec, no dynamic link, no GTK init, no
+            // inventory, no icon decode. Everything that made a cold open cost 117ms already
+            // happened once.
             existing.present();
+            REVEAL.with(|r| {
+                if let Some(f) = r.borrow().as_ref() {
+                    f();
+                }
+            });
             return;
         }
         build(app);
@@ -444,6 +519,15 @@ fn build(application: &Application) {
     //
     // Gated on having been active at least once, because a surface is briefly inactive between
     // mapping and being focused -- closing on that first false would make it flash and vanish.
+    // DISMISS, not exit. Hiding keeps the window, the widget tree, the inventory and the decoded
+    // icons alive, so the next open is a map rather than a start. GtkApplication only exits when
+    // the last window is DESTROYED, so a hidden one keeps the process resident with no explicit
+    // hold. What the process does NOT keep is the memory it is not using: see release_idle_pages.
+    let dismiss: Rc<dyn Fn(&ApplicationWindow)> = Rc::new(|w: &ApplicationWindow| {
+        w.set_visible(false);
+        release_idle_pages();
+    });
+
     if exit_on_focus_loss {
         // A GRACE PERIOD, not just a "has been active" flag. Launching from a bar button or a dock
         // means something else held focus at the moment of the click, and focus can bounce once
@@ -458,9 +542,10 @@ fn build(application: &Application) {
                 armed.set(true);
             });
         }
+        let dismiss_on_blur = dismiss.clone();
         window.connect_is_active_notify(move |w| {
             if !w.is_active() && armed.get() {
-                w.close();
+                dismiss_on_blur(w);
             }
         });
     }
@@ -798,6 +883,41 @@ fn build(application: &Application) {
     });
     *render_holder.borrow_mut() = Some(render.clone());
 
+    // WHAT REOPENING MEANS FOR A RESIDENT PROCESS.
+    //
+    // A process that never exits never re-reads anything, so without this a launcher left running
+    // for a week would still be showing the applications that existed when it started -- install
+    // something and it simply would not be there, with no way to tell why. Reopening therefore
+    // re-asks every machine what it has.
+    //
+    // Cheap, because the expensive parts are already done: the inventory commands answer from
+    // their own cache in tens of milliseconds, and any icon they name has been decoded since the
+    // first launch. What this does NOT redo is exec, dynamic linking, GTK initialisation or the
+    // stylesheet -- the whole of the 117ms a cold start pays.
+    //
+    // The query is cleared too. A search left over from last time is not a state anyone expects to
+    // reopen into, and it would hide most of the grid while looking like an empty launcher.
+    {
+        let state = state.clone();
+        let render = render.clone();
+        let reveal: Rc<dyn Fn()> = Rc::new(move || {
+            if let Ok(Some(cfg)) = config::load() {
+                let rows = cfg.folder_rows();
+                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width);
+                let mut s = state.borrow_mut();
+                s.base = fresh;
+                s.query.clear();
+                s.line = 0;
+                s.item = 0;
+                s.item_goal = 0;
+                s.rebuild();
+                s.clamp();
+            }
+            render();
+        });
+        REVEAL.with(|r| *r.borrow_mut() = Some(reveal));
+    }
+
     render();
 
     let keys = EventControllerKey::new();
@@ -828,7 +948,7 @@ fn build(application: &Application) {
                         } else if s.focus == Focus::Inside {
                             s.focus = Focus::Outside;
                         } else {
-                            window.close();
+                            dismiss(&window);
                             return gtk::glib::Propagation::Stop;
                         }
                     }
@@ -867,7 +987,7 @@ fn build(application: &Application) {
                                     spawn(&machine, app, &terminal_cmd);
                                     s.record_launch(&machine.name, &app.id);
                                 }
-                                window.close();
+                                dismiss(&window);
                                 return gtk::glib::Propagation::Stop;
                             }
                         } else if !s.cell().is_empty() {
@@ -911,7 +1031,7 @@ fn build(application: &Application) {
                             }
                             // A launcher that stays up after launching is a window you then have
                             // to dismiss. Closing IS the confirmation.
-                            window.close();
+                            dismiss(&window);
                             return gtk::glib::Propagation::Stop;
                         }
                     }
