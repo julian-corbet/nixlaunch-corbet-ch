@@ -45,4 +45,45 @@ The same harness the GTK numbers came from, so the comparison is like for like:
 
 ## Result
 
-Not yet run.
+Same machine, same 191-application inventory, same headless compositor, text only on both sides,
+software renderer on both sides:
+
+| | private | dirty | clean | RSS | first draw | CPU |
+|---|---|---|---|---|---|---|
+| GTK + cairo | **25.3 MB** | 14.9 | 10.3 | 90.6 | **0.095 s** | 60 ms |
+| Iced + tiny-skia | 59.0 MB | 20.3 | 38.6 | 69.3 | 0.098 s | 90 ms |
+| Iced + wgpu (its default) | 86.0 MB | 33.1 | 52.9 | 163.0 | — | — |
+
+**Time is a tie.** 0.095 s against 0.098 s is noise; neither toolkit is the reason this program feels
+fast or slow.
+
+**Memory is not, and the direction is the opposite of the expectation.** GTK — the heavier library
+by any static measure, a 47 MB floor for an empty window — costs less than half what a Rust toolkit
+does here.
+
+### Why, and the condition it depends on
+
+Look at `clean` against `RSS`. Iced's total footprint is SMALLER (69 MB vs 91 MB) and its private
+cost is more than twice as large. GTK's library pages are shared: ironbar, the file manager and
+everything else on this desktop map the same `/usr/lib/libgtk-4.so.1`, so those pages are already
+resident and cost this process almost nothing. Iced is statically linked into an 11.7 MB binary
+with no sharing partner anywhere on the system, so every page it touches is its own.
+
+That is a fact about **this machine**, not about the toolkits. The conclusion holds wherever GTK is
+already resident — which is every Linux desktop running a GTK bar, panel or file manager — and
+inverts on a machine where nothing else uses it.
+
+### What follows
+
+**Linux keeps GTK.** Half the private memory, identical latency, and a mature layer-shell
+implementation with working drag-and-drop, which the alternative would have to reimplement.
+
+**macOS does not inherit that argument**, and this is the useful part. There is no GTK on a Mac to
+share with, so the sharing advantage that wins here does not exist there — and GTK's macOS backend
+is a second-class port besides. A Mac shell should be chosen on its own merits: either Iced (whose
+57 MB would be unremarkable there, and which brings Windows with it) or native AppKit for the
+non-activating panel that Alfred and Raycast use.
+
+So the answer is not "one shell" or "two shells" but: **the core was worth separating, and the
+right shell is a per-platform decision that the split now lets us take independently.** Which is
+what the split was for, arrived at by measuring rather than by preferring.

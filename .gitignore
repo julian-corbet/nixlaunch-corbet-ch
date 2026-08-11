@@ -1,2 +1,5 @@
-/target
-/result
+# Anywhere, not just at the root. A nested crate under experiments/ has its own target/, and a
+# root-anchored rule silently let 3000 build artifacts into a commit -- which does not fail, it
+# just makes the push hang while it uploads several hundred megabytes.
+target/
+result

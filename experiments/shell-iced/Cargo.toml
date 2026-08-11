@@ -15,7 +15,11 @@ publish = false
 [dependencies]
 # The point of the split: the prototype reuses the launcher itself and only has to draw.
 nixlaunch-core = { path = "../../core" }
-iced = "0.13"
+# TINY-SKIA, NOT THE DEFAULT. Iced defaults to wgpu -- a full GPU pipeline, which is the same
+# class of cost as the Vulkan renderer GTK was measured to be wasting here. Comparing default Iced
+# against cairo-rendered GTK would compare a GPU stack against a software one and call it a toolkit
+# difference, so this is the software renderer against the software renderer.
+iced = { version = "0.13", default-features = false, features = ["tiny-skia"] }
 
 # Matching the shipping profile, or the comparison measures build settings rather than toolkits.
 [profile.release]
