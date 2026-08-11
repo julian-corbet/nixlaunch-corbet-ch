@@ -92,9 +92,50 @@ fn default_accent() -> String {
     "#22C55E".to_string()
 }
 
+/// The palette, as VALUES rather than as code.
+///
+/// The defaults below are a working dark set so the launcher is usable the moment it is installed
+/// -- they are NOT a house palette, and nothing here should be read as one. Override them with
+/// whatever the rest of your desktop already uses, so this looks like part of the same product
+/// rather than a second one that happens to be running.
+///
+/// Welding these into the stylesheet was the original mistake: a colour no consumer can reach is
+/// this repo carrying one estate's taste as though it were a property of launchers.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct Theme {
+    pub ground: String,
+    pub surface: String,
+    pub fg: String,
+    pub muted: String,
+    pub dim: String,
+    pub accent: String,
+    pub error: String,
+    pub border: String,
+    pub icon_size: i32,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme {
+            ground: "#0A0A0A".into(),
+            surface: "#0E0E0E".into(),
+            fg: "#F0F0F0".into(),
+            muted: "#999999".into(),
+            dim: "#444444".into(),
+            accent: "#22C55E".into(),
+            error: "#B91322".into(),
+            border: "#1C1C1C".into(),
+            icon_size: 20,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub machines: Vec<MachineConfig>,
+    #[serde(default)]
+    pub theme: Theme,
     /// Row order. "Other" is appended automatically if absent and forced last if present -- it is
     /// the inbox, not a category, and a config that could bury it in the middle would defeat it.
     #[serde(default)]

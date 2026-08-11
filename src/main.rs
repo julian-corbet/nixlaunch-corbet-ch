@@ -64,33 +64,46 @@ fn insert_index_at(container: &GBox, x: f64) -> usize {
 // Near-black ground, warm off-white ink -- the palette the rest of this desktop already uses.
 // The per-machine accent on the column head is the same identity colour the window frames and
 // forwarded-window badges use, so a column is recognisable before you read its label.
-const CSS: &str = "
-window { background-color: #0A0A0A; color: #F0F0F0; }
-.root { padding: 18px; }
-.search { font-size: 15px; padding: 8px 12px; margin-bottom: 14px;
-          border: 1px solid #262626; border-radius: 6px; background-color: #111111; }
-.search.empty { color: #666666; }
-.colhead { font-weight: bold; font-size: 13px; padding: 4px 8px; margin-bottom: 6px;
-           border-bottom: 2px solid #262626; }
-.rowhead { font-size: 13px; color: #999999; padding-right: 12px; }
-.rowhead.active { color: #F0F0F0; font-weight: bold; }
-.cell { border: 1px solid #1C1C1C; border-radius: 6px; padding: 5px; margin: 3px;
-        background-color: #0E0E0E; }
-.cell.cursor { border-color: #22C55E; background-color: #101810; }
-.cell.inside { border-width: 2px; padding: 4px; }
-.cell.empty { border-style: dashed; }
-.line { border-radius: 4px; padding: 2px; }
-.line.sel { background-color: #22C55E1A; }
-.app { padding: 3px 6px; border-radius: 4px; }
-.app.sel { background-color: #22C55E33; }
-.appname { font-size: 12px; }
-.dim { color: #444444; font-size: 12px; font-style: italic; }
-.hint { color: #666666; font-size: 11px; margin-top: 12px; }
-.hint b { color: #22C55E; }
-";
+/// The stylesheet, generated from config values rather than written as a constant. See
+/// `config::Theme` -- a colour nobody can reach is this repo carrying one estate's taste.
+fn css(t: &config::Theme) -> String {
+    format!(
+        "
+window {{ background-color: {ground}; color: {fg}; }}
+.root {{ padding: 18px; }}
+.search {{ font-size: 15px; padding: 8px 12px; margin-bottom: 14px;
+          border: 1px solid #262626; border-radius: 6px; background-color: {surface}; }}
+.search.empty {{ color: {dim}; }}
+.colhead {{ font-weight: bold; font-size: 13px; padding: 4px 8px; margin-bottom: 6px;
+           border-bottom: 2px solid #262626; }}
+.rowhead {{ font-size: 13px; color: {muted}; padding-right: 12px; }}
+.rowhead.active {{ color: {fg}; font-weight: bold; }}
+.cell {{ border: 1px solid {border}; border-radius: 6px; padding: 5px; margin: 3px;
+        background-color: {surface}; }}
+.cell.cursor {{ border-color: {accent}; }}
+.cell.inside {{ border-width: 2px; padding: 4px; }}
+.cell.empty {{ border-style: dashed; }}
+.line {{ border-radius: 4px; padding: 2px; }}
+.line.sel {{ background-color: alpha({accent}, 0.10); }}
+.app {{ padding: 3px 6px; border-radius: 4px; }}
+.app.sel {{ background-color: alpha({accent}, 0.20); }}
+.appname {{ font-size: 12px; }}
+.dim {{ color: {dim}; font-size: 12px; font-style: italic; }}
+.hint {{ color: #666666; font-size: 11px; margin-top: 12px; }}
+.hint b {{ color: {accent}; }}
+",
+        ground = t.ground,
+        surface = t.surface,
+        fg = t.fg,
+        muted = t.muted,
+        dim = t.dim,
+        accent = t.accent,
+        border = t.border,
+    )
+}
 
 fn main() {
-    let application = Application::builder().application_id("ch.corbet.nixlaunch").build();
+    let application = Application::builder().application_id("io.github.nixlaunch").build();
     application.connect_activate(|app| {
         eprintln!("nixlaunch: activate");
         build(app);
@@ -104,11 +117,6 @@ fn main() {
 }
 
 fn build(application: &Application) {
-    let provider = CssProvider::new();
-    provider.load_from_string(CSS);
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &provider, 800);
-    }
 
     // NO default size. A launcher should be exactly as big as what it is showing: a fixed size
     // leaves dead space under a short grid and clips a tall one, and BOTH are wrong for a surface
@@ -141,7 +149,14 @@ fn build(application: &Application) {
         window.set_keyboard_mode(KeyboardMode::OnDemand);
     }
 
-    let (folders, base, config_error) = load_world();
+    let (folders, base, theme, config_error) = load_world();
+
+    let provider = CssProvider::new();
+    provider.load_from_string(&css(&theme));
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, 800);
+    }
+
     if let Some(e) = &config_error {
         eprintln!("nixlaunch: {e}");
     }
@@ -232,6 +247,8 @@ fn build(application: &Application) {
         let spacer = spacer.clone();
         let hint = hint.clone();
         let holder = render_holder.clone();
+        let theme_error = theme.error.clone();
+        let icon_px = theme.icon_size;
         move || {
             let s = state.borrow();
 
@@ -270,9 +287,10 @@ fn build(application: &Application) {
                 head.set_markup(&match &m.error {
                     None => format!("<span foreground=\"{}\">{}</span>", m.accent, escape(&m.name)),
                     Some(e) => format!(
-                        "<span foreground=\"{}\">{}</span>  <span foreground=\"#B91322\" size=\"small\">{}</span>",
+                        "<span foreground=\"{}\">{}</span>  <span foreground=\"{}\" size=\"small\">{}</span>",
                         m.accent,
                         escape(&m.name),
+                        theme_error,
                         escape(e.lines().next().unwrap_or("unreachable"))
                     ),
                 });
@@ -393,7 +411,7 @@ fn build(application: &Application) {
                                 b.add_css_class("sel");
                             }
                             let img = Image::from_icon_name(&app.icon);
-                            img.set_pixel_size(20);
+                            img.set_pixel_size(icon_px);
                             b.append(&img);
                             let l = Label::new(Some(&app.name));
                             l.add_css_class("appname");
@@ -552,15 +570,15 @@ fn build(application: &Application) {
 /// one: it is how many left/right steps a row costs before up/down is the faster move.
 const LINE_WIDTH: usize = 4;
 
-fn load_world() -> (Vec<String>, Vec<Machine>, Option<String>) {
+fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Option<String>) {
     let default_rows = || DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect::<Vec<_>>();
     match config::load() {
-        Err(e) => (default_rows(), fixture(), Some(e)),
-        Ok(None) => (default_rows(), fixture(), None),
+        Err(e) => (default_rows(), fixture(), config::Theme::default(), Some(e)),
+        Ok(None) => (default_rows(), fixture(), config::Theme::default(), None),
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
             let machines = cfg.machines.iter().map(|mc| inventory(mc, &rows)).collect();
-            (rows, machines, None)
+            (rows, machines, cfg.theme.clone(), None)
         }
     }
 }

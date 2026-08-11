@@ -116,6 +116,26 @@ in
       '';
     };
 
+    theme = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.either lib.types.str lib.types.int);
+      default = { };
+      example = {
+        ground = "#0A0A0A";
+        accent = "#22C55E";
+        icon_size = 20;
+      };
+      description = ''
+        Palette overrides, written verbatim into the config file. Recognised keys: `ground`,
+        `surface`, `fg`, `muted`, `dim`, `accent`, `error`, `border`, and the integer `icon_size`.
+        Anything omitted keeps the program's own default.
+
+        The built-in defaults are a working dark set so the launcher is usable the moment it is
+        installed — they are NOT a house palette. Override them with whatever the rest of your
+        desktop already uses, so this looks like part of the same product rather than a second one
+        that happens to be running.
+      '';
+    };
+
     machines = lib.mkOption {
       type = lib.types.listOf (lib.types.submodule machineModule);
       default = [ ];
@@ -153,9 +173,9 @@ in
     # `toJSON` on the option values directly, not a hand-assembled string: the Nix types ARE the
     # schema, so anything that type-checks here serialises correctly by construction and there is
     # no second place for the two to disagree.
-    xdg.configFile."nixlaunch/config.json".text = builtins.toJSON {
+    xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
       inherit (cfg) folders;
       machines = map (m: { inherit (m) name accent inventory launch; }) cfg.machines;
-    };
+    } // lib.optionalAttrs (cfg.theme != { }) { inherit (cfg) theme; });
   };
 }
