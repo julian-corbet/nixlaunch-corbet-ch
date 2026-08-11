@@ -37,10 +37,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 
-mod config;
 mod icons;
-mod model;
-mod usage;
+// The launcher itself, from the crate that has no toolkit in it. `model::*` is glob-imported
+// because this file speaks in its vocabulary throughout -- App, Line, Machine, Focus, State.
+use nixlaunch_core::{config, model, usage};
 use model::*;
 
 /// never has to land in the thin space between two widgets to mean something.
@@ -262,7 +262,9 @@ fn release_idle_pages() {
     }
 }
 
-/// The way back in, published so the single-instance path can reach the window that already exists.
+// The way back in, published so the single-instance path can reach the window that already
+// exists. A `//` comment, not a doc comment: a doc comment on a macro invocation attaches to
+// nothing and the compiler says so.
 thread_local! {
     static REVEAL: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
 }
@@ -1097,14 +1099,18 @@ fn build(application: &Application) {
     // `--daemon` builds everything and shows nothing, so the later `activate` is a present() and
     // not a start.
     //
-    // The HOLD is not belt-and-braces, it is the whole thing: an unpresented window does not keep
-    // a GtkApplication alive. Reasoning said it should -- the application exits when its last
-    // window is DESTROYED, and this one never is -- but the process simply exited three seconds
-    // in, every time. `hold` raises the use count explicitly and is the documented way to say
-    // "stay running with nothing on screen", which is exactly what a daemon is.
-    if start_hidden() {
-        application.hold();
-    } else {
+    // NO `hold()` HERE, and the story is worth keeping because it nearly became a permanent piece
+    // of cargo cult. The daemon exited three seconds after starting, which looked exactly like a
+    // lifetime problem, so a `hold()` went in with a confident comment about GtkApplication use
+    // counts. The real cause was elsewhere -- GApplication rejecting an argv flag it did not know
+    // -- and once that was fixed the daemon ran fine on two machines for hours.
+    //
+    // Then the compiler pointed out that `hold()` returns a guard which releases when dropped, so
+    // the call had been doing nothing the entire time. Which is the proof: a hidden window keeps
+    // the application alive on its own, exactly as the documentation says and as the first
+    // reasoning had it. The "fix" was wrong AND inert, and only ever looked necessary because it
+    // happened to be added at the same moment as the change that actually worked.
+    if !start_hidden() {
         window.present();
     }
 }
@@ -1177,7 +1183,9 @@ fn inventory_all(machines: &[config::MachineConfig], rows: &[String], line_width
 /// point rather than a simplification.
 fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> Machine {
     let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
-    let mut error = None;
+    // Declared without a value: both arms of the match below assign it, so an initial `None`
+    // would be a value nothing ever reads -- which is exactly what the compiler was saying.
+    let error;
 
     let parsed = mc
         .inventory

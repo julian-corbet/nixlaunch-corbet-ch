@@ -1,0 +1,21 @@
+Building this once and copying it to another machine
+====================================================
+
+CachyOS (and any Arch derivative that tunes for the build host) sets
+`-march=native` in /etc/makepkg.conf. That is correct for a package built where
+it will run, and wrong for one built here and installed elsewhere.
+
+The failure is not a link error or a missing symbol. The binary starts and dies
+immediately with SIGILL, which systemd reports as `code=killed, status=4/ILL` --
+indistinguishable, at a glance, from a crash in the program itself.
+
+Seen here: built on a Lunar Lake Core Ultra, installed on a Zen 3 Ryzen.
+
+For an AUR user none of this applies: they build on their own machine and should
+get their own tuning. It matters only when one build serves several hosts, and
+then the answer is a common floor rather than the build host's ceiling -- e.g.
+
+    CFLAGS="${CFLAGS/-march=native/-march=x86-64-v3}"
+    RUSTFLAGS="-C target-cpu=x86-64-v3"
+
+passed via `makepkg --config`, so the developer's own defaults are left alone.

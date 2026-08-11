@@ -486,6 +486,14 @@ version = "0.1.0"
 dependencies = [
  "gtk4",
  "gtk4-layer-shell",
+ "nixlaunch-core",
+ "serde_json",
+]
+
+[[package]]
+name = "nixlaunch-core"
+version = "0.1.0"
+dependencies = [
  "nucleo-matcher",
  "serde",
  "serde_json",
