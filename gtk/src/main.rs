@@ -474,7 +474,34 @@ fn build(application: &Application) {
     // the same size group as the folder labels each render, so it tracks that column's real width
     // instead of guessing a margin that goes wrong the moment a folder is renamed.
     let searchrow = GBox::new(Orientation::Horizontal, 0);
-    let spacer = Label::new(None);
+    // THE CORNER, and the search box starting where the MACHINES start.
+    //
+    // The search row reserved the width of one label column, which was right while there was one.
+    // With a folder column and a subcategory column beside it the box began under the
+    // subcategories instead of under the first machine, so the thing you type into did not line up
+    // with the thing it filters.
+    //
+    // Two spacers, one in each label column's size group, so the corner is exactly as wide as both
+    // -- computed rather than guessed, and it stays right when a longer folder name changes the
+    // first column's width.
+    let spacer = GBox::new(Orientation::Horizontal, 0);
+    let spacer_folder = Label::new(None);
+    let spacer_sub = Label::new(None);
+    spacer.append(&spacer_folder);
+    spacer.append(&spacer_sub);
+
+    // And since that corner is now a real space rather than a gap, it can hold something. Empty
+    // unless configured: a launcher shipping someone else's mark would be wearing it.
+    if !theme.logo.is_empty() {
+        let logo = if std::path::Path::new(&theme.logo).is_absolute() {
+            Image::from_file(&theme.logo)
+        } else {
+            Image::from_icon_name(&theme.logo)
+        };
+        logo.set_pixel_size(theme.logo_size);
+        logo.set_halign(Align::Start);
+        spacer.append(&logo);
+    }
     searchrow.append(&spacer);
 
     let search = Label::new(None);
@@ -733,7 +760,8 @@ fn build(application: &Application) {
     let render: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
         let grid = grid.clone();
-        let spacer = spacer.clone();
+        let spacer_folder = spacer_folder.clone();
+        let spacer_sub = spacer_sub.clone();
         let holder = render_holder.clone();
         let theme_error = theme.error.clone();
         let painted = painted.clone();
@@ -768,7 +796,11 @@ fn build(application: &Application) {
             // Rebuilt every render rather than kept: the row-head widgets are recreated each time,
             // and a long-lived group would accumulate memberships for widgets that no longer exist.
             let labelcol = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
-            labelcol.add_widget(&spacer);
+            labelcol.add_widget(&spacer_folder);
+            // The subcategory column gets its own group, so the corner can be the sum of the two
+            // rather than an approximation of either.
+            let subcol = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+            subcol.add_widget(&spacer_sub);
 
             for (c, m) in s.view.iter().enumerate() {
                 let head = Label::new(None);
@@ -833,6 +865,7 @@ fn build(application: &Application) {
                 sublabel.set_xalign(1.0);
                 sublabel.set_valign(Align::Center);
                 sublabel.add_css_class("subrow");
+                subcol.add_widget(&sublabel);
                 grid.attach(&sublabel, 1, r as i32 + 1, 1, 1);
                 painted.borrow_mut().rowheads.push(rh.clone());
                 let mut row_cells: Vec<CellW> = Vec::with_capacity(s.view.len());

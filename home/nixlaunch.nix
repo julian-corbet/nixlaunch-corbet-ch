@@ -195,6 +195,12 @@ in
 
         Colours: `ground`, `surface`, `fg`, `muted`, `dim`, `accent`, `error`, `border`.
 
+        `logo` puts an image in the corner the label columns leave empty -- an absolute path, or an
+        icon name resolved against your theme. Empty by default: a launcher that shipped somebody
+        else's mark would be wearing it. `logo_size` (default 28) sizes it, separately from
+        `icon_size` because the corner has a header row to fill while an application icon has to
+        sit inside a line of text.
+
         Numbers: `icon_size` (default 20, keep it in proportion to your UI font), `line_width`
         (default 4 — apps per line, which is how many left/right steps a row costs before up/down
         is the faster move; more machine columns or a narrower display want fewer),

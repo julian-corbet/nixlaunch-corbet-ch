@@ -170,6 +170,24 @@ pub struct Theme {
     pub error: String,
     pub border: String,
     pub icon_size: i32,
+
+    /// An image for the corner the label columns leave empty: an absolute path, or an icon name
+
+    /// resolved against the theme. Empty means nothing is drawn -- a launcher that shipped
+
+    /// somebody's mark by default would be wearing it.
+
+    #[serde(default)]
+
+    pub logo: String,
+
+    /// How large that image is drawn. Separate from `icon_size` because the corner has a whole
+
+    /// header row to fill while an application icon has to sit inside a line of text.
+
+    #[serde(default = "default_logo_size")]
+
+    pub logo_size: i32,
     /// Apps per line when packing a fresh inventory. Taste, not mechanism: it is how many
     /// left/right steps a row costs before up/down is the faster move, and the answer depends on
     /// how many machine columns you have and how wide the display is. Two machines on an ultrawide
@@ -191,6 +209,10 @@ pub struct Theme {
     pub width: i32,
 }
 
+fn default_logo_size() -> i32 {
+    28
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Theme {
@@ -203,6 +225,8 @@ impl Default for Theme {
             error: "#B91322".into(),
             border: "#1C1C1C".into(),
             icon_size: 20,
+            logo: String::new(),
+            logo_size: default_logo_size(),
             line_width: 4,
             max_height_fraction: 0.66,
             max_width_fraction: 0.9,
