@@ -36,10 +36,10 @@ url="https://github.com/julian-corbet/nixlaunch-corbet-ch"
 license=('MIT')
 depends=('gtk4' 'gtk4-layer-shell')
 makedepends=('cargo' 'pkgconf')
-_commit=c5a2a9be4053a2ab150a2d4de5f98ec51cb78849
+_commit=a5bb0de97aa3c8ca96b23f192d97a531cb70c4c2
 _srcdir="$pkgname-corbet-ch-$_commit"
 source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz")
-sha256sums=('bbd5ad7d04a2654db0a57464eff752e5c61548cab53ba92084845b964b48aef9')
+sha256sums=('e1eb7988f919a7adb149e4ded5060f51d48a74de3f117e9bf87528212c20f9da')
 
 prepare() {
   cd "$_srcdir"
