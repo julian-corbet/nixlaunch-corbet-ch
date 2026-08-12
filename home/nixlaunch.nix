@@ -142,7 +142,7 @@ in
         The rows, IN PRIORITY ORDER. These are the group labels the `inventory` command emits; a
         label it returns that is not listed here falls into the inbox rather than being dropped, so
         an uncategorised application is always still reachable. Usage may reorder a row's contents,
-        but never the configured rows themselves.
+        but never the configured rows themselves: one folder always renders as one contiguous block.
 
         Empty puts everything in the inbox — usable, and exactly what a machine with no category
         table should look like, rather than an error.

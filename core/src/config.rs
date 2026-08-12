@@ -477,6 +477,37 @@ mod tests {
         assert_eq!(c.folder_rows(), vec!["Chat", "Editors", "Other"]);
     }
 
+    /// Every category expands once, in place. Its subrows and catch-all are one contiguous block;
+    /// later categories can never be inserted between them.
+    #[test]
+    fn each_category_expands_to_one_contiguous_block() {
+        let c: Config = serde_json::from_str(
+            r#"{
+                "machines": [],
+                "folders": ["AI", "Code"],
+                "subrows": {
+                    "AI": [{"name":"us"},{"name":"alt"}],
+                    "Code": [{"name":"term"},{"name":"graph"},{"name":"build"},{"name":"insp"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.folder_rows(),
+            [
+                "AI/us",
+                "AI/alt",
+                "AI",
+                "Code/term",
+                "Code/graph",
+                "Code/build",
+                "Code/insp",
+                "Code",
+                "Other",
+            ]
+        );
+    }
+
     /// A config that names "Other" in the middle must not be able to bury the inbox.
     #[test]
     fn other_is_forced_last_when_present() {

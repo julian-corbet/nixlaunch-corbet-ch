@@ -1506,25 +1506,66 @@ mod tests {
         );
     }
 
-    /// Configured folder order is spatial UI, not a frecency candidate. Even overwhelming usage
-    /// in a later folder must leave both the labels and their parallel cells where config put them.
+    /// A category is one contiguous visual block and its heading is rendered once. Even
+    /// overwhelming usage in one Code subrow must not pull it away from the other Code subrows or
+    /// move the block past AI.
     #[test]
-    fn rebuilding_preserves_declared_folder_order_and_alignment() {
-        let mut s = state(vec![machine("m", 0, vec![vec!["Foot"]])]);
-        s.base[0].cells[1] = vec![Line {
-            name: None,
-            apps: vec![app("Helix")],
-        }];
-        let declared = s.folders.clone();
+    fn rebuilding_keeps_each_category_one_contiguous_block() {
+        let declared: Vec<String> = [
+            "AI/us",
+            "AI/alt",
+            "AI",
+            "Code/term",
+            "Code/graph",
+            "Code/build",
+            "Code/insp",
+            "Code",
+            "Other",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let cells = [
+            "Claude", "OpenCode", "", "Foot", "Zed", "CMake", "Sysprof", "", "",
+        ]
+        .into_iter()
+        .map(|name| {
+            if name.is_empty() {
+                vec![]
+            } else {
+                vec![line(vec![app(name)])]
+            }
+        })
+        .collect();
+        let mut s = state(vec![Machine {
+            name: "m".into(),
+            aliases: vec![],
+            accent: "#fff".into(),
+            launch: vec!["{}".into()],
+            error: None,
+            cells,
+        }]);
+        s.folders = declared.clone();
         for _ in 0..80 {
-            s.record_launch_for_test("m", "Helix");
+            s.record_launch_for_test("m", "Foot");
         }
         s.rebuild();
         s.rebuild();
         s.rebuild();
         assert_eq!(s.folders, declared);
-        assert_eq!(s.machines[0].cells[0][0].apps[0].name, "Foot");
-        assert_eq!(s.machines[0].cells[1][0].apps[0].name, "Helix");
+        let visible_categories: Vec<&str> = s
+            .folders
+            .iter()
+            .enumerate()
+            .filter(|(r, _)| s.row_has_content(*r))
+            .map(|(_, row)| row.split_once('/').map_or(row.as_str(), |(f, _)| f))
+            .collect();
+        assert_eq!(
+            visible_categories,
+            ["AI", "AI", "Code", "Code", "Code", "Code"],
+            "a category may appear in one contiguous block only"
+        );
+        assert_eq!(s.machines[0].cells[3][0].apps[0].name, "Foot");
     }
 
     /// An empty machine list is a shape the config module can legitimately render -- every machine
