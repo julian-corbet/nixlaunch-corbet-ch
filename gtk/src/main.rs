@@ -1189,9 +1189,11 @@ fn build(application: &Application) {
     // WHAT REOPENING MEANS FOR A RESIDENT PROCESS.
     //
     // A process that never exits never re-reads anything, so without this a launcher left running
-    // for a week would still be showing the applications that existed when it started -- install
-    // something and it simply would not be there, with no way to tell why. Reopening therefore
-    // re-asks every machine what it has.
+    // for a week would still be showing both the CONFIGURATION and the applications that existed
+    // when it started. Reopening therefore re-reads config.json and re-asks every machine what it
+    // has. Keeping the build-time Config here instead would make a folder rename or a new machine
+    // invisible until the daemon was restarted -- exactly the lifecycle a resident process exists
+    // to avoid paying.
     //
     // Cheap, because the expensive parts are already done: the inventory commands answer from
     // their own cache in tens of milliseconds, and any icon they name has been decoded since the
@@ -1204,7 +1206,11 @@ fn build(application: &Application) {
         let state = state.clone();
         let render = render.clone();
         let arm_focus = arm_focus.clone();
-        let refresh_config = loaded_config.clone();
+        // LAST KNOWN GOOD. Home Manager replaces the file atomically, but direct editors need not;
+        // a parse failure during a save must not replace the coherent grid with fixtures or empty
+        // columns. The next reveal tries again. This also lets a daemon started before config.json
+        // existed begin using it once the file appears.
+        let refresh_config = Rc::new(RefCell::new(loaded_config.clone()));
         let refresh_generation = Rc::new(std::cell::Cell::new(0u64));
         let reveal: Rc<dyn Fn()> = Rc::new(move || {
             arm_focus();
@@ -1222,7 +1228,23 @@ fn build(application: &Application) {
             }
             render();
 
-            let Some(cfg) = refresh_config.clone() else {
+            // Reading one small local JSON file is bounded work and belongs here on the GTK thread;
+            // inventory remains in the worker below. Only model inputs reload live: folders,
+            // subrows, machines, launch prefixes and line width. CSS, key bindings, the terminal
+            // wrapper and layer-shell/window construction were bound above and deliberately remain
+            // restart-only rather than being half-reconfigured under a mapped window.
+            let latest_config = match config::load() {
+                Ok(Some(cfg)) => {
+                    *refresh_config.borrow_mut() = Some(cfg.clone());
+                    Some(cfg)
+                }
+                Ok(None) => refresh_config.borrow().clone(),
+                Err(e) => {
+                    eprintln!("nixlaunch: {e}; retaining last valid configuration");
+                    refresh_config.borrow().clone()
+                }
+            };
+            let Some(cfg) = latest_config else {
                 return;
             };
             let generation = refresh_generation.get().wrapping_add(1);

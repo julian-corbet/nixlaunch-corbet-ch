@@ -423,11 +423,10 @@ in
 
     home.packages = lib.optional (cfg.package != null) cfg.package;
 
-    # A UNIT, not a compositor spawn line. A spawn line fires once at session start, so switching
-    # a generation into a session that is already running leaves the old process in place -- or no
-    # process at all if this was just enabled. As a unit, `home-manager switch` starts and
-    # restarts it during activation, which converges the RUNNING session rather than waiting for
-    # the next login.
+    # A UNIT, not a compositor spawn line. That gives the session one supervised resident process
+    # and starts it when the feature is first enabled. Ordinary config changes do not need a
+    # service restart: each reveal re-reads the model inputs from config.json. Settings bound to
+    # GTK or the layer surface take effect at the next ordinary process start.
     systemd.user.services = lib.mkIf cfg.daemon.enable {
       nixlaunch = {
         Unit = {

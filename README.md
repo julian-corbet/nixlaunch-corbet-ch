@@ -140,10 +140,12 @@ focus-loss options. Key overrides extend the defaults, `null` unbinds one chord,
 `launch-line` and `launch-cell` actions retain their meaning in either focus mode. The default
 `launch-selection` remains contextual: cell outside, line inside.
 
-With `daemon.enable = true`, the service starts hidden. A reveal maps the cached grid immediately
-and refreshes every inventory in background; the newest refresh wins, and each command is bounded
-by `inventory_timeout_ms`. Configuration is one coherent startup snapshot, so a Home Manager
-activation restarts the service rather than partially applying a new file to an old process.
+With `daemon.enable = true`, the service starts hidden. A reveal maps the cached grid immediately,
+re-reads `config.json`, and refreshes every inventory in the background; the newest refresh wins,
+and each command is bounded by `inventory_timeout_ms`. Model inputs — folders, subrows, machines,
+launch prefixes, and inventory line width — update on that reveal. Settings bound to the existing
+GTK process or window — CSS/theme, key bindings, terminal wrapper, focus policy, and surface mode —
+take effect at the next ordinary process start instead of half-reconfiguring a mapped window.
 
 ## Status
 
