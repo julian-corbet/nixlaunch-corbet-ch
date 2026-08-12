@@ -29,17 +29,17 @@
 # distro's own toolchain is slower to set up and correct by construction.
 pkgname=nixlaunch
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc="A Wayland launcher whose layout is a matrix: machines across, folders down, appsets within"
 arch=('x86_64' 'aarch64')
 url="https://github.com/julian-corbet/nixlaunch-corbet-ch"
 license=('MIT')
 depends=('gtk4' 'gtk4-layer-shell')
 makedepends=('cargo' 'pkgconf')
-_commit=a5bb0de97aa3c8ca96b23f192d97a531cb70c4c2
+_commit=f299a658db120cb757b6202589e756597710789e
 _srcdir="$pkgname-corbet-ch-$_commit"
 source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz")
-sha256sums=('e1eb7988f919a7adb149e4ded5060f51d48a74de3f117e9bf87528212c20f9da')
+sha256sums=('a8e4d14f51cf39563b8cae0ee4a4eefec3512d653554be29b8f086b33a458a49')
 
 prepare() {
   cd "$_srcdir"
