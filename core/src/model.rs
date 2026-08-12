@@ -234,15 +234,8 @@ pub enum Focus {
 }
 
 pub struct State {
-    /// The row set as CONFIG declared it, and the order `base`'s cells are indexed by. Never
-    /// permuted -- `folders` below is re-derived from this on every rebuild.
-    ///
-    /// Keeping these apart is not tidiness. When usage ordering permuted the live row list in
-    /// place, the next rebuild's unplaced pass indexed base's ORIGINAL row numbers into a cells
-    /// vector whose positions had moved, so untouched machines silently swapped rows -- and the
-    /// next drag snapshotted that corruption into placement.json, permanently.
-    pub canonical_folders: Vec<String>,
-    /// The row set as DISPLAYED, after usage ordering. Rebuilt from `canonical_folders` each time.
+    /// The row set as CONFIG declared it, in the same order as every machine's `cells`.
+    /// Frecency never permutes rows: configured order is the launcher's spatial contract.
     pub folders: Vec<String>,
     /// How often each thing is reached for. See usage.rs.
     pub usage: Usage,
@@ -415,17 +408,13 @@ impl State {
     /// Called on startup and after every drop, so there is exactly one path from
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
-        // Always from canonical: apply_placement indexes base's cells, which are in canonical
-        // order, and a permuted row list here is what desynchronised the two.
-        self.folders = self.canonical_folders.clone();
-        self.machines = apply_placement(&self.base, &self.placement, &self.canonical_folders);
+        self.machines = apply_placement(&self.base, &self.placement, &self.folders);
         // Placement decides MEMBERSHIP -- which folder, which line. Usage decides ORDER within
         // that, and only where the evidence justifies a move. Running it here rather than baking
         // it into the placement file keeps the two separable: the file stays a record of what the
         // user arranged, never of what the statistics did to it.
         apply_usage(
             &mut self.machines,
-            &mut self.folders,
             &self.usage,
             usage::now_secs(),
             self.z,
@@ -445,7 +434,7 @@ impl State {
         // FROM THE PLACEMENT GRID, NOT THE RENDERED ONE, and the difference is the whole reason
         // this is not simply `&self.machines[mi]`.
         //
-        // `self.machines` has been through `apply_usage`, so its lines and rows are in FRECENCY
+        // `self.machines` has been through `apply_usage`, so its lines are in FRECENCY
         // order. Snapshotting that would write the statistics' opinion into placement.json as
         // though the user had arranged it -- and once written it is indistinguishable from a real
         // arrangement, so it never decays and never moves again. Two drags in, the file is a
@@ -455,7 +444,7 @@ impl State {
         // usage decides order, and the file "stays a record of what the user arranged, never of
         // what the statistics did to it". This recomputes the placement-only grid so that promise
         // is true rather than merely stated.
-        let placed = apply_placement(&self.base, &self.placement, &self.canonical_folders);
+        let placed = apply_placement(&self.base, &self.placement, &self.folders);
         let m = &placed[mi];
         let mut folders: HashMap<String, Vec<StoredLine>> = HashMap::new();
         for (r, lines) in m.cells.iter().enumerate() {
@@ -463,10 +452,9 @@ impl State {
                 continue;
             }
             folders.insert(
-                // Canonical, matching the grid this was read from. `self.folders` is the RENDERED
-                // row order, which usage may have permuted -- pairing it with canonical cells would
-                // file every row's contents under a neighbouring row's name.
-                self.canonical_folders[r].clone(),
+                // The configured label at the same row index. Folder order never changes at
+                // runtime, so labels and cells remain parallel through every rebuild.
+                self.folders[r].clone(),
                 lines
                     .iter()
                     .map(|l| {
@@ -755,8 +743,8 @@ impl State {
 
     /// The next row in `dir` that has something on it, or the current one if none does.
     ///
-    /// Skipping rather than hiding-and-reindexing: the row indices stay aligned with
-    /// `canonical_folders` and the placement, which is the alignment that has broken twice before.
+    /// Skipping rather than hiding-and-reindexing: row indices stay aligned with `folders` and the
+    /// placement.
     /// An empty row is simply never landed on.
     pub fn next_row(&self, from: usize, dir: i32) -> usize {
         let last = self.folders.len().saturating_sub(1);
@@ -1008,26 +996,17 @@ pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Option<
     Some(argv)
 }
 
-/// Order the grid by how often things are actually used -- WITHOUT sorting it.
+/// Order each cell by how often things are actually used -- WITHOUT sorting it.
 ///
-/// Three levels, all through the same significance gate, so nothing moves on noise:
+/// Two levels, both through the same significance gate, so nothing moves on noise:
 ///   * items on a line, by their own score;
 ///   * lines within a cell, by the sum of their apps -- an appset you start often should rise as
 ///     a unit, since starting the line is one action;
-///   * the rows themselves, by the aggregate across every machine, because a row is one row for
-///     the whole grid and ordering it per-column is not a thing the layout can express.
 ///
-/// The inbox is PINNED LAST and never participates. It is not a category competing for position;
-/// it is where uncategorised things wait, and a busy inbox floating to the top would bury the
-/// folders the user actually organised.
-pub fn apply_usage(
-    machines: &mut [Machine],
-    folders: &mut [String],
-    u: &Usage,
-    now: u64,
-    z: f64,
-    hl: f64,
-) {
+/// Folder order never participates. It is explicitly declared configuration and therefore part of
+/// the launcher's learnable spatial layout; statistics may arrange a folder's contents, not move
+/// the folder itself.
+pub fn apply_usage(machines: &mut [Machine], u: &Usage, now: u64, z: f64, hl: f64) {
     for m in machines.iter_mut() {
         let name = m.name.clone();
         for cell in m.cells.iter_mut() {
@@ -1049,72 +1028,6 @@ pub fn apply_usage(
                 z,
             );
         }
-    }
-
-    // Rows. Everything but the inbox, which stays where it is.
-    let n = folders.len();
-    if n < 3 {
-        return;
-    }
-    let inbox = n - 1;
-    let row_score = |r: usize| -> f64 {
-        machines
-            .iter()
-            .map(|m| {
-                m.cells
-                    .get(r)
-                    .map(|cell| {
-                        cell.iter()
-                            .flat_map(|l| l.apps.iter())
-                            .map(|a| usage::score_of(u, &m.name, &a.id, now, hl))
-                            .sum::<f64>()
-                    })
-                    .unwrap_or(0.0)
-            })
-            .sum()
-    };
-
-    // A folder and its subrows are one visual group. Reordering individual rows could put Editors
-    // between Chat/biz and Chat/priv, breaking both the taxonomy and the renderer's label grouping.
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for r in 0..inbox {
-        let group = folders[r]
-            .split_once('/')
-            .map(|(f, _)| f)
-            .unwrap_or(&folders[r]);
-        match groups.last_mut() {
-            Some(rows)
-                if folders[rows[0]]
-                    .split_once('/')
-                    .map(|(f, _)| f)
-                    .unwrap_or(&folders[rows[0]])
-                    == group =>
-            {
-                rows.push(r);
-            }
-            _ => groups.push(vec![r]),
-        }
-    }
-    usage::reorder_stable(
-        &mut groups,
-        |rows| rows.iter().map(|r| row_score(*r)).sum::<f64>(),
-        z,
-    );
-    let mut order: Vec<usize> = groups.into_iter().flatten().collect();
-    order.push(inbox);
-
-    // Apply the permutation to the row labels and to every machine's cells together -- they are
-    // parallel by contract, and permuting one without the other silently mislabels the whole grid.
-    let new_folders: Vec<String> = order.iter().map(|&r| folders[r].clone()).collect();
-    for (i, f) in new_folders.into_iter().enumerate() {
-        folders[i] = f;
-    }
-    for m in machines.iter_mut() {
-        let cells: Vec<Vec<Line>> = order
-            .iter()
-            .map(|&r| m.cells.get(r).cloned().unwrap_or_default())
-            .collect();
-        m.cells = cells;
     }
 }
 
@@ -1266,7 +1179,6 @@ mod tests {
 
     fn state(machines: Vec<Machine>) -> State {
         let mut s = State {
-            canonical_folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
             folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
             // No usage in the model tests: they are about placement and navigation, and a live
             // reordering pass would make their expectations depend on statistics they are not
@@ -1594,48 +1506,25 @@ mod tests {
         );
     }
 
-    /// THE REGRESSION THAT MOTIVATED canonical_folders. Usage ordering permuted the live row list
-    /// in place; the next rebuild's unplaced pass then indexed base's ORIGINAL row numbers into a
-    /// cells vector whose positions had moved, so a machine the user never touched silently
-    /// swapped rows -- and the next drag snapshotted that into placement.json permanently.
-    ///
-    /// The invariant: rebuilding twice must produce the same grid as rebuilding once.
+    /// Configured folder order is spatial UI, not a frecency candidate. Even overwhelming usage
+    /// in a later folder must leave both the labels and their parallel cells where config put them.
     #[test]
-    fn rebuilding_is_stable_under_row_reordering() {
+    fn rebuilding_preserves_declared_folder_order_and_alignment() {
         let mut s = state(vec![machine("m", 0, vec![vec!["Foot"]])]);
-        // Make a later row decisively outrank row 0, so a permutation really happens.
         s.base[0].cells[1] = vec![Line {
             name: None,
             apps: vec![app("Helix")],
         }];
+        let declared = s.folders.clone();
         for _ in 0..80 {
             s.record_launch_for_test("m", "Helix");
         }
         s.rebuild();
-        let first: Vec<(String, Vec<String>)> = snapshot(&s);
         s.rebuild();
         s.rebuild();
-        assert_eq!(
-            snapshot(&s),
-            first,
-            "the grid must not drift on repeated rebuilds"
-        );
-    }
-
-    fn snapshot(s: &State) -> Vec<(String, Vec<String>)> {
-        s.folders
-            .iter()
-            .enumerate()
-            .map(|(r, f)| {
-                (
-                    f.clone(),
-                    s.machines[0].cells[r]
-                        .iter()
-                        .flat_map(|l| l.apps.iter().map(|a| a.name.clone()))
-                        .collect(),
-                )
-            })
-            .collect()
+        assert_eq!(s.folders, declared);
+        assert_eq!(s.machines[0].cells[0][0].apps[0].name, "Foot");
+        assert_eq!(s.machines[0].cells[1][0].apps[0].name, "Helix");
     }
 
     /// An empty machine list is a shape the config module can legitimately render -- every machine
@@ -1775,43 +1664,6 @@ mod tests {
             ],
             "the FILE kept the arrangement, not the ranking"
         );
-    }
-
-    /// Row frecency must move a folder and all of its declared subrows as one visual block. Moving
-    /// the rows independently put Editors between Chat/biz and Chat/priv as soon as Editors beat
-    /// only the quieter of the two Chat rows.
-    #[test]
-    fn usage_never_splits_a_folder_from_its_subrows() {
-        let mut machines = vec![Machine {
-            name: "m".into(),
-            aliases: vec![],
-            accent: "#fff".into(),
-            launch: vec!["{}".into()],
-            error: None,
-            cells: vec![
-                vec![line(vec![app("chat-busy")])],
-                vec![line(vec![app("chat-quiet")])],
-                vec![line(vec![app("editor")])],
-                vec![],
-            ],
-        }];
-        let mut folders = vec![
-            "Chat/biz".to_string(),
-            "Chat/priv".to_string(),
-            "Editors".to_string(),
-            "Other".to_string(),
-        ];
-        let mut usage = Usage::new();
-        for _ in 0..50 {
-            usage::record(&mut usage, "m", "chat-busy", 1, 30.0);
-        }
-        for _ in 0..25 {
-            usage::record(&mut usage, "m", "editor", 1, 30.0);
-        }
-
-        apply_usage(&mut machines, &mut folders, &usage, 1, 0.0, 30.0);
-
-        assert_eq!(folders, ["Chat/biz", "Chat/priv", "Editors", "Other"]);
     }
 
     /// Typing puts the cursor on the first match, not on whatever the goal column happens to hit.

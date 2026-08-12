@@ -463,7 +463,6 @@ fn build(application: &Application) {
     )));
 
     let state = Rc::new(RefCell::new(State {
-        canonical_folders: folders.clone(),
         folders,
         usage: loaded_usage,
         usage_writable,
@@ -1263,7 +1262,6 @@ fn build(application: &Application) {
                     Ok((rows, fresh)) => {
                         if latest.get() == generation {
                             let mut s = state.borrow_mut();
-                            s.canonical_folders = rows.clone();
                             s.folders = rows;
                             s.base = fresh;
                             s.rebuild();

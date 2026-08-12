@@ -123,7 +123,8 @@ nixlaunch = {
 `machines` and `folders` are **lists, not attrsets**, and that is load-bearing rather than
 stylistic. Column order decides which machine you open on; row order decides which row an app lands
 in, because grouping upstream is first-match-wins. An attrset would alphabetise both and silently
-change behaviour.
+change behaviour. Frecency may reorder apps and appsets within a cell, but it never moves configured
+folders or subrows: those positions remain exactly as declared.
 
 `inventory` is a list, never a shell string — a string gets re-split on spaces by whatever runs it,
 and a path containing one would fail in a way that looks like an unreachable machine rather than a
