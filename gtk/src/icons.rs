@@ -28,6 +28,7 @@
 // next package operation, while an over-eager check costs latency on every launch forever.
 use gtk4::prelude::*;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -67,37 +68,37 @@ fn cache_path(px: i32) -> PathBuf {
 /// The newest mtime across the icon themes' own index files. Package operations rewrite those --
 /// it is what `gtk-update-icon-cache` exists to do -- so this moves exactly when the answer to an
 /// icon lookup could have changed, and stays still the rest of the time.
-fn theme_stamp() -> u64 {
-    let mut roots: Vec<PathBuf> = vec![
-        PathBuf::from("/usr/share/icons"),
-        PathBuf::from("/usr/share/pixmaps"),
-        PathBuf::from("/run/current-system/sw/share/icons"),
-    ];
-    if let Some(h) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(&h).join(".local/share/icons"));
-        roots.push(PathBuf::from(&h).join(".nix-profile/share/icons"));
-    }
-    let mut newest = 0u64;
+fn theme_stamp(theme: &gtk4::IconTheme) -> u64 {
+    let mut stamp = std::collections::hash_map::DefaultHasher::new();
+    // Switching the active theme changes every lookup without touching any theme index. The old
+    // stamp missed that completely and served the previous theme's finished pixels forever.
+    theme.theme_name().hash(&mut stamp);
+    let mut roots = theme.search_path();
+    roots.sort();
     for root in roots {
-        let Ok(themes) = std::fs::read_dir(&root) else { continue };
+        root.hash(&mut stamp);
+        if let Ok(modified) = std::fs::metadata(&root).and_then(|m| m.modified()) {
+            modified.hash(&mut stamp);
+        }
+        let Ok(themes) = std::fs::read_dir(&root) else {
+            continue;
+        };
         for theme in themes.flatten() {
             for f in ["icon-theme.cache", "index.theme"] {
-                if let Ok(md) = std::fs::metadata(theme.path().join(f)) {
-                    if let Ok(t) = md.modified() {
-                        if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                            newest = newest.max(d.as_secs());
-                        }
-                    }
+                if let Ok(md) = std::fs::metadata(theme.path().join(f))
+                    && let Ok(t) = md.modified()
+                {
+                    t.hash(&mut stamp);
                 }
             }
         }
     }
-    newest
+    stamp.finish()
 }
 
 impl Icons {
-    pub fn load(px: i32) -> Self {
-        Self::load_from(cache_path(px), px, theme_stamp())
+    pub fn load(px: i32, theme: &gtk4::IconTheme) -> Self {
+        Self::load_from(cache_path(px), px, theme_stamp(theme))
     }
 
     fn load_from(path: PathBuf, px: i32, stamp: u64) -> Self {
@@ -109,7 +110,9 @@ impl Icons {
             textures: HashMap::new(),
             dirty: false,
         };
-        let Ok(buf) = std::fs::read(&path) else { return me };
+        let Ok(buf) = std::fs::read(&path) else {
+            return me;
+        };
         if buf.len() < MAGIC.len() + 12 || &buf[..MAGIC.len()] != MAGIC {
             return me;
         }
@@ -122,20 +125,30 @@ impl Icons {
             *at += n;
             Some(v)
         };
-        let Some(st) = take(&buf, &mut at, 8) else { return me };
+        let Some(st) = take(&buf, &mut at, 8) else {
+            return me;
+        };
         if u64::from_le_bytes(st.try_into().unwrap_or([0; 8])) != stamp {
             // Something was installed or removed since this was written. Start again rather than
             // trust it -- this is the one moment a wrong icon is cheap to avoid.
             return me;
         }
-        let Some(cnt) = take(&buf, &mut at, 4) else { return me };
+        let Some(cnt) = take(&buf, &mut at, 4) else {
+            return me;
+        };
         let count = u32::from_le_bytes(cnt.try_into().unwrap_or([0; 4])) as usize;
         let bytes = (px * px * 4) as usize;
         for _ in 0..count {
-            let Some(nl) = take(&buf, &mut at, 2) else { break };
+            let Some(nl) = take(&buf, &mut at, 2) else {
+                break;
+            };
             let n = u16::from_le_bytes(nl.try_into().unwrap_or([0; 2])) as usize;
-            let Some(name) = take(&buf, &mut at, n) else { break };
-            let Some(px_data) = take(&buf, &mut at, bytes) else { break };
+            let Some(name) = take(&buf, &mut at, n) else {
+                break;
+            };
+            let Some(px_data) = take(&buf, &mut at, bytes) else {
+                break;
+            };
             if let Ok(name) = String::from_utf8(name) {
                 me.pixels.insert(name, px_data);
             }
@@ -144,11 +157,7 @@ impl Icons {
     }
 
     /// The texture for `name`, from the cache when possible and from the icon theme when not.
-    pub fn texture(
-        &mut self,
-        name: &str,
-        theme: &gtk4::IconTheme,
-    ) -> Option<gtk4::gdk::Texture> {
+    pub fn texture(&mut self, name: &str, theme: &gtk4::IconTheme) -> Option<gtk4::gdk::Texture> {
         if name.is_empty() {
             return None;
         }
@@ -168,11 +177,11 @@ impl Icons {
             .map(|t| t.upcast::<gtk4::gdk::Texture>()),
             None => {
                 let decoded = decode(name, px, theme);
-                if let Some(ref pb) = decoded {
-                    if let Some(raw) = rgba_square(pb, px) {
-                        self.pixels.insert(name.to_string(), raw);
-                        self.dirty = true;
-                    }
+                if let Some(ref pb) = decoded
+                    && let Some(raw) = rgba_square(pb, px)
+                {
+                    self.pixels.insert(name.to_string(), raw);
+                    self.dirty = true;
                 }
                 decoded.map(|pb| gtk4::gdk::Texture::for_pixbuf(&pb).upcast())
             }
@@ -195,19 +204,23 @@ impl Icons {
         let mut out: Vec<u8> = Vec::with_capacity(self.pixels.len() * (bytes + 32) + 32);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&self.stamp.to_le_bytes());
-        let usable: Vec<(&String, &Vec<u8>)> =
-            self.pixels.iter().filter(|(n, d)| d.len() == bytes && n.len() <= u16::MAX as usize).collect();
+        let usable: Vec<(&String, &Vec<u8>)> = self
+            .pixels
+            .iter()
+            .filter(|(n, d)| d.len() == bytes && n.len() <= u16::MAX as usize)
+            .collect();
         out.extend_from_slice(&(usable.len() as u32).to_le_bytes());
         for (name, data) in usable {
             out.extend_from_slice(&(name.len() as u16).to_le_bytes());
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(data);
         }
-        let tmp = path.with_extension("bin.tmp");
-        if let Ok(mut f) = std::fs::File::create(&tmp) {
-            if f.write_all(&out).is_ok() && f.sync_all().is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
+        let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
+        if let Ok(mut f) = std::fs::File::create(&tmp)
+            && f.write_all(&out).is_ok()
+            && f.sync_all().is_ok()
+        {
+            let _ = std::fs::rename(&tmp, path);
         }
     }
 }
@@ -220,7 +233,14 @@ impl Icons {
 /// result uniformly small rather than uniformly whatever upstream shipped.
 fn decode(name: &str, px: i32, theme: &gtk4::IconTheme) -> Option<gtk4::gdk_pixbuf::Pixbuf> {
     let path = theme
-        .lookup_icon(name, &[], px, 1, gtk4::TextDirection::None, gtk4::IconLookupFlags::empty())
+        .lookup_icon(
+            name,
+            &[],
+            px,
+            1,
+            gtk4::TextDirection::None,
+            gtk4::IconLookupFlags::empty(),
+        )
         .file()?
         .path()?;
     gtk4::gdk_pixbuf::Pixbuf::from_file_at_size(&path, px, px).ok()
@@ -264,13 +284,21 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("nixlaunch-icons-{}-{}", std::process::id(), name));
+        let d =
+            std::env::temp_dir().join(format!("nixlaunch-icons-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&d).unwrap();
         d.join("icons.bin")
     }
 
     fn blank(path: PathBuf, px: i32, stamp: u64) -> Icons {
-        Icons { px, stamp, path, pixels: HashMap::new(), textures: HashMap::new(), dirty: true }
+        Icons {
+            px,
+            stamp,
+            path,
+            pixels: HashMap::new(),
+            textures: HashMap::new(),
+            dirty: true,
+        }
     }
 
     /// A file this program did not write, or wrote in an older shape, reads as "no cache" rather
@@ -279,7 +307,10 @@ mod tests {
     fn a_foreign_file_is_ignored() {
         let p = tmp("foreign");
         std::fs::write(&p, b"not a nixlaunch cache at all").unwrap();
-        assert!(Icons::load_from(p, 20, 1).pixels.is_empty(), "garbage must not become icons");
+        assert!(
+            Icons::load_from(p, 20, 1).pixels.is_empty(),
+            "garbage must not become icons"
+        );
     }
 
     /// The stamp IS the validity test, so a mismatched one discards everything -- otherwise an
@@ -289,11 +320,19 @@ mod tests {
         let p = tmp("stale");
         let px = 4;
         let mut w = blank(p.clone(), px, 12345);
-        w.pixels.insert("thing".into(), vec![7u8; (px * px * 4) as usize]);
+        w.pixels
+            .insert("thing".into(), vec![7u8; (px * px * 4) as usize]);
         w.save();
 
-        assert!(!Icons::load_from(p.clone(), px, 999).pixels.is_empty() == false, "a different stamp reads as empty");
-        assert_eq!(Icons::load_from(p, px, 12345).pixels.len(), 1, "the matching stamp still reads");
+        assert!(
+            Icons::load_from(p.clone(), px, 999).pixels.is_empty(),
+            "a different stamp reads as empty"
+        );
+        assert_eq!(
+            Icons::load_from(p, px, 12345).pixels.len(),
+            1,
+            "the matching stamp still reads"
+        );
     }
 
     /// Round trip: what is written comes back byte for byte.
@@ -306,7 +345,10 @@ mod tests {
         w.pixels.insert("round.trip".into(), data.clone());
         w.save();
 
-        assert_eq!(Icons::load_from(p, px, 77).pixels.get("round.trip"), Some(&data));
+        assert_eq!(
+            Icons::load_from(p, px, 77).pixels.get("round.trip"),
+            Some(&data)
+        );
     }
 
     /// Nothing new decoded means nothing written -- a warm start must not rewrite the file it just
@@ -322,7 +364,11 @@ mod tests {
         read_back.dirty = false;
         std::fs::write(&p, b"sentinel").unwrap();
         read_back.save();
-        assert_eq!(std::fs::read(&p).unwrap(), b"sentinel", "a clean cache wrote nothing");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"sentinel",
+            "a clean cache wrote nothing"
+        );
         assert!(before > 0);
     }
 }

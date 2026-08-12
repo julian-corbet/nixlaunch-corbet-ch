@@ -18,10 +18,13 @@ both for the same reason: **fixtures are short**.
 The lesson is not "write bigger fixtures". It is that a fixture proves interaction and cannot prove
 layout, so layout has to be checked against a real inventory at least once before it is believed.
 
-## Where a launcher's startup time actually goes
+## Where the first launcher's startup time went
 
-Measured, not guessed, on a three-machine 191-application inventory. The method matters as much as
-the numbers, because the first three attempts measured the wrong thing:
+These are the historical measurements that drove concurrency, cairo-by-default, incremental paint,
+and the decoded-icon cache. They describe the original icon-bearing cold path, not the current
+resident reveal or the later text-only shell comparison. Measured on a three-machine,
+191-application inventory. The method matters as much as the numbers, because the first three
+attempts measured the wrong thing:
 
 - **`strace -f` over everything** gives an accurate ORDER of events and accurate timings for the
   parts that are syscall-bound — but it inflates a futex-heavy phase enormously, and the renderer
@@ -40,13 +43,14 @@ What the numbers said:
 | exec + dynamic link + GTK init | ~85 ms | no |
 | inventory, 3 machines, sequential | 66 + 269 + 324 ms | **yes** — it is all waiting |
 | grid construction + first frame | ~400 ms good case | no — GTK is single-threaded |
-| icon theme lookups | negligible (193 failed probes total) | — |
+| icon theme path probes | negligible (193 failed probes total) | — |
 
 Three things worth keeping:
 
-**The obvious suspect was innocent.** Icon lookups are the classic launcher bottleneck and the
-hypothesis was wrong here — 193 failed probes across the whole startup. Checking cost one query
-against the trace; assuming would have cost a pointless caching layer.
+**The first obvious suspect was innocent.** Theme path probes were cheap: 193 failed probes across
+the whole startup. Decoding the icons that did resolve was a separate cost, found later and removed
+from repeat launches by caching decoded textures. Conflating lookup and decode would make either
+measurement sound like it disproved the other.
 
 **The renderer is a latency decision, not a quality one.** GTK4 probes the GPU and picks Vulkan
 where it can. Cairo settled in 0.52–0.55 s on every run; one Vulkan run was still burning CPU at
@@ -57,6 +61,10 @@ keypress and the window.
 **Identical input, 4–5× spread.** The same config measured 550 ms of CPU on one run and 2500 ms on
 the next. A bimodal result is not noise to average away — it means something occasionally spins, and
 averaging is precisely how you hide it.
+
+The later like-for-like, text-only shell probe reached first draw in 0.095 s with distro GTK+cairo;
+see `experiments/shell-iced/README.md`. That number and the ~400 ms historical grid figure answer
+different questions, so neither should be presented as the other's current replacement.
 
 ## A cache TTL is a latency budget
 

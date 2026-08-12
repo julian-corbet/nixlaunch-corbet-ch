@@ -18,12 +18,9 @@
 // first-class object: a line is a set you can start in one keystroke, which is a thing neither
 // rofi nor fuzzel can express at all.
 //
-// ── THIS FILE IS THE GUI ITERATION, WITH FIXTURE DATA ───────────────────────────────────────
-// The data below is fake, deliberately, and shaped like `rlaunch --json <host>` already emits
-// (host, error, folders[] -> label + apps[] -> name/icon/exec/terminal), plus the one thing that
-// inventory cannot know: which apps belong on a line together. Getting the interaction right is
-// the hard part and it does not need real data; wiring the real inventory in afterwards is then a
-// parse plus an appset table, not a redesign.
+// ── THIS FILE IS THE GTK SHELL ──────────────────────────────────────────────────────────────
+// It runs the inventory commands declared in config and draws the core model. Fixture data remains
+// only as the no-config demo, so a fresh checkout is usable without carrying a private setup.
 use gtk4 as gtk;
 
 use gtk::gdk::{Key, ModifierType};
@@ -36,12 +33,26 @@ use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-
 mod icons;
 // The launcher itself, from the crate that has no toolkit in it. `model::*` is glob-imported
 // because this file speaks in its vocabulary throughout -- App, Line, Machine, Focus, State.
-use nixlaunch_core::{config, keymap, model, usage};
 use model::*;
+use nixlaunch_core::{config, keymap, model, usage};
+
+type Callback = Rc<dyn Fn()>;
+type CallbackSlot = Rc<RefCell<Option<Callback>>>;
+
+struct World {
+    folders: Vec<String>,
+    machines: Vec<Machine>,
+    theme: config::Theme,
+    terminal: Vec<String>,
+    surface: String,
+    keyboard: String,
+    exit_on_focus_loss: bool,
+    config: Option<config::Config>,
+    error: Option<String>,
+}
 
 /// never has to land in the thin space between two widgets to mean something.
 fn insert_index_at(container: &GBox, x: f64) -> usize {
@@ -51,7 +62,9 @@ fn insert_index_at(container: &GBox, x: f64) -> usize {
     let mut idx = 0usize;
     let mut child = container.first_child();
     while let Some(w) = child {
-        let Some(b) = w.compute_bounds(container) else { break };
+        let Some(b) = w.compute_bounds(container) else {
+            break;
+        };
         let mid = (b.x() + b.width() / 2.0) as f64;
         if x <= mid {
             break;
@@ -242,10 +255,14 @@ fn release_idle_pages() {
     unsafe {
         malloc_trim(0);
     }
-    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return };
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return;
+    };
     for line in maps.lines() {
         let mut parts = line.split_whitespace();
-        let (Some(range), Some(perms)) = (parts.next(), parts.next()) else { continue };
+        let (Some(range), Some(perms)) = (parts.next(), parts.next()) else {
+            continue;
+        };
         // A fourth field beyond the offset/dev/inode means the mapping is file-backed, and those
         // are the ones already cheap to reclaim.
         if parts.clone().count() > 3 {
@@ -254,8 +271,11 @@ fn release_idle_pages() {
         if !perms.starts_with("rw") {
             continue;
         }
-        let Some((lo, hi)) = range.split_once('-') else { continue };
-        let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16)) else {
+        let Some((lo, hi)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+        else {
             continue;
         };
         // The stack grows; advising it away is asking for a fault on the way back out of here.
@@ -311,7 +331,9 @@ fn main() {
         mallopt(M_MMAP_THRESHOLD, 128 * 1024);
         mallopt(M_TRIM_THRESHOLD, 256 * 1024);
     }
-    let application = Application::builder().application_id("io.github.nixlaunch").build();
+    let application = Application::builder()
+        .application_id("io.github.nixlaunch")
+        .build();
     application.connect_activate(|app| {
         // GApplication is single-instance by default, so a second launch does not start a second
         // process -- it fires `activate` on the running one. Building unconditionally there
@@ -323,12 +345,12 @@ fn main() {
             // so this is a map and not a start: no exec, no dynamic link, no GTK init, no
             // inventory, no icon decode. Everything that made a cold open cost 117ms already
             // happened once.
-            existing.present();
             REVEAL.with(|r| {
                 if let Some(f) = r.borrow().as_ref() {
                     f();
                 }
             });
+            existing.present();
             return;
         }
         build(app);
@@ -349,12 +371,24 @@ fn main() {
 }
 
 fn build(application: &Application) {
-    let (folders, base, theme, terminal_cmd_outer, surface_mode, keyboard_mode, exit_on_focus_loss, config_error) = load_world();
+    let World {
+        folders,
+        machines: base,
+        theme,
+        terminal: terminal_cmd_outer,
+        surface: surface_mode,
+        keyboard: keyboard_mode,
+        exit_on_focus_loss,
+        config: loaded_config,
+        error: config_error,
+    } = load_world();
     // A placement that exists and does not parse is reported, never assumed empty: the next drag
     // rewrites whatever we decide it was, so guessing "nothing" would overwrite a real arrangement.
     let (placement, placement_error) = load_placement();
-    let startup_error = config_error.clone().or(placement_error);
-
+    let (loaded_usage, usage_error) = usage::load();
+    let placement_writable = placement_error.is_none();
+    let usage_writable = usage_error.is_none();
+    let startup_error = config_error.clone().or(placement_error).or(usage_error);
 
     // NO default size. A launcher should be exactly as big as what it is showing: a fixed size
     // leaves dead space under a short grid and clips a tall one, and BOTH are wrong for a surface
@@ -364,7 +398,9 @@ fn build(application: &Application) {
     //
     // The search entry carries the only explicit measurement, a minimum width, so an empty or
     // heavily-filtered grid cannot collapse the window to a sliver mid-keystroke.
-    let window = ApplicationWindow::builder().application(application).build();
+    let window = ApplicationWindow::builder()
+        .application(application)
+        .build();
 
     // Layer shell: an overlay that OWNS the keyboard while open. Exclusive rather than OnDemand
     // because every key here is a navigation key -- a launcher that only half-takes the keyboard
@@ -396,7 +432,6 @@ fn build(application: &Application) {
         });
     }
 
-
     let provider = CssProvider::new();
     provider.load_from_string(&css(&theme));
     if let Some(display) = gtk::gdk::Display::default() {
@@ -417,19 +452,28 @@ fn build(application: &Application) {
         eprintln!("nixlaunch: {e}");
     }
 
-    // Created before anything can use it, and named apart from the module it comes from.
-    let icon_cache = Rc::new(RefCell::new(icons::Icons::load(theme.icon_size)));
+    // One theme handle and one texture cache for the life of the process. The active theme and its
+    // search path are part of the cache stamp, so they must exist before the persisted pixels load.
+    let icon_theme = gtk::gdk::Display::default()
+        .map(|d| gtk::IconTheme::for_display(&d))
+        .unwrap_or_default();
+    let icon_cache = Rc::new(RefCell::new(icons::Icons::load(
+        theme.icon_size,
+        &icon_theme,
+    )));
 
     let state = Rc::new(RefCell::new(State {
         canonical_folders: folders.clone(),
         folders,
-        usage: usage::load(),
+        usage: loaded_usage,
+        usage_writable,
         // Two standard errors, ~95% confidence. Lower and the grid twitches; higher and a real
         // preference takes weeks to show up.
         z: 2.0,
         half_life_days: usage::HALF_LIFE_DAYS,
         base,
-        placement: placement,
+        placement,
+        placement_writable,
         machines: Vec::new(),
         view: Vec::new(),
         col: 0,
@@ -545,8 +589,10 @@ fn build(application: &Application) {
             })
             .unwrap_or(fallback)
     };
-    let largest = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| extreme(pick, fallback, true);
-    let smallest = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| extreme(pick, fallback, false);
+    let largest =
+        |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| extreme(pick, fallback, true);
+    let smallest =
+        |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| extreme(pick, fallback, false);
     // HEIGHT against the smallest monitor, WIDTH against the largest, and the asymmetry is the
     // whole lesson of this cap.
     //
@@ -601,23 +647,27 @@ fn build(application: &Application) {
         release_idle_pages();
     });
 
-    if exit_on_focus_loss {
-        // A GRACE PERIOD, not just a "has been active" flag. Launching from a bar button or a dock
-        // means something else held focus at the moment of the click, and focus can bounce once
-        // before it settles -- so a handler that closes on the FIRST inactive edge closes the
-        // launcher immediately and it reads as "the button does nothing". Ignore focus loss for a
-        // moment after mapping; after that, losing the keyboard means the user looked elsewhere
-        // and the window should go.
-        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
-        {
-            let armed = armed.clone();
-            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
-                armed.set(true);
-            });
+    // A GRACE PERIOD ON EVERY REVEAL, not merely after process startup. A daemon starts hidden and
+    // may wait hours for its first map; arming once during build means every real open has already
+    // expired the guard and one focus bounce from a bar or dock dismisses it immediately.
+    // A deadline rather than a timer. Replacing it on every reveal really restarts the grace;
+    // overlapping one-shot timers let an older reveal re-arm dismissal too early.
+    let focus_ready_at = Rc::new(std::cell::Cell::new(None::<std::time::Instant>));
+    let arm_focus: Rc<dyn Fn()> = Rc::new({
+        let focus_ready_at = focus_ready_at.clone();
+        move || {
+            focus_ready_at
+                .set(std::time::Instant::now().checked_add(std::time::Duration::from_millis(400)));
         }
+    });
+    if exit_on_focus_loss {
         let dismiss_on_blur = dismiss.clone();
+        let focus_ready_at = focus_ready_at.clone();
         window.connect_is_active_notify(move |w| {
-            if !w.is_active() && armed.get() {
+            let ready = focus_ready_at
+                .get()
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+            if !w.is_active() && ready {
                 dismiss_on_blur(w);
             }
         });
@@ -643,25 +693,18 @@ fn build(application: &Application) {
     // The bindings, resolved once. Defaults unless configuration says otherwise -- see the keymap
     // module on why overriding beats replacing wholesale.
     let keys_map: Rc<keymap::Keymap> = Rc::new(
-        config::load()
-            .ok()
-            .flatten()
+        loaded_config
+            .as_ref()
             .map(|c| keymap::Keymap::from_overrides(&c.keys))
             .unwrap_or_default(),
     );
 
     let painted: Rc<RefCell<Painted>> = Rc::new(RefCell::new(Painted::default()));
 
-    // One theme handle and one texture cache for the life of the process, so a rebuild costs no
-    // disk reads at all after the first.
-    let icon_theme = gtk::gdk::Display::default()
-        .map(|d| gtk::IconTheme::for_display(&d))
-        .unwrap_or_default();
-
     // `render` must be callable from inside a drop handler that `render` itself installed, so it
     // needs a handle to itself. The holder is that indirection -- filled in immediately after
     // construction, and only ever read while no other borrow of it is live.
-    let render_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let render_holder: CallbackSlot = Rc::new(RefCell::new(None));
 
     let paint: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
@@ -734,7 +777,9 @@ fn build(application: &Application) {
                 let scroller = scroller.clone();
                 let grid = grid_for_scroll.clone();
                 gtk::glib::idle_add_local_once(move || {
-                    let Some(b) = bx.compute_bounds(&grid) else { return };
+                    let Some(b) = bx.compute_bounds(&grid) else {
+                        return;
+                    };
                     // ONE RULE, BOTH AXES. Moving left and right across machines runs off the
                     // edge exactly as moving down through folders runs off the bottom, and a fix
                     // that only followed the cursor vertically would be the same bug left half
@@ -750,8 +795,16 @@ fn build(application: &Application) {
                             adj.set_value(far - page);
                         }
                     };
-                    reveal(&scroller.vadjustment(), b.y() as f64, (b.y() + b.height()) as f64);
-                    reveal(&scroller.hadjustment(), b.x() as f64, (b.x() + b.width()) as f64);
+                    reveal(
+                        &scroller.vadjustment(),
+                        b.y() as f64,
+                        (b.y() + b.height()) as f64,
+                    );
+                    reveal(
+                        &scroller.hadjustment(),
+                        b.x() as f64,
+                        (b.x() + b.width()) as f64,
+                    );
                 });
             }
         }
@@ -834,6 +887,7 @@ fn build(application: &Application) {
                 grid.attach(&head, c as i32 + 2, 0, 1, 1);
             }
 
+            let mut last_rendered_group: Option<String> = None;
             for (r, folder) in s.folders.iter().enumerate() {
                 // A row nobody has anything on is a gap with a label. Skipped rather than removed,
                 // so row indices stay aligned with the placement -- the alignment that has gone
@@ -850,8 +904,11 @@ fn build(application: &Application) {
                     Some((f, s)) => (f, Some(s)),
                     None => (folder.as_str(), None),
                 };
-                let first_of_group = r == 0
-                    || s.folders[r - 1].split('/').next() != Some(fname);
+                // Compare with the last row actually DRAWN. The preceding canonical row may have
+                // been skipped as globally empty; comparing with it suppresses the only visible
+                // folder label and leaves a block of subrows with no heading.
+                let first_of_group = last_rendered_group.as_deref() != Some(fname);
+                last_rendered_group = Some(fname.to_string());
                 let rh = Label::new(if first_of_group { Some(fname) } else { None });
                 rh.set_xalign(1.0);
                 rh.set_valign(Align::Center);
@@ -885,8 +942,12 @@ fn build(application: &Application) {
                         let st = state.clone();
                         let holder2 = holder.clone();
                         tgt.connect_drop(move |_, value, _, _| {
-                            let Ok(p) = value.get::<String>() else { return false };
-                            let Some((from_col, name)) = p.split_once('\u{1}') else { return false };
+                            let Ok(p) = value.get::<String>() else {
+                                return false;
+                            };
+                            let Some((from_col, name)) = p.split_once('\u{1}') else {
+                                return false;
+                            };
                             if from_col.parse::<usize>().ok() != Some(c) {
                                 return false;
                             }
@@ -913,7 +974,11 @@ fn build(application: &Application) {
                                 let mut s = st.borrow_mut();
                                 s.col = c;
                                 s.row = r;
-                                s.focus = if s.cell().is_empty() { Focus::Outside } else { Focus::Inside };
+                                s.focus = if s.cell().is_empty() {
+                                    Focus::Outside
+                                } else {
+                                    Focus::Inside
+                                };
                                 s.line = 0;
                                 s.item = 0;
                                 s.item_goal = 0;
@@ -950,10 +1015,11 @@ fn build(application: &Application) {
                             // an index into a grid that is filtered and frecency-ordered -- two
                             // transformations away from the placement it would be written to. The
                             // names survive both; see `place_app`'s own account.
-                            let names: Vec<String> =
-                                ln.apps.iter().map(|a| a.id.clone()).collect();
+                            let names: Vec<String> = ln.apps.iter().map(|a| a.id.clone()).collect();
                             tgt.connect_drop(move |_, value, x, _| {
-                                let Ok(payload) = value.get::<String>() else { return false };
+                                let Ok(payload) = value.get::<String>() else {
+                                    return false;
+                                };
                                 let Some((from_col, name)) = payload.split_once('\u{1}') else {
                                     return false;
                                 };
@@ -1008,6 +1074,7 @@ fn build(application: &Application) {
                                 let win = window.clone();
                                 let term = terminal_cmd.clone();
                                 let dismiss = dismiss.clone();
+                                let holder2 = holder.clone();
                                 // Captured by IDENTITY, never by index: the grid may be rebuilt
                                 // between this being wired and the click arriving -- a query
                                 // filters, a drag reorders, frecency moves a line -- and an index
@@ -1023,7 +1090,9 @@ fn build(application: &Application) {
                                     // also read the press as the beginning of a drag.
                                     g.set_state(gtk::EventSequenceState::Claimed);
                                     let mut st_mut = st.borrow_mut();
-                                    let Some(machine) = st_mut.view.get(c).cloned() else { return };
+                                    let Some(machine) = st_mut.view.get(c).cloned() else {
+                                        return;
+                                    };
                                     let found = machine
                                         .cells
                                         .iter()
@@ -1048,25 +1117,40 @@ fn build(application: &Application) {
                                     } else {
                                         vec![app.clone()]
                                     };
+                                    let mut launched = false;
                                     for a in &batch {
-                                        spawn(&machine, a, &term);
-                                        st_mut.record_launch(&machine.name, &a.id);
+                                        if spawn(&machine, a, &term) {
+                                            st_mut.record_launch(&machine.name, &a.id);
+                                            launched = true;
+                                        }
+                                    }
+                                    if launched {
+                                        st_mut.save_usage();
                                     }
                                     if button == 2 {
                                         // Stay open, and repaint so the frecency reorder this
                                         // launch may have earned is visible immediately.
+                                        if launched {
+                                            st_mut.rebuild();
+                                        }
                                         drop(st_mut);
+                                        if launched && let Some(rf) = holder2.borrow().as_ref() {
+                                            rf();
+                                        }
                                         return;
                                     }
                                     // The borrow ends before the window is touched: dismissing
                                     // releases idle pages and can re-enter, and a live borrow
                                     // here would panic at runtime rather than fail to compile.
                                     drop(st_mut);
-                                    dismiss(&win);
+                                    if launched {
+                                        dismiss(&win);
+                                    }
                                 });
                                 b.add_controller(click);
                             }
-                            let img = match icon_cache.borrow_mut().texture(&app.icon, &icon_theme) {
+                            let img = match icon_cache.borrow_mut().texture(&app.icon, &icon_theme)
+                            {
                                 Some(tex) => Image::from_paintable(Some(&tex)),
                                 None => Image::from_icon_name(&app.icon),
                             };
@@ -1079,10 +1163,16 @@ fn build(application: &Application) {
                             line_apps.push(b);
                         }
                         cell.append(&lb);
-                        cell_lines.push(LineW { bx: lb.clone(), apps: line_apps });
+                        cell_lines.push(LineW {
+                            bx: lb.clone(),
+                            apps: line_apps,
+                        });
                     }
                     grid.attach(&cell, c as i32 + 2, r as i32 + 1, 1, 1);
-                    row_cells.push(CellW { bx: cell.clone(), lines: cell_lines });
+                    row_cells.push(CellW {
+                        bx: cell.clone(),
+                        lines: cell_lines,
+                    });
                 }
                 painted.borrow_mut().cells.push(row_cells);
             }
@@ -1113,12 +1203,16 @@ fn build(application: &Application) {
     {
         let state = state.clone();
         let render = render.clone();
+        let arm_focus = arm_focus.clone();
+        let refresh_config = loaded_config.clone();
+        let refresh_generation = Rc::new(std::cell::Cell::new(0u64));
         let reveal: Rc<dyn Fn()> = Rc::new(move || {
-            if let Ok(Some(cfg)) = config::load() {
-                let rows = cfg.folder_rows();
-                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
+            arm_focus();
+            // Reveal the coherent cached grid immediately. Inventory refresh is external I/O and
+            // belongs off the GTK thread; one wedged peer must not stop the existing window from
+            // mapping or make focus-loss handling unresponsive.
+            {
                 let mut s = state.borrow_mut();
-                s.base = fresh;
                 s.query.clear();
                 s.line = 0;
                 s.item = 0;
@@ -1127,6 +1221,42 @@ fn build(application: &Application) {
                 s.clamp();
             }
             render();
+
+            let Some(cfg) = refresh_config.clone() else {
+                return;
+            };
+            let generation = refresh_generation.get().wrapping_add(1);
+            refresh_generation.set(generation);
+            let latest = refresh_generation.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let rows = cfg.folder_rows();
+                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
+                let _ = tx.send((rows, fresh));
+            });
+            let state = state.clone();
+            let render = render.clone();
+            gtk::glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
+                match rx.try_recv() {
+                    Ok((rows, fresh)) => {
+                        if latest.get() == generation {
+                            let mut s = state.borrow_mut();
+                            s.canonical_folders = rows.clone();
+                            s.folders = rows;
+                            s.base = fresh;
+                            s.rebuild();
+                            s.clamp();
+                            drop(s);
+                            render();
+                        }
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        gtk::glib::ControlFlow::Break
+                    }
+                }
+            });
         });
         REVEAL.with(|r| *r.borrow_mut() = Some(reveal));
     }
@@ -1201,30 +1331,56 @@ fn build(application: &Application) {
                         s.item_goal = 0;
                     }
 
-                    (Focus::Outside, Some(keymap::Action::MoveLeft)) => s.col = s.col.saturating_sub(1),
+                    (Focus::Outside, Some(keymap::Action::MoveLeft)) => {
+                        s.col = s.col.saturating_sub(1)
+                    }
                     (Focus::Outside, Some(keymap::Action::MoveRight)) => {
                         s.col = (s.col + 1).min(s.view.len().saturating_sub(1))
                     }
                     (Focus::Outside, Some(keymap::Action::MoveUp)) => s.row = s.next_row(s.row, -1),
-                    (Focus::Outside, Some(keymap::Action::MoveDown)) => s.row = s.next_row(s.row, 1),
-                    (Focus::Outside, Some(keymap::Action::Enter)) | (Focus::Outside, Some(keymap::Action::LaunchLine)) => {
-                        if shift {
-                            let machine = s.view[s.col].clone();
-                            let all: Vec<App> =
-                                s.cell().iter().flat_map(|l| l.apps.iter().cloned()).collect();
-                            if !all.is_empty() {
-                                for app in &all {
-                                    spawn(&machine, app, &terminal_cmd);
-                                    s.record_launch(&machine.name, &app.id);
-                                }
-                                dismiss(&window);
-                                return gtk::glib::Propagation::Stop;
-                            }
-                        } else if !s.cell().is_empty() {
+                    (Focus::Outside, Some(keymap::Action::MoveDown)) => {
+                        s.row = s.next_row(s.row, 1)
+                    }
+                    (Focus::Outside, Some(keymap::Action::Enter)) => {
+                        if !s.cell().is_empty() {
                             s.focus = Focus::Inside;
                             s.line = 0;
                             s.item = 0;
                             s.item_goal = 0;
+                        }
+                    }
+                    (
+                        Focus::Outside,
+                        Some(
+                            action @ (keymap::Action::LaunchLine
+                            | keymap::Action::LaunchCell
+                            | keymap::Action::LaunchSelection),
+                        ),
+                    ) => {
+                        let Some(machine) = s.view.get(s.col).cloned() else {
+                            return gtk::glib::Propagation::Stop;
+                        };
+                        let apps: Vec<App> = match action {
+                            keymap::Action::LaunchLine => {
+                                s.current_line().map(|l| l.apps.clone()).unwrap_or_default()
+                            }
+                            _ => s
+                                .cell()
+                                .iter()
+                                .flat_map(|l| l.apps.iter().cloned())
+                                .collect(),
+                        };
+                        let mut launched = false;
+                        for app in &apps {
+                            if spawn(&machine, app, &terminal_cmd) {
+                                s.record_launch(&machine.name, &app.id);
+                                launched = true;
+                            }
+                        }
+                        if launched {
+                            s.save_usage();
+                            dismiss(&window);
+                            return gtk::glib::Propagation::Stop;
                         }
                     }
 
@@ -1239,26 +1395,47 @@ fn build(application: &Application) {
                         s.item = (s.item + 1).min(n.saturating_sub(1));
                         s.item_goal = s.item;
                     }
-                    (Focus::Inside, Some(keymap::Action::MoveUp)) => s.line = s.line.saturating_sub(1),
+                    (Focus::Inside, Some(keymap::Action::MoveUp)) => {
+                        s.line = s.line.saturating_sub(1)
+                    }
                     (Focus::Inside, Some(keymap::Action::MoveDown)) => {
                         s.line = (s.line + 1).min(s.cell().len().saturating_sub(1))
                     }
-                    (Focus::Inside, Some(keymap::Action::Enter)) | (Focus::Inside, Some(keymap::Action::LaunchLine)) => {
-                        let machine = s.view[s.col].clone();
-                        let apps: Vec<App> = if shift {
-                            s.current_line().map(|l| l.apps.clone()).unwrap_or_default()
-                        } else {
-                            s.current_line()
+                    (
+                        Focus::Inside,
+                        Some(
+                            action @ (keymap::Action::Enter
+                            | keymap::Action::LaunchLine
+                            | keymap::Action::LaunchCell
+                            | keymap::Action::LaunchSelection),
+                        ),
+                    ) => {
+                        let Some(machine) = s.view.get(s.col).cloned() else {
+                            return gtk::glib::Propagation::Stop;
+                        };
+                        let apps: Vec<App> = match action {
+                            keymap::Action::Enter => s
+                                .current_line()
                                 .and_then(|l| l.apps.get(s.item))
                                 .cloned()
                                 .into_iter()
-                                .collect()
+                                .collect(),
+                            keymap::Action::LaunchCell => s
+                                .cell()
+                                .iter()
+                                .flat_map(|l| l.apps.iter().cloned())
+                                .collect(),
+                            _ => s.current_line().map(|l| l.apps.clone()).unwrap_or_default(),
                         };
-                        if !apps.is_empty() {
-                            for app in &apps {
-                                spawn(&machine, app, &terminal_cmd);
+                        let mut launched = false;
+                        for app in &apps {
+                            if spawn(&machine, app, &terminal_cmd) {
                                 s.record_launch(&machine.name, &app.id);
+                                launched = true;
                             }
+                        }
+                        if launched {
+                            s.save_usage();
                             // A launcher that stays up after launching is a window you then have
                             // to dismiss. Closing IS the confirmation.
                             dismiss(&window);
@@ -1277,14 +1454,13 @@ fn build(application: &Application) {
                         let chord = mods.contains(ModifierType::CONTROL_MASK)
                             || mods.contains(ModifierType::ALT_MASK)
                             || mods.contains(ModifierType::SUPER_MASK);
-                        if !chord {
-                            if let Some(ch) = key.to_unicode() {
-                                if !ch.is_control() {
-                                    let mut q = s.query.clone();
-                                    q.push(ch);
-                                    s.set_query(q);
-                                }
-                            }
+                        if !chord
+                            && let Some(ch) = key.to_unicode()
+                            && !ch.is_control()
+                        {
+                            let mut q = s.query.clone();
+                            q.push(ch);
+                            s.set_query(q);
                         }
                     }
                 }
@@ -1316,6 +1492,7 @@ fn build(application: &Application) {
     // reasoning had it. The "fix" was wrong AND inert, and only ever looked necessary because it
     // happened to be added at the same moment as the change that actually worked.
     if !start_hidden() {
+        arm_focus();
         window.present();
     }
 }
@@ -1326,15 +1503,50 @@ fn build(application: &Application) {
 /// repo testable by someone with no fleet. A config that EXISTS but does not parse is a different
 /// thing entirely and is reported rather than silently replaced by fixtures, because silently
 /// showing invented machines when the real ones failed to load is the worst of both.
-fn load_world() -> (Vec<String>, Vec<Machine>, config::Theme, Vec<String>, String, String, bool, Option<String>) {
-    let default_rows = || DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+fn load_world() -> World {
+    let default_rows = || {
+        DEFAULT_FOLDERS
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+    };
     match config::load() {
-        Err(e) => (default_rows(), fixture(), config::Theme::default(), vec![], "layer".into(), "exclusive".into(), true, Some(e)),
-        Ok(None) => (default_rows(), fixture(), config::Theme::default(), vec![], "layer".into(), "exclusive".into(), true, None),
+        Err(e) => World {
+            folders: default_rows(),
+            machines: fixture(),
+            theme: config::Theme::default(),
+            terminal: vec![],
+            surface: "layer".into(),
+            keyboard: "exclusive".into(),
+            exit_on_focus_loss: true,
+            config: None,
+            error: Some(e),
+        },
+        Ok(None) => World {
+            folders: default_rows(),
+            machines: fixture(),
+            theme: config::Theme::default(),
+            terminal: vec![],
+            surface: "layer".into(),
+            keyboard: "exclusive".into(),
+            exit_on_focus_loss: true,
+            config: None,
+            error: None,
+        },
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
             let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
-            (rows, machines, cfg.theme.clone(), cfg.terminal.clone(), cfg.surface.clone(), cfg.keyboard.clone(), cfg.exit_on_focus_loss, None)
+            World {
+                folders: rows,
+                machines,
+                theme: cfg.theme.clone(),
+                terminal: cfg.terminal.clone(),
+                surface: cfg.surface.clone(),
+                keyboard: cfg.keyboard.clone(),
+                exit_on_focus_loss: cfg.exit_on_focus_loss,
+                config: Some(cfg),
+                error: None,
+            }
         }
     }
 }
@@ -1408,16 +1620,22 @@ fn inventory(
         .split_first()
         .ok_or_else(|| "no inventory command configured".to_string())
         .and_then(|(bin, args)| {
-            std::process::Command::new(bin)
-                .args(args)
-                .output()
-                .map_err(|e| format!("{bin}: {e}"))
+            command_output(
+                bin,
+                args,
+                std::time::Duration::from_millis(mc.inventory_timeout_ms),
+            )
         })
         .and_then(|out| {
             if out.status.success() {
                 config::parse_inventory(&out.stdout)
             } else {
-                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(if stderr.is_empty() {
+                    format!("inventory exited with {}", out.status)
+                } else {
+                    stderr
+                })
             }
         });
 
@@ -1453,16 +1671,22 @@ fn inventory(
                 // Grouped by the row each app lands in, so a subcategory's members end up on its
                 // row together rather than scattered by the order the inventory happened to list
                 // them in.
-                let mut by_row: std::collections::HashMap<String, Vec<&config::InventoryApp>> =
-                    std::collections::HashMap::new();
+                let mut by_row: Vec<Vec<&config::InventoryApp>> = vec![Vec::new(); rows.len()];
                 for a in &folder.apps {
-                    by_row.entry(row_label(a)).or_default().push(a);
-                }
-                for (label, apps) in by_row {
+                    let label = row_label(a);
                     let r = rows
                         .iter()
                         .position(|x| *x == label)
                         .unwrap_or(rows.len().saturating_sub(1));
+                    if let Some(bucket) = by_row.get_mut(r) {
+                        bucket.push(a);
+                    }
+                }
+                for (r, apps) in by_row
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, apps)| !apps.is_empty())
+                {
                     for chunk in apps.chunks(line_width.max(1)) {
                         cells[r].push(Line {
                             name: None,
@@ -1497,16 +1721,173 @@ fn inventory(
     }
 }
 
-/// Start one application, detached.
+/// Run one inventory command with a wall-clock bound. A process is put in its own process group so
+/// a timeout can terminate the command and the helpers it started rather than leaving an SSH child
+/// behind to keep the captured stdout/stderr pipes open forever.
+fn command_output(
+    bin: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new(bin)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("{bin}: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{bin}: stdout pipe was not created"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{bin}: stderr pipe was not created"))?;
+    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        // Nonblocking reads let this thread drain BOTH pipes while it also watches the deadline.
+        // A reader thread per pipe looks simpler, but cannot be stopped if a grandchild inherits a
+        // write end and keeps it open; one reveal would then leak two threads indefinitely.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            stop_child_group(&mut child);
+            return Err(format!(
+                "{bin}: could not make inventory pipes nonblocking: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let mut status = None;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut collect_until = None;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    // Usually EOF is already visible. Give readers at least a short grace when the
+                    // process exits on its deadline, while never waiting beyond the configured
+                    // bound merely because a descendant inherited a pipe.
+                    let now = std::time::Instant::now();
+                    let grace = now
+                        .checked_add(std::time::Duration::from_millis(100))
+                        .unwrap_or(now);
+                    collect_until = Some(
+                        started
+                            .checked_add(timeout)
+                            .map(|deadline| deadline.max(grace))
+                            .unwrap_or(grace),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    stop_child_group(&mut child);
+                    return Err(format!("{bin}: {e}"));
+                }
+            }
+        }
+
+        let drained = (|| -> Result<(), String> {
+            if !stdout_done {
+                stdout_done = drain_capture(&mut stdout, &mut stdout_bytes, "stdout")?;
+            }
+            if !stderr_done {
+                stderr_done = drain_capture(&mut stderr, &mut stderr_bytes, "stderr")?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = drained {
+            if status.is_none() {
+                stop_child_group(&mut child);
+            }
+            return Err(format!("{bin}: {e}"));
+        }
+
+        if let Some(exit) = status {
+            if stdout_done && stderr_done {
+                return Ok(std::process::Output {
+                    status: exit,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                });
+            }
+            if collect_until.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(format!(
+                    "{bin}: inventory output remained open after the command exited"
+                ));
+            }
+        } else if started.elapsed() >= timeout {
+            // Negative pid means the process group created above. The leader has NOT been reaped
+            // in this branch, so its pgid cannot have been recycled under us. Once try_wait returns
+            // a status we deliberately never send to that number again.
+            stop_child_group(&mut child);
+            return Err(format!(
+                "inventory timed out after {} ms",
+                timeout.as_millis()
+            ));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Drain one nonblocking pipe without giving an arbitrary inventory command unbounded memory.
+/// Sixteen MiB is orders of magnitude above a normal inventory, while still making a runaway
+/// producer a column error rather than a launcher-wide OOM.
+fn drain_capture(
+    pipe: &mut impl std::io::Read,
+    bytes: &mut Vec<u8>,
+    label: &str,
+) -> Result<bool, String> {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let remaining = (MAX_BYTES + 1).saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Err(format!("inventory {label} exceeded {MAX_BYTES} bytes"));
+        }
+        let take = remaining.min(buf.len());
+        match pipe.read(&mut buf[..take]) {
+            Ok(0) => return Ok(true),
+            Ok(n) => {
+                bytes.extend_from_slice(&buf[..n]);
+                if bytes.len() > MAX_BYTES {
+                    return Err(format!("inventory {label} exceeded {MAX_BYTES} bytes"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("could not read inventory {label}: {e}")),
+        }
+    }
+}
+
+/// Kill and reap a child which is still known to lead the process group created for it.
+fn stop_child_group(child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+/// Start one application, isolated from the launcher's process group and unit cgroup where the
+/// host can provide that. Returns whether the immediate launcher process was created; it cannot
+/// promise that a forwarding wrapper later succeeded, but known refusals must not earn usage.
 ///
-/// DETACHED ON PURPOSE. The launcher exits immediately after launching, and a child in our own
-/// process group would be killed with us -- so the thing you just started would vanish. `setsid`
-/// via `process_group(0)` is what makes the app outlive the launcher, which is the entire point of
-/// a launcher.
+/// A NEW PROCESS GROUP ON PURPOSE. `process_group(0)` is `setpgid`, not `setsid`: a Ctrl-C aimed at
+/// the launcher's foreground process group does not reach the child. It neither creates a session
+/// nor drops the controlling terminal; escaping a systemd unit's cgroup is the scope below's job.
 ///
 /// Failures are reported, not swallowed: a missing binary is exactly the case where silence would
 /// look like the keypress never registered.
-fn spawn(machine: &Machine, app: &App, terminal: &[String]) {
+fn spawn(machine: &Machine, app: &App, terminal: &[String]) -> bool {
     if app.terminal && terminal.is_empty() {
         // Say so rather than launching something that will vanish: a terminal program spawned
         // without one exits immediately, and the user sees a keypress that did nothing.
@@ -1514,17 +1895,21 @@ fn spawn(machine: &Machine, app: &App, terminal: &[String]) {
             "nixlaunch: {} needs a terminal and none is configured (set `terminal` in config)",
             app.name
         );
+        return false;
     }
     if app.exec.trim().is_empty() {
         // Without this the argv is just the machine prefix, and a remote column would run its
         // forwarding wrapper with no command -- opening a stray session instead of an app.
         eprintln!("nixlaunch: {} has an empty exec line", app.name);
-        return;
+        return false;
     }
-    let argv = launch_argv(machine, app, terminal);
+    let Some(argv) = launch_argv(machine, app, terminal) else {
+        eprintln!("nixlaunch: {} is a read-only column", machine.name);
+        return false;
+    };
     let Some((bin, args)) = argv.split_first() else {
         eprintln!("nixlaunch: {} has no exec line", app.name);
-        return;
+        return false;
     };
     use std::os::unix::process::CommandExt;
 
@@ -1534,10 +1919,8 @@ fn spawn(machine: &Machine, app: &App, terminal: &[String]) {
     // cgroup. Restarting the unit then kills every application ever started from it -- including
     // forwarded sessions to other machines, which take a visible moment to rebuild.
     //
-    // `process_group(0)` below does NOT prevent this, and believing it did cost a real afternoon:
-    // setsid escapes the process group, systemd kills by cgroup, and the two look interchangeable
-    // right up until you test them. `KillMode=process` does not save it either -- that governs
-    // which process receives the stop signal, and the cgroup is torn down afterwards regardless.
+    // `process_group(0)` below does NOT prevent this: it creates a new process group, while systemd
+    // kills by cgroup. The two hierarchies look interchangeable right up until a unit restarts.
     //
     // A transient scope is a unit of its own, so the application leaves this cgroup entirely.
     // Measured, not assumed: a child started this way survives its parent unit being stopped,
@@ -1545,12 +1928,7 @@ fn spawn(machine: &Machine, app: &App, terminal: &[String]) {
     //
     // Falls back to a plain spawn where systemd-run is absent -- a launcher must not require an
     // init system to start a program.
-    let scoped = std::process::Command::new("systemd-run")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let scoped = user_scopes_supported();
 
     let mut cmd = if scoped {
         let mut c = std::process::Command::new("systemd-run");
@@ -1562,16 +1940,79 @@ fn spawn(machine: &Machine, app: &App, terminal: &[String]) {
         c.args(args);
         c
     };
-    // Still setsid: it is what detaches from the launcher's terminal and controlling process, and
-    // it remains correct on the fallback path where there is no scope to escape into.
+    // Still a separate process group: the property is independent of whether a scope exists.
     cmd.process_group(0);
     match cmd.spawn() {
-        Ok(_) => eprintln!("nixlaunch: started {} on {}", app.name, machine.name),
-        Err(e) => eprintln!("nixlaunch: {} on {}: {e}", app.name, machine.name),
+        Ok(child) => {
+            // Dropping `Child` does not reap it. A resident daemon would otherwise accumulate one
+            // zombie per launched application for the whole session.
+            let pid = gtk::glib::Pid(child.id() as _);
+            drop(child);
+            gtk::glib::child_watch_add_local(pid, |_, _| {});
+            eprintln!("nixlaunch: started {} on {}", app.name, machine.name);
+            true
+        }
+        Err(e) => {
+            eprintln!("nixlaunch: {} on {}: {e}", app.name, machine.name);
+            false
+        }
     }
 }
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+/// Test the capability actually used, once. Finding a `systemd-run` binary says nothing about
+/// whether this session has a user manager and bus; assuming it does makes every launch vanish
+/// inside a wrapper that immediately fails while the launcher reports success.
+fn user_scopes_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "--collect", "--quiet", "--", "true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
 }
 
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The old wait-then-read implementation blocked as soon as either pipe reached 64 KiB. Real
+    /// inventories can cross that threshold simply through long absolute Exec paths.
+    #[test]
+    fn inventory_output_larger_than_a_pipe_is_drained_while_running() {
+        let script = concat!(
+            "dd if=/dev/zero bs=131072 count=1 2>/dev/null; ",
+            "dd if=/dev/zero bs=131072 count=1 1>&2 2>/dev/null"
+        );
+        let output = command_output(
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 131_072);
+        assert_eq!(output.stderr.len(), 131_072);
+    }
+
+    #[test]
+    fn inventory_timeout_is_a_wall_clock_bound() {
+        let started = std::time::Instant::now();
+        let error = command_output(
+            "sh",
+            &["-c".to_string(), "sleep 10".to_string()],
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out after 50 ms"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+}

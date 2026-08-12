@@ -61,7 +61,10 @@ pub fn decayed(entry: &Entry, now: u64, half_life_days: f64) -> f64 {
 }
 
 pub fn score_of(usage: &Usage, machine: &str, app: &str, now: u64, half_life_days: f64) -> f64 {
-    usage.get(&key(machine, app)).map(|e| decayed(e, now, half_life_days)).unwrap_or(0.0)
+    usage
+        .get(&key(machine, app))
+        .map(|e| decayed(e, now, half_life_days))
+        .unwrap_or(0.0)
 }
 
 /// Record one launch: decay what was there, then add one.
@@ -101,17 +104,21 @@ pub fn significantly_greater(a: f64, b: f64, z: f64) -> bool {
 ///
 /// Bounded by `items.len()` passes, which is the most a bubble sort can need, so a pathological
 /// score set cannot spin here.
-pub fn reorder_stable<T, F>(items: &mut Vec<T>, score: F, z: f64)
+pub fn reorder_stable<T, F>(items: &mut [T], score: F, z: f64)
 where
     F: Fn(&T) -> f64,
 {
     let n = items.len();
+    // The score may involve a hash lookup and key construction. It is a property of the item for
+    // this pass, not of the comparison, so compute it once rather than O(n²) times during bubbles.
+    let mut scores: Vec<f64> = items.iter().map(&score).collect();
     for _ in 0..n {
         let mut moved = false;
         for i in 1..items.len() {
-            let (lo, hi) = (score(&items[i - 1]), score(&items[i]));
+            let (lo, hi) = (scores[i - 1], scores[i]);
             if significantly_greater(hi, lo, z) {
                 items.swap(i - 1, i);
+                scores.swap(i - 1, i);
                 moved = true;
             }
         }
@@ -129,11 +136,16 @@ pub fn usage_path() -> PathBuf {
     base.join("nixlaunch").join("usage.json")
 }
 
-pub fn load() -> Usage {
-    std::fs::read_to_string(usage_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+pub fn load() -> (Usage, Option<String>) {
+    let path = usage_path();
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Usage::new(), None),
+        Err(e) => (Usage::new(), Some(format!("{}: {e}", path.display()))),
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(usage) => (usage, None),
+            Err(e) => (Usage::new(), Some(format!("{}: {e}", path.display()))),
+        },
+    }
 }
 
 /// Atomic, for the same reason placement is: a truncated score file parses as "never used
@@ -156,9 +168,15 @@ mod tests {
     /// The requirement in one test: small differences are noise and must not move anything.
     #[test]
     fn a_small_lead_is_not_significant() {
-        assert!(!significantly_greater(3.0, 2.0, 2.0), "2 vs 3 launches is nothing");
+        assert!(
+            !significantly_greater(3.0, 2.0, 2.0),
+            "2 vs 3 launches is nothing"
+        );
         assert!(!significantly_greater(6.0, 4.0, 2.0));
-        assert!(!significantly_greater(1.0, 0.0, 2.0), "one launch beats none by nothing");
+        assert!(
+            !significantly_greater(1.0, 0.0, 2.0),
+            "one launch beats none by nothing"
+        );
     }
 
     /// And large ones are real.
@@ -172,8 +190,14 @@ mod tests {
     /// the numbers grow. This is the property that keeps heavily-used items from thrashing.
     #[test]
     fn the_bar_grows_with_the_totals() {
-        assert!(significantly_greater(9.0, 1.0, 2.0), "gap of 8 on small totals is real");
-        assert!(!significantly_greater(108.0, 100.0, 2.0), "the same gap of 8 is noise up here");
+        assert!(
+            significantly_greater(9.0, 1.0, 2.0),
+            "gap of 8 on small totals is real"
+        );
+        assert!(
+            !significantly_greater(108.0, 100.0, 2.0),
+            "the same gap of 8 is noise up here"
+        );
     }
 
     #[test]
@@ -186,7 +210,10 @@ mod tests {
 
     #[test]
     fn one_half_life_halves_the_score() {
-        let e = Entry { score: 8.0, last: 0 };
+        let e = Entry {
+            score: 8.0,
+            last: 0,
+        };
         let after = decayed(&e, (30.0 * 86_400.0) as u64, 30.0);
         assert!((after - 4.0).abs() < 1e-9, "got {after}");
     }
@@ -197,9 +224,21 @@ mod tests {
         let now = 400 * 86_400;
         let mut u = Usage::new();
         // Fifty launches, a year ago.
-        u.insert(key("m", "old"), Entry { score: 50.0, last: 35 * 86_400 });
+        u.insert(
+            key("m", "old"),
+            Entry {
+                score: 50.0,
+                last: 35 * 86_400,
+            },
+        );
         // Two launches, today.
-        u.insert(key("m", "new"), Entry { score: 2.0, last: now });
+        u.insert(
+            key("m", "new"),
+            Entry {
+                score: 2.0,
+                last: now,
+            },
+        );
 
         let old = score_of(&u, "m", "old", now, 30.0);
         let new = score_of(&u, "m", "new", now, 30.0);
@@ -211,10 +250,20 @@ mod tests {
     #[test]
     fn recording_decays_first() {
         let mut u = Usage::new();
-        u.insert(key("m", "a"), Entry { score: 8.0, last: 0 });
+        u.insert(
+            key("m", "a"),
+            Entry {
+                score: 8.0,
+                last: 0,
+            },
+        );
         record(&mut u, "m", "a", (30.0 * 86_400.0) as u64, 30.0);
         let e = &u[&key("m", "a")];
-        assert!((e.score - 5.0).abs() < 1e-9, "8 halved to 4, plus 1 = 5, got {}", e.score);
+        assert!(
+            (e.score - 5.0).abs() < 1e-9,
+            "8 halved to 4, plus 1 = 5, got {}",
+            e.score
+        );
     }
 
     // ── the reorder ──────────────────────────────────────────────────────────────────────────
@@ -225,7 +274,10 @@ mod tests {
     fn noise_does_not_reorder() {
         let mut v = vec![("a", 2.0), ("b", 3.0), ("c", 1.0)];
         reorder_stable(&mut v, |x| x.1, 2.0);
-        assert_eq!(v.iter().map(|x| x.0).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(
+            v.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
     }
 
     /// A real difference does move, and moves all the way.
@@ -233,7 +285,10 @@ mod tests {
     fn a_real_difference_reorders() {
         let mut v = vec![("rare", 1.0), ("common", 60.0)];
         reorder_stable(&mut v, |x| x.1, 2.0);
-        assert_eq!(v.iter().map(|x| x.0).collect::<Vec<_>>(), vec!["common", "rare"]);
+        assert_eq!(
+            v.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec!["common", "rare"]
+        );
     }
 
     /// An item rises exactly as far as the evidence carries it: past the ones it clearly beats,
@@ -267,6 +322,9 @@ mod tests {
     fn an_unused_grid_keeps_its_declared_order() {
         let mut v = vec![("a", 0.0), ("b", 0.0), ("c", 0.0), ("d", 0.0)];
         reorder_stable(&mut v, |x| x.1, 2.0);
-        assert_eq!(v.iter().map(|x| x.0).collect::<Vec<_>>(), vec!["a", "b", "c", "d"]);
+        assert_eq!(
+            v.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
     }
 }

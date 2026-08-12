@@ -25,6 +25,10 @@ let
         type = lib.types.listOf lib.types.unspecified;
         default = [ ];
       };
+      systemd.user.services = lib.mkOption {
+        type = lib.types.attrsOf lib.types.unspecified;
+        default = { };
+      };
     };
   };
 
@@ -72,6 +76,29 @@ let
       ((builtins.elemAt (rendered base).machines 0).inventory == [ "inv" "--json" "alpha" ])
       "a shell string would be re-split on spaces and the failure would look like an unreachable machine")
 
+    (check "inventory timeout reaches the rendered contract"
+      ((builtins.elemAt (rendered base).machines 0).inventory_timeout_ms == 5000)
+      "an unbounded external command can hang a cold launcher forever")
+
+    (check "fractional theme values render"
+      ((rendered (lib.recursiveUpdate base {
+        nixlaunch.theme.max_height_fraction = 0.5;
+      })).theme.max_height_fraction == 0.5)
+      "the Rust schema uses f64; a module that only accepts strings and integers cannot configure it")
+
+    (check "key overrides and focus policy render"
+      (
+        let
+          r = rendered (lib.recursiveUpdate base {
+            nixlaunch.keys."ctrl+j" = "move-down";
+            nixlaunch.surface = "window";
+            nixlaunch.exit_on_focus_loss = false;
+          });
+        in
+        r.keys."ctrl+j" == "move-down" && r.surface == "window" && !r.exit_on_focus_loss
+      )
+      "public options must reach the exact JSON the binary reads")
+
     # The module writes nothing at all rather than an empty config, so a fresh checkout falls back
     # to the binary's own demo data instead of rendering an empty launcher.
     (check "no machines renders no file"
@@ -79,21 +106,47 @@ let
       "an empty machine list should be a no-op, not an empty launcher")
 
     (check "a machine with no inventory command is refused"
-      (failures {
-        nixlaunch.enable = true;
-        nixlaunch.machines = [{ name = "mute"; inventory = [ ]; }];
-      } != [ ])
+      (failures
+        {
+          nixlaunch.enable = true;
+          nixlaunch.machines = [{ name = "mute"; inventory = [ ]; }];
+        } != [ ])
       "a column that cannot be asked what it has is indistinguishable from a real outage")
 
     (check "duplicate machine names are refused"
-      (failures {
-        nixlaunch.enable = true;
-        nixlaunch.machines = [
-          { name = "same"; inventory = [ "a" ]; }
-          { name = "same"; inventory = [ "b" ]; }
-        ];
-      } != [ ])
+      (failures
+        {
+          nixlaunch.enable = true;
+          nixlaunch.machines = [
+            { name = "same"; inventory = [ "a" ]; }
+            { name = "same"; inventory = [ "b" ]; }
+          ];
+        } != [ ])
       "placements are keyed on the name, so duplicates would silently share the user's arrangement")
+
+    (check "case-insensitive name and alias collisions are refused"
+      (failures
+        {
+          nixlaunch.enable = true;
+          nixlaunch.machines = [
+            { name = "Server"; aliases = [ "nas" ]; inventory = [ "a" ]; }
+            { name = "nas"; inventory = [ "b" ]; }
+          ];
+        } != [ ])
+      "the search box resolves case-insensitively and takes the first match")
+
+    (check "daemon service renders the bounded lifecycle policy"
+      (
+        let
+          service = (eval (lib.recursiveUpdate base {
+            nixlaunch.daemon.enable = true;
+          })).systemd.user.services.nixlaunch;
+        in
+        service.Service.KillMode == "process"
+        && service.Service.ExecStart == "/usr/bin/nixlaunch --daemon"
+        && service.Unit.StartLimitBurst == 5
+      )
+      "daemon support must be covered by the module harness that previously lacked its option stub")
   ];
 in
 pkgs.runCommand "nixlaunch-module-checks" { passthru.results = results; } ''

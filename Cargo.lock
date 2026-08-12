@@ -486,6 +486,7 @@ version = "0.1.0"
 dependencies = [
  "gtk4",
  "gtk4-layer-shell",
+ "libc",
  "nixlaunch-core",
 ]
 

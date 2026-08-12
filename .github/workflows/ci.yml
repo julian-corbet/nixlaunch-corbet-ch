@@ -1,6 +1,6 @@
-# CI -- one job, one command. `nix flake check` already builds the package (whose checkPhase is
-# `cargo test`) and evaluates the module checks, so a separate cargo step here would be a second,
-# weaker copy of a gate the flake already owns -- and one that could pass while the flake fails.
+# CI -- one job, one command. `nix flake check` builds the package, whose checkPhase runs tests,
+# rustfmt, and clippy; it also evaluates the module suite and checks Nix formatting. A separate
+# cargo step here would be a second, weaker copy of a gate the flake already owns.
 
 name: check
 
@@ -45,6 +45,7 @@ jobs:
           # store keeps this cache from being the reason some other one vanishes.
           gc-max-store-size-linux: 1G
 
-      # -L streams build logs. Without it a failing `cargo test` surfaces as "derivation failed"
-      # with the assertion folded away, which is the difference between reading CI and rerunning it.
+      # -L streams build logs. Without it a failed test or lint surfaces as "derivation failed"
+      # with the useful assertion folded away, which is the difference between reading CI and
+      # rerunning it.
       - run: nix flake check -L

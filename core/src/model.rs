@@ -7,12 +7,13 @@
 // tests at the bottom of this file rather than by opening the launcher and squinting.
 //
 // The rule that keeps it that way: nothing in this file may import gtk.
+use crate::usage::{self, Usage};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use crate::usage::{self, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 // ── the model ───────────────────────────────────────────────────────────────────────────────
@@ -89,8 +90,15 @@ pub struct Machine {
 /// with no fleet still runs. The REAL row set is `State::folders`, supplied by config, because the
 /// grouping table is a per-estate value and hardcoding it here would make this repo carry one
 /// operator's taxonomy as though it were a fact about launchers.
-pub const DEFAULT_FOLDERS: &[&str] =
-    &["Terminals", "Editors", "Browsers", "Chat", "Files", "Media", "Other"];
+pub const DEFAULT_FOLDERS: &[&str] = &[
+    "Terminals",
+    "Editors",
+    "Browsers",
+    "Chat",
+    "Files",
+    "Media",
+    "Other",
+];
 
 /// The user's own ARRANGEMENT of a machine's apps: machine -> folder label -> lines of app names.
 ///
@@ -173,7 +181,8 @@ pub fn placement_path() -> PathBuf {
 pub fn load_placement() -> (Placement, Option<String>) {
     let path = placement_path();
     match std::fs::read_to_string(&path) {
-        Err(_) => (Placement::new(), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Placement::new(), None),
+        Err(e) => (Placement::new(), Some(format!("{}: {e}", path.display()))),
         Ok(text) => match serde_json::from_str(&text) {
             Ok(p) => (p, None),
             Err(e) => (Placement::new(), Some(format!("{}: {e}", path.display()))),
@@ -206,9 +215,14 @@ pub fn write_atomic<T: serde::Serialize>(path: &std::path::Path, value: &T) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let Ok(text) = serde_json::to_string_pretty(value) else { return };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
+    let Ok(text) = serde_json::to_string_pretty(value) else {
+        return;
+    };
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if let Ok(mut file) = std::fs::File::create(&tmp)
+        && file.write_all(text.as_bytes()).is_ok()
+        && file.sync_all().is_ok()
+    {
         let _ = std::fs::rename(&tmp, path);
     }
 }
@@ -232,6 +246,9 @@ pub struct State {
     pub folders: Vec<String>,
     /// How often each thing is reached for. See usage.rs.
     pub usage: Usage,
+    /// False when the on-disk usage file existed but could not be read or parsed. In-memory use may
+    /// continue, but writing an empty replacement would turn a transient read failure into data loss.
+    pub usage_writable: bool,
     /// Standard errors an item must lead by before it may move. See `significantly_greater`.
     pub z: f64,
     pub half_life_days: f64,
@@ -242,6 +259,8 @@ pub struct State {
     pub base: Vec<Machine>,
     /// The user's own arrangement. Persisted; see `placement_path`.
     pub placement: Placement,
+    /// The placement analogue of `usage_writable`; see `load_placement`.
+    pub placement_writable: bool,
     /// `base` with `placement` applied. Filtered into `view`.
     pub machines: Vec<Machine>,
     /// `machines` with the query applied. Navigation and rendering BOTH read this, so the cursor
@@ -281,13 +300,30 @@ impl State {
     /// Test-only: bump a score without writing to disk.
     #[cfg(test)]
     pub fn record_launch_for_test(&mut self, machine: &str, app: &str) {
-        usage::record(&mut self.usage, machine, app, usage::now_secs(), self.half_life_days);
+        usage::record(
+            &mut self.usage,
+            machine,
+            app,
+            usage::now_secs(),
+            self.half_life_days,
+        );
     }
 
-    /// Record a launch, and persist it.
+    /// Record a launch in memory. Batch callers persist once after recording every successful app.
     pub fn record_launch(&mut self, machine: &str, app: &str) {
-        usage::record(&mut self.usage, machine, app, usage::now_secs(), self.half_life_days);
-        usage::save(&self.usage);
+        usage::record(
+            &mut self.usage,
+            machine,
+            app,
+            usage::now_secs(),
+            self.half_life_days,
+        );
+    }
+
+    pub fn save_usage(&self) {
+        if self.usage_writable {
+            usage::save(&self.usage);
+        }
     }
 
     /// Rewrite state written when placement and usage were keyed on the DISPLAY NAME.
@@ -316,7 +352,10 @@ impl State {
                 for l in lines {
                     for a in &l.apps {
                         ids.insert(a.id.as_str());
-                        by_name.entry(a.name.as_str()).or_default().push(a.id.as_str());
+                        by_name
+                            .entry(a.name.as_str())
+                            .or_default()
+                            .push(a.id.as_str());
                     }
                 }
             }
@@ -365,8 +404,10 @@ impl State {
         // which is every start after the first -- a migration that rewrote both state files on
         // every launch would be a needless write on the path this program is judged by.
         if touched {
-            save_placement(&self.placement);
-            usage::save(&self.usage);
+            if self.placement_writable {
+                save_placement(&self.placement);
+            }
+            self.save_usage();
         }
     }
 
@@ -443,8 +484,11 @@ impl State {
         // backend that timed out and returned a partial list) the moment the user dragged anything
         // else. Entries for apps we cannot currently see are carried through untouched, which is
         // what makes "uninstall it and it returns to where you put it" true.
-        let seen: std::collections::HashSet<String> =
-            folders.values().flatten().flat_map(|l| l.apps().iter().cloned()).collect();
+        let seen: std::collections::HashSet<String> = folders
+            .values()
+            .flatten()
+            .flat_map(|l| l.apps().iter().cloned())
+            .collect();
         let previous = self.placement.get(&m.name).cloned().unwrap_or_default();
         for (folder, lines) in previous {
             // Carried through with their NAMES intact: an app that is not in today's inventory
@@ -453,8 +497,12 @@ impl State {
                 .into_iter()
                 .map(|l| {
                     let name = l.name().map(|n| n.to_string());
-                    let apps: Vec<String> =
-                        l.apps().iter().filter(|n| !seen.contains(*n)).cloned().collect();
+                    let apps: Vec<String> = l
+                        .apps()
+                        .iter()
+                        .filter(|n| !seen.contains(*n))
+                        .cloned()
+                        .collect();
                     StoredLine::new(name, apps)
                 })
                 .filter(|l| !l.apps().is_empty())
@@ -552,7 +600,9 @@ impl State {
             None => lines.push(StoredLine::Bare(vec![app.to_string()])),
         }
 
-        save_placement(&self.placement);
+        if self.placement_writable {
+            save_placement(&self.placement);
+        }
         self.rebuild();
         // The drop can shrink the line the cursor was on. Nothing else in this path re-checks it.
         self.clamp();
@@ -597,8 +647,11 @@ impl State {
         // machine-blind, so the moment you started typing you lost the one axis the layout exists
         // for, and `foot@srvhome` searched for an application literally called that. Naming the
         // machine in the query keeps both halves of the idea available at once.
-        let names: Vec<(String, Vec<String>)> =
-            self.machines.iter().map(|m| (m.name.clone(), m.aliases.clone())).collect();
+        let names: Vec<(String, Vec<String>)> = self
+            .machines
+            .iter()
+            .map(|m| (m.name.clone(), m.aliases.clone()))
+            .collect();
         let (only, pattern_text) = split_query(&self.query, &names);
 
         let mut matcher = Matcher::new(Config::DEFAULT);
@@ -608,7 +661,9 @@ impl State {
         let mut keep = |name: &str| -> bool {
             match &pattern {
                 None => true,
-                Some(p) => p.score(Utf32Str::new(name, &mut buf), &mut matcher).is_some(),
+                Some(p) => p
+                    .score(Utf32Str::new(name, &mut buf), &mut matcher)
+                    .is_some(),
             }
         };
         self.view = self
@@ -627,33 +682,32 @@ impl State {
                     vec![Vec::new(); m.cells.len()]
                 } else {
                     m.cells
-                    .iter()
-                    .map(|lines| {
-                        lines
-                            .iter()
-                            .filter_map(|l| {
-                                let apps: Vec<App> = l
-                                    .apps
-                                    .iter()
-                                    .filter(|a| keep(&a.name))
-                                    .cloned()
-                                    .collect();
-                                // A NAMED row survives having no matches while there is no
-                                // query, because that is precisely when you need to see it: an
-                                // empty declared row is a place to drag something INTO, and one
-                                // that is invisible until it already has contents can never
-                                // acquire any. Under a query it goes, like any line with nothing
-                                // in it -- a search should show what matched, not the taxonomy.
-                                let keeps_place = l.name.is_some() && pattern.is_none();
-                                if apps.is_empty() && !keeps_place {
-                                    None
-                                } else {
-                                    Some(Line { name: l.name.clone(), apps })
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect()
+                        .iter()
+                        .map(|lines| {
+                            lines
+                                .iter()
+                                .filter_map(|l| {
+                                    let apps: Vec<App> =
+                                        l.apps.iter().filter(|a| keep(&a.name)).cloned().collect();
+                                    // A NAMED row survives having no matches while there is no
+                                    // query, because that is precisely when you need to see it: an
+                                    // empty declared row is a place to drag something INTO, and one
+                                    // that is invisible until it already has contents can never
+                                    // acquire any. Under a query it goes, like any line with nothing
+                                    // in it -- a search should show what matched, not the taxonomy.
+                                    let keeps_place = l.name.is_some() && pattern.is_none();
+                                    if apps.is_empty() && !keeps_place {
+                                        None
+                                    } else {
+                                        Some(Line {
+                                            name: l.name.clone(),
+                                            apps,
+                                        })
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect()
                 },
             })
             .collect();
@@ -694,7 +748,9 @@ impl State {
     /// chat client into biz/leis/priv leaves the bare `Chat` row empty everywhere -- and a
     /// subcategory whose members are installed on no machine does the same.
     pub fn row_has_content(&self, r: usize) -> bool {
-        self.view.iter().any(|m| m.cells.get(r).is_some_and(|c| !c.is_empty()))
+        self.view
+            .iter()
+            .any(|m| m.cells.get(r).is_some_and(|c| !c.is_empty()))
     }
 
     /// The next row in `dir` that has something on it, or the current one if none does.
@@ -706,7 +762,11 @@ impl State {
         let last = self.folders.len().saturating_sub(1);
         let mut r = from;
         loop {
-            let next = if dir < 0 { r.checked_sub(1) } else { (r + 1).le(&last).then_some(r + 1) };
+            let next = if dir < 0 {
+                r.checked_sub(1)
+            } else {
+                (r + 1).le(&last).then_some(r + 1)
+            };
             let Some(next) = next else { return from };
             r = next;
             if self.row_has_content(r) {
@@ -728,7 +788,11 @@ impl State {
         self.line = self.line.min(lines - 1);
         let items = self.cell()[self.line].apps.len();
         // Aim for the goal column, clamped to THIS line -- never overwrite the goal itself.
-        self.item = if items == 0 { 0 } else { self.item_goal.min(items - 1) };
+        self.item = if items == 0 {
+            0
+        } else {
+            self.item_goal.min(items - 1)
+        };
     }
 }
 
@@ -763,16 +827,16 @@ pub fn split_query(query: &str, machines: &[(String, Vec<String>)]) -> (Option<S
         // that this word means this machine, so it must beat any accident of spelling -- otherwise
         // adding a machine whose name happens to start with someone's alias would quietly break
         // a shortcut they had been using for months.
-        if let Some((n, _)) = machines
-            .iter()
-            .find(|(n, al)| n.to_lowercase() == lower || al.iter().any(|a| a.to_lowercase() == lower))
-        {
+        if let Some((n, _)) = machines.iter().find(|(n, al)| {
+            n.to_lowercase() == lower || al.iter().any(|a| a.to_lowercase() == lower)
+        }) {
             return Some(n.clone());
         }
         // Then a unique prefix of a name or an alias. Two candidates starting the same way is not
         // an invitation to guess -- it is a reason to treat the token as ordinary search text.
         let mut hits = machines.iter().filter(|(n, al)| {
-            n.to_lowercase().starts_with(&lower) || al.iter().any(|a| a.to_lowercase().starts_with(&lower))
+            n.to_lowercase().starts_with(&lower)
+                || al.iter().any(|a| a.to_lowercase().starts_with(&lower))
         });
         match (hits.next(), hits.next()) {
             (Some((n, _)), None) => Some(n.clone()),
@@ -781,10 +845,16 @@ pub fn split_query(query: &str, machines: &[(String, Vec<String>)]) -> (Option<S
     };
 
     for sep in ['@', ':', '/', '.'] {
-        let Some((left, right)) = query.split_once(sep) else { continue };
+        let Some((left, right)) = query.split_once(sep) else {
+            continue;
+        };
         // The right side first for `@`, which universally means "the thing after the at is where":
         // it is the one spelling where the order is not a matter of taste.
-        let (first, second) = if sep == '@' { (right, left) } else { (left, right) };
+        let (first, second) = if sep == '@' {
+            (right, left)
+        } else {
+            (left, right)
+        };
         if let Some(m) = resolve(first) {
             return (Some(m), second.trim().to_string());
         }
@@ -832,7 +902,9 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
 
             if let Some(arranged_folders) = arranged {
                 for (fi, fname) in folders.iter().enumerate() {
-                    let Some(lines) = arranged_folders.get(fname.as_str()) else { continue };
+                    let Some(lines) = arranged_folders.get(fname.as_str()) else {
+                        continue;
+                    };
                     for l in lines {
                         let apps: Vec<App> = l
                             .apps()
@@ -852,17 +924,31 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
 
             for (r, lines) in m.cells.iter().enumerate() {
                 for l in lines {
-                    let apps: Vec<App> =
-                        l.apps.iter().filter(|a| !placed.contains(a.id.as_str())).cloned().collect();
+                    let apps: Vec<App> = l
+                        .apps
+                        .iter()
+                        .filter(|a| !placed.contains(a.id.as_str()))
+                        .cloned()
+                        .collect();
                     // The name comes along. A row keeps what it is called even when the pass that
                     // rebuilt it was only concerned with which apps had not been filed yet.
                     if !apps.is_empty() || l.name.is_some() {
-                        cells[r].push(Line { name: l.name.clone(), apps });
+                        cells[r].push(Line {
+                            name: l.name.clone(),
+                            apps,
+                        });
                     }
                 }
             }
 
-            Machine { name: m.name.clone(), aliases: m.aliases.clone(), accent: m.accent.clone(), launch: m.launch.clone(), error: m.error.clone(), cells }
+            Machine {
+                name: m.name.clone(),
+                aliases: m.aliases.clone(),
+                accent: m.accent.clone(),
+                launch: m.launch.clone(),
+                error: m.error.clone(),
+                cells,
+            }
         })
         .collect()
 }
@@ -878,7 +964,13 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
 ///
 /// Splitting is `shlex`, not `split_whitespace`: an Exec may legitimately quote an argument
 /// containing spaces, and naive splitting turns one path into two broken ones.
-pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Vec<String> {
+pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Option<Vec<String>> {
+    // Empty means READ-ONLY. Treating it as an ordinary empty prefix launches the inventory's Exec
+    // on the local machine while claiming it started on the selected remote column. A local column
+    // is explicit: `launch = ["{}"]`.
+    if machine.launch.is_empty() {
+        return None;
+    }
     // SPLIT FIRST, then drop field codes. Stripping on whitespace beforehand reached INSIDE
     // quoted arguments and collapsed runs of spaces, so `prog "a  b"` became `prog "a b"` -- a
     // path silently altered on its way to exec.
@@ -888,36 +980,33 @@ pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Vec<Str
         .filter(|t| !(t.len() == 2 && t.starts_with('%')))
         .collect();
 
-    let mut argv = machine.launch.clone();
+    let mut inner = Vec::new();
     // ORDER MATTERS, and it is the non-obvious part: the machine prefix comes FIRST, then the
     // terminal, then the program. A terminal emulator for a remote program has to run on the
     // remote machine -- `<forward> foot -e helix`, never `foot -e <forward> helix`, which would
     // open a local window and then try to forward from inside it.
     if app.terminal {
-        argv.extend(terminal.iter().cloned());
+        inner.extend(terminal.iter().cloned());
     }
+    inner.extend(tokens);
     // `{}` is a PLACEHOLDER when present, a prefix when absent. config.rs documented the
     // placeholder and nothing ever substituted it, so a launch template containing one passed the
     // two braces to exec as a literal argument.
-    if argv.iter().any(|a| a == "{}") {
+    if machine.launch.iter().any(|a| a == "{}") {
         let mut out = Vec::new();
-        for a in argv {
+        for a in &machine.launch {
             if a == "{}" {
-                out.extend(tokens.iter().cloned());
+                out.extend(inner.iter().cloned());
             } else {
-                out.push(a);
+                out.push(a.clone());
             }
         }
-        return out;
+        return Some(out);
     }
-    argv.extend(tokens);
-    argv
+    let mut argv = machine.launch.clone();
+    argv.extend(inner);
+    Some(argv)
 }
-
-/// Which GAP between a line's items a drop at `x` belongs to.
-///
-/// Compared against each child's MIDPOINT, not its edges, so the target flips when the pointer
-/// passes the middle of an item -- the behaviour every reorderable list has, and the reason a drop
 
 /// Order the grid by how often things are actually used -- WITHOUT sorting it.
 ///
@@ -943,11 +1032,20 @@ pub fn apply_usage(
         let name = m.name.clone();
         for cell in m.cells.iter_mut() {
             for line in cell.iter_mut() {
-                usage::reorder_stable(&mut line.apps, |a| usage::score_of(u, &name, &a.id, now, hl), z);
+                usage::reorder_stable(
+                    &mut line.apps,
+                    |a| usage::score_of(u, &name, &a.id, now, hl),
+                    z,
+                );
             }
             usage::reorder_stable(
                 cell,
-                |l| l.apps.iter().map(|a| usage::score_of(u, &name, &a.id, now, hl)).sum::<f64>(),
+                |l| {
+                    l.apps
+                        .iter()
+                        .map(|a| usage::score_of(u, &name, &a.id, now, hl))
+                        .sum::<f64>()
+                },
                 z,
             );
         }
@@ -976,8 +1074,33 @@ pub fn apply_usage(
             .sum()
     };
 
-    let mut order: Vec<usize> = (0..inbox).collect();
-    usage::reorder_stable(&mut order, |r| row_score(*r), z);
+    // A folder and its subrows are one visual group. Reordering individual rows could put Editors
+    // between Chat/biz and Chat/priv, breaking both the taxonomy and the renderer's label grouping.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for r in 0..inbox {
+        let group = folders[r]
+            .split_once('/')
+            .map(|(f, _)| f)
+            .unwrap_or(&folders[r]);
+        match groups.last_mut() {
+            Some(rows)
+                if folders[rows[0]]
+                    .split_once('/')
+                    .map(|(f, _)| f)
+                    .unwrap_or(&folders[rows[0]])
+                    == group =>
+            {
+                rows.push(r);
+            }
+            _ => groups.push(vec![r]),
+        }
+    }
+    usage::reorder_stable(
+        &mut groups,
+        |rows| rows.iter().map(|r| row_score(*r)).sum::<f64>(),
+        z,
+    );
+    let mut order: Vec<usize> = groups.into_iter().flatten().collect();
     order.push(inbox);
 
     // Apply the permutation to the row labels and to every machine's cells together -- they are
@@ -987,14 +1110,22 @@ pub fn apply_usage(
         folders[i] = f;
     }
     for m in machines.iter_mut() {
-        let cells: Vec<Vec<Line>> =
-            order.iter().map(|&r| m.cells.get(r).cloned().unwrap_or_default()).collect();
+        let cells: Vec<Vec<Line>> = order
+            .iter()
+            .map(|&r| m.cells.get(r).cloned().unwrap_or_default())
+            .collect();
         m.cells = cells;
     }
 }
 
 pub fn a(name: &str, icon: &str) -> App {
-    App { id: name.into(), name: name.into(), icon: icon.into(), exec: name.to_lowercase(), terminal: false }
+    App {
+        id: name.into(),
+        name: name.into(),
+        icon: icon.into(),
+        exec: name.to_lowercase(),
+        terminal: false,
+    }
 }
 
 pub fn line(apps: Vec<App>) -> Line {
@@ -1010,28 +1141,50 @@ pub fn fixture() -> Vec<Machine> {
             name: "laptop".into(),
             aliases: vec![],
             accent: "#166534".into(),
-            launch: vec![],
+            launch: vec!["{}".into()],
             error: None,
             cells: vec![
-                vec![line(vec![a("Foot", "foot"), a("Foot Client", "foot")]), line(vec![a("Foot Server", "foot")])],
                 vec![
-                    line(vec![a("Helix", "helix"), a("Code - OSS", "com.visualstudio.code.oss")]),
-                    line(vec![a("Builder", "org.gnome.Builder"), a("IntelliJ IDEA", "idea")]),
+                    line(vec![a("Foot", "foot"), a("Foot Client", "foot")]),
+                    line(vec![a("Foot Server", "foot")]),
                 ],
-                vec![line(vec![a("Firefox", "firefox"), a("Chromium", "chromium")])],
+                vec![
+                    line(vec![
+                        a("Helix", "helix"),
+                        a("Code - OSS", "com.visualstudio.code.oss"),
+                    ]),
+                    line(vec![
+                        a("Builder", "org.gnome.Builder"),
+                        a("IntelliJ IDEA", "idea"),
+                    ]),
+                ],
+                vec![line(vec![
+                    a("Firefox", "firefox"),
+                    a("Chromium", "chromium"),
+                ])],
                 // The appset that started this whole conversation: all the messengers, one line.
-                vec![line(vec![a("Telegram", "org.telegram.desktop"), a("ZapZap", "com.rtosta.zapzap"), a("Teams", "teams-for-linux")])],
-                vec![line(vec![a("Thunar", "thunar"), a("Czkawka", "com.github.qarmin.czkawka")])],
+                vec![line(vec![
+                    a("Telegram", "org.telegram.desktop"),
+                    a("ZapZap", "com.rtosta.zapzap"),
+                    a("Teams", "teams-for-linux"),
+                ])],
+                vec![line(vec![
+                    a("Thunar", "thunar"),
+                    a("Czkawka", "com.github.qarmin.czkawka"),
+                ])],
                 vec![line(vec![a("mpv", "mpv"), a("VLC", "vlc")])],
                 // Other: the inbox. Two apps the category table did not recognise.
-                vec![line(vec![a("Czkawka", "com.github.qarmin.czkawka")]), line(vec![a("Bottles", "com.usebottles.bottles")])],
+                vec![
+                    line(vec![a("Czkawka", "com.github.qarmin.czkawka")]),
+                    line(vec![a("Bottles", "com.usebottles.bottles")]),
+                ],
             ],
         },
         Machine {
             name: "workstation".into(),
             aliases: vec![],
             accent: "#B45309".into(),
-            launch: vec![],
+            launch: vec!["{}".into()],
             error: None,
             cells: vec![
                 vec![line(vec![a("Foot", "foot"), a("Alacritty", "Alacritty")])],
@@ -1050,7 +1203,7 @@ pub fn fixture() -> Vec<Machine> {
             name: "console".into(),
             aliases: vec![],
             accent: "#9F1239".into(),
-            launch: vec![],
+            launch: vec!["{}".into()],
             error: None,
             cells: vec![
                 vec![line(vec![a("Foot", "foot")])],
@@ -1065,7 +1218,6 @@ pub fn fixture() -> Vec<Machine> {
         },
     ]
 }
-
 
 // ── tests ───────────────────────────────────────────────────────────────────────────────────
 //
@@ -1082,15 +1234,34 @@ mod tests {
     }
 
     fn app(n: &str) -> App {
-        App { id: n.into(), name: n.into(), icon: "x".into(), exec: n.to_lowercase(), terminal: false }
+        App {
+            id: n.into(),
+            name: n.into(),
+            icon: "x".into(),
+            exec: n.to_lowercase(),
+            terminal: false,
+        }
     }
 
     /// One machine, one folder, with the given lines. `folder` indexes DEFAULT_FOLDERS.
     fn machine(name: &str, folder: usize, lines: Vec<Vec<&str>>) -> Machine {
         let mut cells: Vec<Vec<Line>> = vec![Vec::new(); DEFAULT_FOLDERS.len()];
-        cells[folder] =
-            lines.into_iter().map(|l| Line { name: None, apps: l.into_iter().map(app).collect() }).collect();
-        Machine { name: name.into(), aliases: vec![], accent: "#fff".into(), launch: vec![], error: None, cells }
+        cells[folder] = lines
+            .into_iter()
+            .map(|l| Line {
+                name: None,
+                apps: l.into_iter().map(app).collect(),
+            })
+            .collect();
+        Machine {
+            name: name.into(),
+            aliases: vec![],
+            accent: "#fff".into(),
+            // An explicit identity template is the local-machine spelling. Empty is read-only.
+            launch: vec!["{}".into()],
+            error: None,
+            cells,
+        }
     }
 
     fn state(machines: Vec<Machine>) -> State {
@@ -1101,10 +1272,12 @@ mod tests {
             // reordering pass would make their expectations depend on statistics they are not
             // testing. usage.rs owns those, with its own suite.
             usage: Usage::new(),
+            usage_writable: true,
             z: 2.0,
             half_life_days: crate::usage::HALF_LIFE_DAYS,
             base: machines,
             placement: Placement::new(),
+            placement_writable: true,
             machines: Vec::new(),
             view: Vec::new(),
             col: 0,
@@ -1123,20 +1296,32 @@ mod tests {
     /// A cell is a real 2D grid, not a list of lists: moving DOWN keeps the column.
     #[test]
     fn down_preserves_the_column() {
-        let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c"], vec!["d", "e", "f"]])]);
+        let mut s = state(vec![machine(
+            "m",
+            0,
+            vec![vec!["a", "b", "c"], vec!["d", "e", "f"]],
+        )]);
         s.focus = Focus::Inside;
         s.item = 1;
         s.item_goal = 1;
         s.line = 1;
         s.clamp();
-        assert_eq!(s.cell()[s.line].apps[s.item].name, "e", "line 1 item 2 -> down -> line 2 item 2");
+        assert_eq!(
+            s.cell()[s.line].apps[s.item].name,
+            "e",
+            "line 1 item 2 -> down -> line 2 item 2"
+        );
     }
 
     /// Crossing a SHORT line clamps for that line only. Coming back returns to the goal column
     /// instead of drifting left -- the bug a naive `item = min(item, len-1)` produces.
     #[test]
     fn a_short_line_does_not_eat_the_goal_column() {
-        let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c"], vec!["solo"], vec!["x", "y", "z"]])]);
+        let mut s = state(vec![machine(
+            "m",
+            0,
+            vec![vec!["a", "b", "c"], vec!["solo"], vec!["x", "y", "z"]],
+        )]);
         s.focus = Focus::Inside;
         s.item = 2;
         s.item_goal = 2;
@@ -1147,7 +1332,11 @@ mod tests {
 
         s.line = 2;
         s.clamp();
-        assert_eq!(s.cell()[s.line].apps[s.item].name, "z", "goal column survived the short line");
+        assert_eq!(
+            s.cell()[s.line].apps[s.item].name,
+            "z",
+            "goal column survived the short line"
+        );
     }
 
     /// The filter reaches every machine, not just the focused column.
@@ -1161,18 +1350,31 @@ mod tests {
         s.refilter();
         assert_eq!(s.view[0].cells[0].len(), 1);
         assert_eq!(s.view[0].cells[0][0].apps.len(), 1);
-        assert!(s.view[1].cells[0].is_empty(), "the other machine filtered down to nothing");
+        assert!(
+            s.view[1].cells[0].is_empty(),
+            "the other machine filtered down to nothing"
+        );
     }
 
     /// Fuzzy, not substring: gaps are allowed, so an acronym-ish prefix finds the real name.
     #[test]
     fn search_matches_fuzzily() {
-        let mut s = state(vec![machine("m", 0, vec![vec!["Code - OSS", "Manage Printing"]])]);
+        let mut s = state(vec![machine(
+            "m",
+            0,
+            vec![vec!["Code - OSS", "Manage Printing"]],
+        )]);
         s.query = "cod".into();
         s.refilter();
-        let hits: Vec<&str> =
-            s.view[0].cells[0].iter().flat_map(|l| l.apps.iter().map(|a| a.name.as_str())).collect();
-        assert_eq!(hits, vec!["Code - OSS"], "matched across the gap, and did not match the other");
+        let hits: Vec<&str> = s.view[0].cells[0]
+            .iter()
+            .flat_map(|l| l.apps.iter().map(|a| a.name.as_str()))
+            .collect();
+        assert_eq!(
+            hits,
+            vec!["Code - OSS"],
+            "matched across the gap, and did not match the other"
+        );
     }
 
     /// The regression that motivated dropping substring matching: a single common letter must not
@@ -1182,8 +1384,10 @@ mod tests {
         let mut s = state(vec![machine("m", 0, vec![vec!["Zed", "Krita"]])]);
         s.query = "zd".into();
         s.refilter();
-        let hits: Vec<&str> =
-            s.view[0].cells[0].iter().flat_map(|l| l.apps.iter().map(|a| a.name.as_str())).collect();
+        let hits: Vec<&str> = s.view[0].cells[0]
+            .iter()
+            .flat_map(|l| l.apps.iter().map(|a| a.name.as_str()))
+            .collect();
         assert_eq!(hits, vec!["Zed"]);
     }
 
@@ -1196,7 +1400,10 @@ mod tests {
         ]);
         s.query = "kden".into();
         s.refilter();
-        assert!(!s.cell().is_empty(), "cursor moved to a cell that still has something");
+        assert!(
+            !s.cell().is_empty(),
+            "cursor moved to a cell that still has something"
+        );
         assert_eq!(s.cell()[0].apps[0].name, "Kdenlive");
     }
 
@@ -1213,11 +1420,17 @@ mod tests {
     #[test]
     fn dropping_on_a_line_inserts_at_position() {
         let mut m = machine("m", 0, vec![vec!["a", "b", "c"]]);
-        m.cells[6] = vec![Line { name: None, apps: vec![app("new")] }];
+        m.cells[6] = vec![Line {
+            name: None,
+            apps: vec![app("new")],
+        }];
         let mut s = state(vec![m]);
         s.place_app(0, "new", 0, Some(&on(&["a", "b", "c"])), Some("b"));
-        let names: Vec<&str> =
-            s.machines[0].cells[0][0].apps.iter().map(|a| a.name.as_str()).collect();
+        let names: Vec<&str> = s.machines[0].cells[0][0]
+            .apps
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
         assert_eq!(names, vec!["a", "new", "b", "c"], "landed between a and b");
     }
 
@@ -1226,8 +1439,11 @@ mod tests {
     fn reordering_within_a_line() {
         let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c"]])]);
         s.place_app(0, "c", 0, Some(&on(&["a", "b", "c"])), Some("a"));
-        let names: Vec<&str> =
-            s.machines[0].cells[0][0].apps.iter().map(|a| a.name.as_str()).collect();
+        let names: Vec<&str> = s.machines[0].cells[0][0]
+            .apps
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
         assert_eq!(names, vec!["c", "a", "b"]);
     }
 
@@ -1236,10 +1452,16 @@ mod tests {
     #[test]
     fn unplaced_apps_keep_their_computed_folder() {
         let mut m = machine("m", 0, vec![vec!["Foot"]]);
-        m.cells[6] = vec![Line { name: None, apps: vec![app("Brand New")] }];
+        m.cells[6] = vec![Line {
+            name: None,
+            apps: vec![app("Brand New")],
+        }];
         let mut s = state(vec![m]);
         s.place_app(0, "Foot", 1, None, None); // arrange something else entirely
-        assert_eq!(s.machines[0].cells[6][0].apps[0].name, "Brand New", "still in the inbox");
+        assert_eq!(
+            s.machines[0].cells[6][0].apps[0].name, "Brand New",
+            "still in the inbox"
+        );
     }
 
     /// A placement naming an app that no longer exists must not corrupt its neighbours.
@@ -1250,17 +1472,35 @@ mod tests {
         let mut folders = HashMap::new();
         folders.insert(
             DEFAULT_FOLDERS[0].to_string(),
-            vec![StoredLine::Bare(vec!["a".into(), "ghost".into(), "b".into()])],
+            vec![StoredLine::Bare(vec![
+                "a".into(),
+                "ghost".into(),
+                "b".into(),
+            ])],
         );
         p.insert("m".to_string(), folders);
         let rows: Vec<String> = DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect();
         let out = apply_placement(&base, &p, &rows);
-        let names: Vec<&str> = out[0].cells[0][0].apps.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b"], "ghost skipped, order of the survivors kept");
+        let names: Vec<&str> = out[0].cells[0][0]
+            .apps
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "ghost skipped, order of the survivors kept"
+        );
     }
 
     fn appx(name: &str, exec: &str) -> App {
-        App { id: name.into(), name: name.into(), icon: "x".into(), exec: exec.into(), terminal: false }
+        App {
+            id: name.into(),
+            name: name.into(),
+            icon: "x".into(),
+            exec: exec.into(),
+            terminal: false,
+        }
     }
 
     /// Unhandled field codes must be REMOVED, not passed through. Left in place, "%U" becomes a
@@ -1268,11 +1508,17 @@ mod tests {
     #[test]
     fn field_codes_are_stripped() {
         let m = machine("m", 0, vec![vec!["x"]]);
-        assert_eq!(launch_argv(&m, &appx("Firefox", "firefox %u"), &[]), vec!["firefox"]);
-        assert_eq!(launch_argv(&m, &appx("Files", "thunar %F"), &[]), vec!["thunar"]);
+        assert_eq!(
+            launch_argv(&m, &appx("Firefox", "firefox %u"), &[]),
+            Some(vec!["firefox".into()])
+        );
+        assert_eq!(
+            launch_argv(&m, &appx("Files", "thunar %F"), &[]),
+            Some(vec!["thunar".into()])
+        );
         assert_eq!(
             launch_argv(&m, &appx("Foot", "foot --server %i"), &[]),
-            vec!["foot", "--server"],
+            Some(vec!["foot".into(), "--server".into()]),
             "only the codes go, the real flags stay"
         );
     }
@@ -1281,7 +1527,10 @@ mod tests {
     #[test]
     fn a_bare_percent_is_not_a_field_code() {
         let m = machine("m", 0, vec![vec!["x"]]);
-        assert_eq!(launch_argv(&m, &appx("odd", "prog 100%"), &[]), vec!["prog", "100%"]);
+        assert_eq!(
+            launch_argv(&m, &appx("odd", "prog 100%"), &[]),
+            Some(vec!["prog".into(), "100%".into()])
+        );
     }
 
     /// Splitting is shlex, so a quoted argument containing spaces stays ONE argument. Naive
@@ -1291,7 +1540,12 @@ mod tests {
         let m = machine("m", 0, vec![vec!["x"]]);
         assert_eq!(
             launch_argv(&m, &appx("q", "prog --path \"/a b/c\" --flag"), &[]),
-            vec!["prog", "--path", "/a b/c", "--flag"]
+            Some(vec![
+                "prog".into(),
+                "--path".into(),
+                "/a b/c".into(),
+                "--flag".into()
+            ])
         );
     }
 
@@ -1306,7 +1560,12 @@ mod tests {
         app.terminal = true;
         assert_eq!(
             launch_argv(&m, &app, &["foot".to_string(), "-e".to_string()]),
-            vec!["fwd@remote", "foot", "-e", "helix"]
+            Some(vec![
+                "fwd@remote".into(),
+                "foot".into(),
+                "-e".into(),
+                "helix".into()
+            ])
         );
     }
 
@@ -1315,8 +1574,12 @@ mod tests {
     fn a_graphical_program_is_not_wrapped() {
         let m = machine("m", 0, vec![vec!["x"]]);
         assert_eq!(
-            launch_argv(&m, &appx("Firefox", "firefox %u"), &["foot".to_string(), "-e".to_string()]),
-            vec!["firefox"]
+            launch_argv(
+                &m,
+                &appx("Firefox", "firefox %u"),
+                &["foot".to_string(), "-e".to_string()]
+            ),
+            Some(vec!["firefox".into()])
         );
     }
 
@@ -1327,7 +1590,7 @@ mod tests {
         m.launch = vec!["waypipe@remote".to_string()];
         assert_eq!(
             launch_argv(&m, &appx("Helix", "helix %F"), &[]),
-            vec!["waypipe@remote", "helix"]
+            Some(vec!["waypipe@remote".into(), "helix".into()])
         );
     }
 
@@ -1341,7 +1604,10 @@ mod tests {
     fn rebuilding_is_stable_under_row_reordering() {
         let mut s = state(vec![machine("m", 0, vec![vec!["Foot"]])]);
         // Make a later row decisively outrank row 0, so a permutation really happens.
-        s.base[0].cells[1] = vec![Line { name: None, apps: vec![app("Helix")] }];
+        s.base[0].cells[1] = vec![Line {
+            name: None,
+            apps: vec![app("Helix")],
+        }];
         for _ in 0..80 {
             s.record_launch_for_test("m", "Helix");
         }
@@ -1349,7 +1615,11 @@ mod tests {
         let first: Vec<(String, Vec<String>)> = snapshot(&s);
         s.rebuild();
         s.rebuild();
-        assert_eq!(snapshot(&s), first, "the grid must not drift on repeated rebuilds");
+        assert_eq!(
+            snapshot(&s),
+            first,
+            "the grid must not drift on repeated rebuilds"
+        );
     }
 
     fn snapshot(s: &State) -> Vec<(String, Vec<String>)> {
@@ -1385,14 +1655,20 @@ mod tests {
     fn materialise_keeps_entries_for_apps_it_cannot_see() {
         let mut s = state(vec![machine("m", 0, vec![vec!["here"]])]);
         let mut folders = HashMap::new();
-        folders.insert("Media".to_string(), vec![StoredLine::Bare(vec!["gone".into()])]);
+        folders.insert(
+            "Media".to_string(),
+            vec![StoredLine::Bare(vec!["gone".into()])],
+        );
         s.placement.insert("m".to_string(), folders);
         s.rebuild();
 
         s.place_app(0, "here", 1, None, None);
 
         let after = &s.placement["m"];
-        assert!(after.contains_key("Media"), "the absent app's folder survived: {after:?}");
+        assert!(
+            after.contains_key("Media"),
+            "the absent app's folder survived: {after:?}"
+        );
         assert_eq!(after["Media"], vec![StoredLine::Bare(vec!["gone".into()])]);
     }
 
@@ -1406,9 +1682,16 @@ mod tests {
     fn rightward_reorder_lands_where_it_was_dropped() {
         let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c", "d"]])]);
         s.place_app(0, "a", 0, Some(&on(&["a", "b", "c", "d"])), Some("c")); // the gap after b
-        let names: Vec<&str> =
-            s.machines[0].cells[0][0].apps.iter().map(|x| x.name.as_str()).collect();
-        assert_eq!(names, vec!["b", "a", "c", "d"], "landed after b, not after c");
+        let names: Vec<&str> = s.machines[0].cells[0][0]
+            .apps
+            .iter()
+            .map(|x| x.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["b", "a", "c", "d"],
+            "landed after b, not after c"
+        );
     }
 
     /// A drop while a QUERY is active must join the appset the user is looking at.
@@ -1420,13 +1703,20 @@ mod tests {
     #[test]
     fn a_drop_under_a_filter_joins_the_line_that_is_visible() {
         let mut m = machine("m", 0, vec![vec!["alpha", "beta"], vec!["gamma"]]);
-        m.cells[6] = vec![Line { name: None, apps: vec![app("delta")] }];
+        m.cells[6] = vec![Line {
+            name: None,
+            apps: vec![app("delta")],
+        }];
         let mut s = state(vec![m]);
 
         // Only the gamma line survives this: on screen it is line 0, in the placement it is line 1.
         s.query = "gamma".into();
         s.refilter();
-        assert_eq!(s.machines[0].cells[0].len(), 2, "the model still holds both lines");
+        assert_eq!(
+            s.machines[0].cells[0].len(),
+            2,
+            "the model still holds both lines"
+        );
 
         s.place_app(0, "delta", 0, Some(&on(&["gamma"])), None);
 
@@ -1439,7 +1729,10 @@ mod tests {
             with_gamma.apps().contains(&"delta".to_string()),
             "joined the visible appset: {lines:?}"
         );
-        let with_alpha = lines.iter().find(|l| l.apps().contains(&"alpha".to_string())).unwrap();
+        let with_alpha = lines
+            .iter()
+            .find(|l| l.apps().contains(&"alpha".to_string()))
+            .unwrap();
         assert!(
             !with_alpha.apps().contains(&"delta".to_string()),
             "did NOT join the filtered-away one: {lines:?}"
@@ -1455,7 +1748,10 @@ mod tests {
     #[test]
     fn a_drag_does_not_fossilise_the_frecency_order() {
         let mut m = machine("m", 0, vec![vec!["rare"], vec!["popular"]]);
-        m.cells[6] = vec![Line { name: None, apps: vec![app("unrelated")] }];
+        m.cells[6] = vec![Line {
+            name: None,
+            apps: vec![app("unrelated")],
+        }];
         let mut s = state(vec![m]);
 
         // Enough launches that the significance gate is cleared and the order really does move.
@@ -1481,6 +1777,43 @@ mod tests {
         );
     }
 
+    /// Row frecency must move a folder and all of its declared subrows as one visual block. Moving
+    /// the rows independently put Editors between Chat/biz and Chat/priv as soon as Editors beat
+    /// only the quieter of the two Chat rows.
+    #[test]
+    fn usage_never_splits_a_folder_from_its_subrows() {
+        let mut machines = vec![Machine {
+            name: "m".into(),
+            aliases: vec![],
+            accent: "#fff".into(),
+            launch: vec!["{}".into()],
+            error: None,
+            cells: vec![
+                vec![line(vec![app("chat-busy")])],
+                vec![line(vec![app("chat-quiet")])],
+                vec![line(vec![app("editor")])],
+                vec![],
+            ],
+        }];
+        let mut folders = vec![
+            "Chat/biz".to_string(),
+            "Chat/priv".to_string(),
+            "Editors".to_string(),
+            "Other".to_string(),
+        ];
+        let mut usage = Usage::new();
+        for _ in 0..50 {
+            usage::record(&mut usage, "m", "chat-busy", 1, 30.0);
+        }
+        for _ in 0..25 {
+            usage::record(&mut usage, "m", "editor", 1, 30.0);
+        }
+
+        apply_usage(&mut machines, &mut folders, &usage, 1, 0.0, 30.0);
+
+        assert_eq!(folders, ["Chat/biz", "Chat/priv", "Editors", "Other"]);
+    }
+
     /// Typing puts the cursor on the first match, not on whatever the goal column happens to hit.
     ///
     /// The goal column is what makes up/down preserve your position, and it is only meaningful
@@ -1489,7 +1822,11 @@ mod tests {
     /// looking at as they type is the first.
     #[test]
     fn a_query_puts_the_cursor_on_the_first_match() {
-        let mut s = state(vec![machine("m", 0, vec![vec!["alpha", "beta", "gamma", "delta"]])]);
+        let mut s = state(vec![machine(
+            "m",
+            0,
+            vec![vec!["alpha", "beta", "gamma", "delta"]],
+        )]);
         s.focus = Focus::Inside;
         s.item = 3;
         s.item_goal = 3;
@@ -1522,7 +1859,13 @@ mod tests {
 
     /// An app with an id distinct from its name, for the identity tests below.
     fn app_id(id: &str, name: &str) -> App {
-        App { id: id.into(), name: name.into(), icon: "x".into(), exec: id.into(), terminal: false }
+        App {
+            id: id.into(),
+            name: name.into(),
+            icon: "x".into(),
+            exec: id.into(),
+            terminal: false,
+        }
     }
 
     /// TWO APPS, ONE DISPLAY NAME. This is the whole reason ids exist.
@@ -1533,16 +1876,25 @@ mod tests {
     #[test]
     fn two_apps_sharing_a_name_stay_distinct() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { name: None, apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")] }];
+        m.cells[0] = vec![Line {
+            name: None,
+            apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")],
+        }];
         let mut s = state(vec![m]);
 
         // File ONE of them somewhere else, by its id.
         s.place_app(0, "b.desktop", 4, None, None);
 
-        let terminals: Vec<&str> =
-            s.machines[0].cells[0].iter().flat_map(|l| l.apps.iter()).map(|a| a.id.as_str()).collect();
-        let files: Vec<&str> =
-            s.machines[0].cells[4].iter().flat_map(|l| l.apps.iter()).map(|a| a.id.as_str()).collect();
+        let terminals: Vec<&str> = s.machines[0].cells[0]
+            .iter()
+            .flat_map(|l| l.apps.iter())
+            .map(|a| a.id.as_str())
+            .collect();
+        let files: Vec<&str> = s.machines[0].cells[4]
+            .iter()
+            .flat_map(|l| l.apps.iter())
+            .map(|a| a.id.as_str())
+            .collect();
         assert_eq!(terminals, vec!["a.desktop"], "the other one stayed put");
         assert_eq!(files, vec!["b.desktop"], "and only the named one moved");
     }
@@ -1551,21 +1903,42 @@ mod tests {
     #[test]
     fn an_arrangement_written_under_names_is_migrated() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { name: None, apps: vec![app_id("helix.desktop", "Helix")] }];
+        m.cells[0] = vec![Line {
+            name: None,
+            apps: vec![app_id("helix.desktop", "Helix")],
+        }];
         let mut s = state(vec![m]);
 
         // What the old code would have written: the DISPLAY NAME, in a different folder.
         let mut folders = HashMap::new();
-        folders.insert("Editors".to_string(), vec![StoredLine::Bare(vec!["Helix".into()])]);
+        folders.insert(
+            "Editors".to_string(),
+            vec![StoredLine::Bare(vec!["Helix".into()])],
+        );
         s.placement.insert("m".to_string(), folders);
-        s.usage.insert(usage::key("m", "Helix"), usage::Entry { score: 9.0, last: 0 });
+        s.usage.insert(
+            usage::key("m", "Helix"),
+            usage::Entry {
+                score: 9.0,
+                last: 0,
+            },
+        );
 
         s.migrate_names_to_ids();
         s.rebuild();
 
-        assert_eq!(s.placement["m"]["Editors"], vec![StoredLine::Bare(vec!["helix.desktop".into()])]);
-        assert!(s.usage.contains_key(&usage::key("m", "helix.desktop")), "the score came too");
-        assert!(!s.usage.contains_key(&usage::key("m", "Helix")), "and did not stay behind");
+        assert_eq!(
+            s.placement["m"]["Editors"],
+            vec![StoredLine::Bare(vec!["helix.desktop".into()])]
+        );
+        assert!(
+            s.usage.contains_key(&usage::key("m", "helix.desktop")),
+            "the score came too"
+        );
+        assert!(
+            !s.usage.contains_key(&usage::key("m", "Helix")),
+            "and did not stay behind"
+        );
         assert_eq!(
             s.machines[0].cells[1][0].apps[0].id, "helix.desktop",
             "and the arrangement still applies: it is in Editors, not its computed folder"
@@ -1577,10 +1950,16 @@ mod tests {
     #[test]
     fn the_migration_is_idempotent() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { name: None, apps: vec![app_id("helix.desktop", "Helix")] }];
+        m.cells[0] = vec![Line {
+            name: None,
+            apps: vec![app_id("helix.desktop", "Helix")],
+        }];
         let mut s = state(vec![m]);
         let mut folders = HashMap::new();
-        folders.insert("Editors".to_string(), vec![StoredLine::Bare(vec!["Helix".into()])]);
+        folders.insert(
+            "Editors".to_string(),
+            vec![StoredLine::Bare(vec!["Helix".into()])],
+        );
         s.placement.insert("m".to_string(), folders);
 
         s.migrate_names_to_ids();
@@ -1598,10 +1977,16 @@ mod tests {
     #[test]
     fn an_ambiguous_name_is_not_guessed() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { name: None, apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")] }];
+        m.cells[0] = vec![Line {
+            name: None,
+            apps: vec![app_id("a.desktop", "Foo"), app_id("b.desktop", "Foo")],
+        }];
         let mut s = state(vec![m]);
         let mut folders = HashMap::new();
-        folders.insert("Editors".to_string(), vec![StoredLine::Bare(vec!["Foo".into()])]);
+        folders.insert(
+            "Editors".to_string(),
+            vec![StoredLine::Bare(vec!["Foo".into()])],
+        );
         s.placement.insert("m".to_string(), folders);
 
         s.migrate_names_to_ids();
@@ -1633,16 +2018,32 @@ mod tests {
     #[test]
     fn a_machine_can_be_named_in_any_of_the_usual_shapes() {
         let h = hosts();
-        for q in ["foot@server", "foot.server", "foot:server", "foot/server", "server.foot"] {
-            assert_eq!(split_query(q, &h), (Some("server".into()), "foot".into()), "{q}");
+        for q in [
+            "foot@server",
+            "foot.server",
+            "foot:server",
+            "foot/server",
+            "server.foot",
+        ] {
+            assert_eq!(
+                split_query(q, &h),
+                (Some("server".into()), "foot".into()),
+                "{q}"
+            );
         }
     }
 
     /// A prefix is enough, because a qualifier you must spell in full saves nothing over arrowing.
     #[test]
     fn an_unambiguous_prefix_is_enough() {
-        assert_eq!(split_query("foot@ser", &hosts()), (Some("server".into()), "foot".into()));
-        assert_eq!(split_query("foot@l", &hosts()), (Some("laptop".into()), "foot".into()));
+        assert_eq!(
+            split_query("foot@ser", &hosts()),
+            (Some("server".into()), "foot".into())
+        );
+        assert_eq!(
+            split_query("foot@l", &hosts()),
+            (Some("laptop".into()), "foot".into())
+        );
     }
 
     /// A declared alias is just another name for the machine, in every spelling.
@@ -1678,7 +2079,8 @@ mod tests {
     /// ...and an ambiguous one is not a licence to guess.
     #[test]
     fn an_ambiguous_prefix_names_no_machine() {
-        let h: Vec<(String, Vec<String>)> = vec![("work".into(), vec![]), ("workstation".into(), vec![])];
+        let h: Vec<(String, Vec<String>)> =
+            vec![("work".into(), vec![]), ("workstation".into(), vec![])];
         // "arc" could be either, so it stays ordinary search text rather than picking one.
         assert_eq!(split_query("foot@arc", &h), (None, "foot@arc".into()));
     }
@@ -1687,16 +2089,26 @@ mod tests {
     /// its whole name.
     #[test]
     fn an_exact_name_wins_over_a_longer_one() {
-        let h: Vec<(String, Vec<String>)> = vec![("work".into(), vec![]), ("workstation".into(), vec![])];
-        assert_eq!(split_query("foot@work", &h), (Some("work".into()), "foot".into()));
+        let h: Vec<(String, Vec<String>)> =
+            vec![("work".into(), vec![]), ("workstation".into(), vec![])];
+        assert_eq!(
+            split_query("foot@work", &h),
+            (Some("work".into()), "foot".into())
+        );
     }
 
     /// Naming a machine with no pattern means everything on it -- falling out of the same rule
     /// rather than being a special case.
     #[test]
     fn a_bare_machine_shows_all_of_it() {
-        assert_eq!(split_query("server.", &hosts()), (Some("server".into()), String::new()));
-        assert_eq!(split_query("@workstation", &hosts()), (Some("workstation".into()), String::new()));
+        assert_eq!(
+            split_query("server.", &hosts()),
+            (Some("server".into()), String::new())
+        );
+        assert_eq!(
+            split_query("@workstation", &hosts()),
+            (Some("workstation".into()), String::new())
+        );
     }
 
     /// THE SAFETY PROPERTY: a query that names no machine is passed through untouched, so this can
@@ -1705,7 +2117,10 @@ mod tests {
     fn a_query_naming_no_machine_is_left_alone() {
         assert_eq!(split_query("foot", &hosts()), (None, "foot".into()));
         assert_eq!(split_query("some.app", &hosts()), (None, "some.app".into()));
-        assert_eq!(split_query("user@host", &hosts()), (None, "user@host".into()));
+        assert_eq!(
+            split_query("user@host", &hosts()),
+            (None, "user@host".into())
+        );
     }
 
     /// And the whole point: the other machines empty, without their columns disappearing.
@@ -1719,7 +2134,10 @@ mod tests {
 
         assert_eq!(s.view.len(), 2, "both columns still exist");
         assert!(s.view[0].cells[0].is_empty(), "the unnamed machine emptied");
-        assert_eq!(s.view[1].cells[0][0].apps[0].name, "Foot", "the named machine kept its match");
+        assert_eq!(
+            s.view[1].cells[0][0].apps[0].name, "Foot",
+            "the named machine kept its match"
+        );
     }
 
     /// A PLACEMENT FILE WRITTEN BEFORE NAMED ROWS EXISTED STILL LOADS.
@@ -1733,8 +2151,15 @@ mod tests {
         let p: Placement = serde_json::from_str(old).expect("the old shape must still parse");
         let lines = &p["m"]["Editors"];
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].apps(), &vec!["helix.desktop".to_string(), "vim.desktop".to_string()]);
-        assert_eq!(lines[0].name(), None, "an old line has no name, and that is not an error");
+        assert_eq!(
+            lines[0].apps(),
+            &vec!["helix.desktop".to_string(), "vim.desktop".to_string()]
+        );
+        assert_eq!(
+            lines[0].name(),
+            None,
+            "an old line has no name, and that is not an error"
+        );
     }
 
     /// And the new shape round-trips, with unnamed lines still written in the old form so a file
@@ -1765,7 +2190,10 @@ mod tests {
     #[test]
     fn an_emptied_named_row_is_not_deleted() {
         let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![Line { name: Some("business".into()), apps: vec![app("Teams")] }];
+        m.cells[0] = vec![Line {
+            name: Some("business".into()),
+            apps: vec![app("Teams")],
+        }];
         let mut s = state(vec![m]);
 
         // Move the only occupant somewhere else entirely.
@@ -1786,8 +2214,14 @@ mod tests {
         let mut a = machine("a", 0, vec![vec!["one"]]);
         let mut b = machine("b", 0, vec![vec!["two"]]);
         // Row 2 has something; row 1 has nothing on either machine.
-        a.cells[2] = vec![Line { name: None, apps: vec![app("three")] }];
-        b.cells[2] = vec![Line { name: None, apps: vec![app("four")] }];
+        a.cells[2] = vec![Line {
+            name: None,
+            apps: vec![app("three")],
+        }];
+        b.cells[2] = vec![Line {
+            name: None,
+            apps: vec![app("four")],
+        }];
         let s = state(vec![a, b]);
 
         assert!(s.row_has_content(0));
@@ -1812,8 +2246,11 @@ mod tests {
     fn dropping_an_item_where_it_already_is_changes_nothing() {
         let mut s = state(vec![machine("m", 0, vec![vec!["a", "b", "c"]])]);
         s.place_app(0, "a", 0, Some(&on(&["a", "b", "c"])), Some("b")); // the gap a already occupies
-        let names: Vec<&str> =
-            s.machines[0].cells[0][0].apps.iter().map(|x| x.name.as_str()).collect();
+        let names: Vec<&str> = s.machines[0].cells[0][0]
+            .apps
+            .iter()
+            .map(|x| x.name.as_str())
+            .collect();
         assert_eq!(names, vec!["a", "b", "c"]);
     }
 
@@ -1823,7 +2260,7 @@ mod tests {
         let m = machine("m", 0, vec![vec!["x"]]);
         assert_eq!(
             launch_argv(&m, &appx("q", "prog \"/a  b\" %U"), &[]),
-            vec!["prog", "/a  b"],
+            Some(vec!["prog".into(), "/a  b".into()]),
             "two spaces preserved, %U gone"
         );
     }
@@ -1835,7 +2272,32 @@ mod tests {
         m.launch = vec!["ssh".into(), "box".into(), "{}".into()];
         assert_eq!(
             launch_argv(&m, &appx("Helix", "helix %F"), &[]),
-            vec!["ssh", "box", "helix"]
+            Some(vec!["ssh".into(), "box".into(), "helix".into()])
+        );
+    }
+
+    #[test]
+    fn an_empty_launch_prefix_is_read_only_not_local() {
+        let mut m = machine("remote", 0, vec![vec!["x"]]);
+        m.launch.clear();
+        assert_eq!(launch_argv(&m, &appx("Helix", "helix"), &[]), None);
+    }
+
+    #[test]
+    fn terminal_wrapper_is_inside_a_placeholder_template() {
+        let mut m = machine("remote", 0, vec![vec!["x"]]);
+        m.launch = vec!["ssh".into(), "box".into(), "{}".into()];
+        let mut app = appx("Helix", "helix %F");
+        app.terminal = true;
+        assert_eq!(
+            launch_argv(&m, &app, &["foot".into(), "-e".into()]),
+            Some(vec![
+                "ssh".into(),
+                "box".into(),
+                "foot".into(),
+                "-e".into(),
+                "helix".into()
+            ])
         );
     }
 
@@ -1859,9 +2321,17 @@ mod tests {
         assert!(s.col < s.view.len(), "column in range");
         assert!(s.row < s.folders.len(), "row in range");
         if s.cell().is_empty() {
-            assert_eq!(s.focus, Focus::Outside, "an empty cell must not hold you inside it");
+            assert_eq!(
+                s.focus,
+                Focus::Outside,
+                "an empty cell must not hold you inside it"
+            );
         } else {
-            assert!(s.cell().get(s.line).is_some_and(|l| l.apps.get(s.item).is_some()));
+            assert!(
+                s.cell()
+                    .get(s.line)
+                    .is_some_and(|l| l.apps.get(s.item).is_some())
+            );
         }
     }
 
@@ -1874,6 +2344,10 @@ mod tests {
         s.item = 99;
         s.item_goal = 99;
         s.clamp();
-        assert_eq!(s.cell()[s.line].apps[s.item].name, "b", "clamped to the last real item");
+        assert_eq!(
+            s.cell()[s.line].apps[s.item].name,
+            "b",
+            "clamped to the last real item"
+        );
     }
 }

@@ -74,6 +74,7 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
                         .unwrap_or(rows.len().saturating_sub(1));
                     for chunk in folder.apps.chunks(line_width.max(1)) {
                         cells[r].push(model::Line {
+                            name: None,
                             apps: chunk
                                 .iter()
                                 .map(|a| model::App {
@@ -92,6 +93,7 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
     }
     model::Machine {
         name: mc.name.clone(),
+        aliases: mc.aliases.clone(),
         accent: mc.accent.clone(),
         launch: mc.launch.clone(),
         error: None,

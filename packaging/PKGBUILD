@@ -69,6 +69,5 @@ package() {
   cd "$pkgname-corbet-ch-$pkgver"
   install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
   install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
-  install -Dm0644 LICENCE "$pkgdir/usr/share/licenses/$pkgname/LICENCE" 2>/dev/null ||
-    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

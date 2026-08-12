@@ -85,6 +85,15 @@ let
         '';
       };
 
+      inventory_timeout_ms = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 5000;
+        description = ''
+          Maximum wall-clock time for this inventory command. An unreachable machine is a normal
+          column state; one command that never returns must not hold the launcher indefinitely.
+        '';
+      };
+
       launch = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -93,6 +102,10 @@ let
           argv prefix for starting one of this machine's applications. Empty means this machine is
           a READ-ONLY column: it can be browsed and searched but nothing can be started on it,
           which is a legitimate state for a box you want to see the contents of and not drive.
+
+          Use [ "{}" ] for the local machine: the placeholder is replaced by the application's
+          argv without adding a forwarding prefix. Empty never falls back to local execution,
+          because doing so on a remote column would start the same-named program on the wrong host.
         '';
       };
     };
@@ -182,7 +195,33 @@ in
     };
 
     theme = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.either lib.types.str lib.types.int);
+      type = lib.types.submodule {
+        options = {
+          ground = lib.mkOption { type = lib.types.str; default = "#0A0A0A"; };
+          surface = lib.mkOption { type = lib.types.str; default = "#0E0E0E"; };
+          fg = lib.mkOption { type = lib.types.str; default = "#F0F0F0"; };
+          muted = lib.mkOption { type = lib.types.str; default = "#999999"; };
+          dim = lib.mkOption { type = lib.types.str; default = "#444444"; };
+          accent = lib.mkOption { type = lib.types.str; default = "#22C55E"; };
+          error = lib.mkOption { type = lib.types.str; default = "#B91322"; };
+          border = lib.mkOption { type = lib.types.str; default = "#1C1C1C"; };
+          logo = lib.mkOption { type = lib.types.str; default = ""; };
+          icon_size = lib.mkOption { type = lib.types.ints.positive; default = 20; };
+          logo_size = lib.mkOption { type = lib.types.ints.positive; default = 28; };
+          line_width = lib.mkOption { type = lib.types.ints.positive; default = 4; };
+          width = lib.mkOption { type = lib.types.ints.positive; default = 560; };
+          max_height_fraction = lib.mkOption {
+            type = lib.types.addCheck (lib.types.either lib.types.int lib.types.float)
+              (value: value > 0 && value <= 1);
+            default = 0.66;
+          };
+          max_width_fraction = lib.mkOption {
+            type = lib.types.addCheck (lib.types.either lib.types.int lib.types.float)
+              (value: value > 0 && value <= 1);
+            default = 0.9;
+          };
+        };
+      };
       default = { };
       example = {
         ground = "#0A0A0A";
@@ -190,8 +229,7 @@ in
         icon_size = 20;
       };
       description = ''
-        Appearance overrides, written verbatim into the config file. Anything omitted keeps the
-        program's own default.
+        Appearance values, type-checked here and rendered into the config file.
 
         Colours: `ground`, `surface`, `fg`, `muted`, `dim`, `accent`, `error`, `border`.
 
@@ -204,14 +242,57 @@ in
         Numbers: `icon_size` (default 20, keep it in proportion to your UI font), `line_width`
         (default 4 — apps per line, which is how many left/right steps a row costs before up/down
         is the faster move; more machine columns or a narrower display want fewer),
-        `max_height_fraction` (default 0.66 — how much of the display the grid may take before it
-        scrolls, so how much of the session stays visible behind it), and `width` (default 560,
-        the minimum window width).
+        `max_height_fraction` (default 0.66 — how much of the display height the grid may take),
+        `max_width_fraction` (default 0.9 — the corresponding width cap), and `width` (default 560,
+        the minimum window width). Both fractions must be greater than zero and at most one.
 
         The built-in defaults are a working dark set so the launcher is usable the moment it is
         installed — they are NOT a house palette. Override them with whatever the rest of your
         desktop already uses, so this looks like part of the same product rather than a second one
         that happens to be running.
+      '';
+    };
+
+    surface = lib.mkOption {
+      type = lib.types.enum [ "layer" "window" ];
+      default = "layer";
+      description = "Layer-shell surface for normal use, or an ordinary window for debugging.";
+    };
+
+    exit_on_focus_loss = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Hide the launcher when keyboard focus goes elsewhere. A short grace period is restarted on
+        every reveal so focus bounce from a bar or dock does not immediately dismiss it.
+      '';
+    };
+
+    keys = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.nullOr (lib.types.enum [
+        "move-left"
+        "move-right"
+        "move-up"
+        "move-down"
+        "enter"
+        "launch-line"
+        "launch-cell"
+        "launch-selection"
+        "toggle-inside"
+        "go-outside"
+        "cancel"
+        "backspace"
+      ]));
+      default = { };
+      example = {
+        "ctrl+j" = "move-down";
+        "shift+return" = "launch-selection";
+        "ctrl+return" = "launch-cell";
+      };
+      description = ''
+        Chord-to-action overrides. They extend the defaults; null unbinds a default chord. Explicit
+        launch-line and launch-cell actions mean the same thing in either focus mode, while
+        launch-selection preserves Shift+Return's contextual default (cell outside, line inside).
       '';
     };
 
@@ -245,8 +326,7 @@ in
         Not defaulted to any particular emulator on purpose. The right answer is whatever terminal
         this desktop already uses, and a launcher that opened a DIFFERENT one from the rest of the
         session would be wrong in a way nobody would think to look for. Left empty, such programs
-        are launched bare, start without a controlling terminal, and exit immediately — which looks
-        exactly like a keypress that did nothing.
+        are refused with an error rather than launched without a visible window.
       '';
     };
 
@@ -312,6 +392,27 @@ in
       }
       {
         assertion =
+          let
+            tokens = lib.concatMap
+              (m: map lib.toLower ([ m.name ] ++ m.aliases))
+              cfg.machines;
+          in
+          lib.length (lib.unique tokens) == lib.length tokens;
+        message =
+          "nixlaunch.machines: names and aliases must be unique case-insensitively -- the search "
+          + "box resolves them case-insensitively and takes the first match, so a collision makes "
+          + "one column unreachable by name.";
+      }
+      {
+        assertion = lib.all
+          (folder: folder != "Other" && lib.elem folder cfg.folders)
+          (lib.attrNames cfg.subrows);
+        message =
+          "nixlaunch.subrows: every key must name a configured folder other than Other -- an "
+          + "unknown key is otherwise silently discarded.";
+      }
+      {
+        assertion =
           let names = map (m: m.name) cfg.machines;
           in lib.length (lib.unique names) == lib.length names;
         message =
@@ -367,10 +468,10 @@ in
           # forwarded sessions to other machines, which take a visible moment to rebuild and are
           # the last thing anyone expects a launcher restart to touch.
           #
-          # The launcher already detaches what it starts with setsid, which is what makes an
-          # application outlive the launcher PROCESS. That is a process group, and systemd does not
-          # kill by process group; it kills by cgroup, which setsid does not escape. The two
-          # mechanisms look interchangeable and are not.
+          # The normal launch path asks systemd for a transient user scope, which moves the
+          # application into a different cgroup. Its fallback only creates a new process group;
+          # systemd does not kill by process group, and the two mechanisms are not interchangeable.
+          # Keeping KillMode=process protects that fallback on an older or degraded user session.
           KillMode = "process";
         };
         Install.WantedBy = [ "graphical-session.target" ];
@@ -381,8 +482,10 @@ in
     # schema, so anything that type-checks here serialises correctly by construction and there is
     # no second place for the two to disagree.
     xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
-      inherit (cfg) folders subrows terminal keyboard;
-      machines = map (m: { inherit (m) name aliases accent inventory launch; }) cfg.machines;
-    } // lib.optionalAttrs (cfg.theme != { }) { inherit (cfg) theme; });
+      inherit (cfg) folders subrows terminal keyboard surface exit_on_focus_loss keys theme;
+      machines = map
+        (m: { inherit (m) name aliases accent inventory inventory_timeout_ms launch; })
+        cfg.machines;
+    });
   };
 }

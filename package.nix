@@ -1,11 +1,14 @@
 # package.nix — the build, kept separate from flake.nix so a consumer can `callPackage` it with
 # their own pkgs rather than being forced through this flake's nixpkgs pin.
 { lib
+, stdenv
 , rustPlatform
 , pkg-config
 , gtk4
 , gtk4-layer-shell
 , wrapGAppsHook4
+, clippy
+, rustfmt
 }:
 
 rustPlatform.buildRustPackage {
@@ -20,7 +23,7 @@ rustPlatform.buildRustPackage {
     # and the package rebuilds because a note changed.
     filter = path: type:
       let base = baseNameOf path; in
-      !(lib.hasPrefix "." base || base == "target" || base == "result");
+        !(lib.hasPrefix "." base || base == "target" || base == "result");
   };
 
   cargoLock.lockFile = ./Cargo.lock;
@@ -30,7 +33,17 @@ rustPlatform.buildRustPackage {
   # starts and then fails at the first icon lookup, which looks like a broken icon theme rather
   # than a packaging mistake.
   nativeBuildInputs = [ pkg-config wrapGAppsHook4 ];
+  nativeCheckInputs = [ clippy rustfmt ];
   buildInputs = [ gtk4 gtk4-layer-shell ];
+
+  # Keep style and linting in the SAME gate as the build. CI runs `nix flake check`; putting these
+  # here means a green package has compiled, tested, formatted, and passed clippy rather than
+  # relying on a separate workflow step that can drift away from the derivation developers use.
+  postCheck = ''
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets --all-features --profile release \
+      --target ${stdenv.targetPlatform.rust.rustcTargetSpec} --offline -- -D warnings
+  '';
 
   # THE CAIRO RENDERER, BY DEFAULT.
   #

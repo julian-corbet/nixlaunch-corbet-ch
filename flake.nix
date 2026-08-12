@@ -31,6 +31,18 @@
 
         # The module's own behaviour, evaluated -- see checks/module.nix for what and why.
         module = import ./checks/module.nix { inherit pkgs; lib = pkgs.lib; };
+
+        format = pkgs.runCommand "nixlaunch-nix-format"
+          {
+            nativeBuildInputs = [ pkgs.nixpkgs-fmt ];
+            src = ./.;
+          } ''
+          cp -r "$src" source
+          chmod -R u+w source
+          cd source
+          nixpkgs-fmt --check flake.nix package.nix home/nixlaunch.nix checks/module.nix
+          touch "$out"
+        '';
       });
 
       formatter = forAll (pkgs: pkgs.nixpkgs-fmt);

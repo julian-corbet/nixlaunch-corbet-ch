@@ -34,6 +34,11 @@ pub enum Action {
     LaunchLine,
     /// Start everything in the current box.
     LaunchCell,
+    /// Preserve the default contextual gesture: start the cell while outside it, or the selected
+    /// line while inside it. Explicit `launch-line` and `launch-cell` bindings never change meaning
+    /// with focus; this action exists so the default Shift+Return behavior can remain contextual
+    /// without consulting the physical Shift modifier after the keymap has decoded it.
+    LaunchSelection,
     /// In when outside, out when inside.
     ToggleInside,
     /// Straight out to the grid, wherever you are.
@@ -65,7 +70,7 @@ impl Default for Keymap {
             ("up", Action::MoveUp),
             ("down", Action::MoveDown),
             ("return", Action::Enter),
-            ("shift+return", Action::LaunchLine),
+            ("shift+return", Action::LaunchSelection),
             ("tab", Action::ToggleInside),
             ("shift+tab", Action::GoOutside),
             ("escape", Action::Cancel),
@@ -115,7 +120,12 @@ impl Keymap {
     /// differently and nobody can see why.
     pub fn chord(key: &str, ctrl: bool, alt: bool, shift: bool, logo: bool) -> String {
         let mut out = String::new();
-        for (held, name) in [(ctrl, "ctrl"), (alt, "alt"), (shift, "shift"), (logo, "super")] {
+        for (held, name) in [
+            (ctrl, "ctrl"),
+            (alt, "alt"),
+            (shift, "shift"),
+            (logo, "super"),
+        ] {
             if held {
                 out.push_str(name);
                 out.push('+');
@@ -161,7 +171,7 @@ mod tests {
     fn the_defaults_are_what_was_hardcoded() {
         let k = Keymap::default();
         assert_eq!(k.action("left"), Some(Action::MoveLeft));
-        assert_eq!(k.action("shift+return"), Some(Action::LaunchLine));
+        assert_eq!(k.action("shift+return"), Some(Action::LaunchSelection));
         assert_eq!(k.action("escape"), Some(Action::Cancel));
     }
 
@@ -178,7 +188,7 @@ mod tests {
     fn modifier_order_does_not_matter() {
         let k = Keymap::default();
         assert_eq!(k.action("shift+tab"), k.action("tab+shift"));
-        assert_eq!(k.action("shift+return"), Some(Action::LaunchLine));
+        assert_eq!(k.action("shift+return"), Some(Action::LaunchSelection));
     }
 
     #[test]
@@ -196,7 +206,11 @@ mod tests {
         o.insert("ctrl+n".to_string(), Some(Action::MoveDown));
         let k = Keymap::from_overrides(&o);
         assert_eq!(k.action("ctrl+n"), Some(Action::MoveDown));
-        assert_eq!(k.action("escape"), Some(Action::Cancel), "the rest survived");
+        assert_eq!(
+            k.action("escape"),
+            Some(Action::Cancel),
+            "the rest survived"
+        );
     }
 
     /// And unbinding is possible, or a key bound by default could never be made to type.
@@ -223,7 +237,11 @@ mod tests {
         }
         let k = Keymap::from_overrides(&o);
         assert_eq!(k.action("ctrl+j"), Some(Action::MoveDown));
-        assert_eq!(k.action("down"), Some(Action::MoveDown), "arrows still work");
+        assert_eq!(
+            k.action("down"),
+            Some(Action::MoveDown),
+            "arrows still work"
+        );
         // And plain h still types, so searching for "helix" is unaffected.
         assert_eq!(k.action("h"), None);
     }

@@ -61,6 +61,7 @@ pub fn parse_inventory(bytes: &[u8]) -> Result<Inventory, String> {
 /// exists only in a state file cannot be reviewed, copied to another machine, or explained.
 /// Dragging still works and still wins: it writes to placement, which is applied after this.
 #[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SubRow {
     pub name: String,
     /// Matched case-insensitively as a SUBSTRING of the application's id or its display name, so
@@ -110,6 +111,7 @@ pub struct InventoryApp {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MachineConfig {
     pub name: String,
     /// Shorter things this machine answers to when typed in the search box.
@@ -127,6 +129,11 @@ pub struct MachineConfig {
     /// argv that prints an `Inventory` as JSON on stdout. NOT a shell string: a list cannot be
     /// re-split on spaces by accident, and a machine name with a space in it stays one argument.
     pub inventory: Vec<String>,
+    /// Maximum time one inventory command may run. Inventory is arbitrary external code and an
+    /// unreachable machine is normal; without a bound, one wedged command can keep a cold start
+    /// waiting forever and can leak one refresh worker on every reopen.
+    #[serde(default = "default_inventory_timeout_ms")]
+    pub inventory_timeout_ms: u64,
     /// argv template for launching one app. `{}` is replaced by the app's own Exec. Absent means
     /// this machine cannot launch anything, which is a legitimate read-only column.
     #[serde(default)]
@@ -149,6 +156,10 @@ fn default_accent() -> String {
     "#22C55E".to_string()
 }
 
+fn default_inventory_timeout_ms() -> u64 {
+    5_000
+}
+
 /// The palette, as VALUES rather than as code.
 ///
 /// The defaults below are a working dark set so the launcher is usable the moment it is installed
@@ -159,7 +170,7 @@ fn default_accent() -> String {
 /// Welding these into the stylesheet was the original mistake: a colour no consumer can reach is
 /// this repo carrying one estate's taste as though it were a property of launchers.
 #[derive(Deserialize, Debug, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Theme {
     pub ground: String,
     pub surface: String,
@@ -178,7 +189,6 @@ pub struct Theme {
     /// somebody's mark by default would be wearing it.
 
     #[serde(default)]
-
     pub logo: String,
 
     /// How large that image is drawn. Separate from `icon_size` because the corner has a whole
@@ -186,7 +196,6 @@ pub struct Theme {
     /// header row to fill while an application icon has to sit inside a line of text.
 
     #[serde(default = "default_logo_size")]
-
     pub logo_size: i32,
     /// Apps per line when packing a fresh inventory. Taste, not mechanism: it is how many
     /// left/right steps a row costs before up/down is the faster move, and the answer depends on
@@ -236,6 +245,7 @@ impl Default for Theme {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub machines: Vec<MachineConfig>,
     /// "layer" (default) or "window".
@@ -277,7 +287,7 @@ pub struct Config {
     /// Not guessed, and not defaulted to some popular emulator: the right answer is whatever
     /// terminal this desktop already uses, and a launcher that opened a DIFFERENT one than every
     /// other part of the session would be wrong in a way nobody would think to look for. Empty
-    /// means such programs are launched bare, which is what happens today and why they die.
+    /// means such programs are refused with an error rather than launched invisibly and lost.
     #[serde(default)]
     pub terminal: Vec<String>,
     #[serde(default)]
@@ -308,23 +318,80 @@ pub struct Config {
     /// unnamed lines above them, so declaring a sub-row never hides anything.
 
     #[serde(default)]
-
     pub subrows: std::collections::HashMap<String, Vec<SubRow>>,
-
 
     /// Key bindings, as chord -> action. Overrides the defaults rather than replacing them, and a
 
-
     /// null action unbinds -- see `keymap` for why both matter.
 
-
     #[serde(default)]
-
-
     pub keys: std::collections::HashMap<String, Option<crate::keymap::Action>>,
 }
 
 impl Config {
+    /// Refuse values that would otherwise fail later as a blank surface, an index panic, or an
+    /// ambiguous machine qualifier. The Home Manager module catches the same shapes at evaluation;
+    /// the binary must still protect direct JSON consumers.
+    pub fn validate(self) -> Result<Self, String> {
+        if !matches!(self.surface.as_str(), "layer" | "window") {
+            return Err(format!(
+                "surface must be `layer` or `window`, got {:?}",
+                self.surface
+            ));
+        }
+        if !matches!(self.keyboard.as_str(), "exclusive" | "ondemand" | "none") {
+            return Err(format!(
+                "keyboard must be `exclusive`, `ondemand`, or `none`, got {:?}",
+                self.keyboard
+            ));
+        }
+        if self.theme.icon_size <= 0 || self.theme.logo_size <= 0 || self.theme.width <= 0 {
+            return Err("theme icon_size, logo_size, and width must be positive".to_string());
+        }
+        if self.theme.line_width == 0 {
+            return Err("theme.line_width must be positive".to_string());
+        }
+        for (name, value) in [
+            ("max_height_fraction", self.theme.max_height_fraction),
+            ("max_width_fraction", self.theme.max_width_fraction),
+        ] {
+            if !(0.0 < value && value <= 1.0) {
+                return Err(format!("theme.{name} must be greater than 0 and at most 1"));
+            }
+        }
+        if self.machines.iter().any(|m| m.name.trim().is_empty()) {
+            return Err("machine names must not be empty".to_string());
+        }
+        if self.machines.iter().any(|m| m.inventory.is_empty()) {
+            return Err("every machine needs an inventory command".to_string());
+        }
+        if self.machines.iter().any(|m| m.inventory_timeout_ms == 0) {
+            return Err("machine inventory_timeout_ms must be positive".to_string());
+        }
+
+        let mut tokens = std::collections::HashMap::<String, String>::new();
+        for machine in &self.machines {
+            for token in std::iter::once(&machine.name).chain(machine.aliases.iter()) {
+                let normal = token.to_lowercase();
+                if let Some(first) = tokens.insert(normal, machine.name.clone()) {
+                    return Err(format!(
+                        "machine names and aliases must be unique case-insensitively; {:?} collides between {first:?} and {:?}",
+                        token, machine.name
+                    ));
+                }
+            }
+        }
+
+        for folder in self.subrows.keys() {
+            if folder == "Other" || !self.folders.iter().any(|f| f == folder) {
+                return Err(format!(
+                    "subrows.{folder} has no declared folder; subrows must belong to a configured folder other than Other"
+                ));
+            }
+        }
+        Ok(self)
+    }
+
     /// Row labels, with the inbox guaranteed present and last.
     pub fn folder_rows(&self) -> Vec<String> {
         // DEDUPED, first occurrence wins. A repeated label is not merely untidy: rows are matched
@@ -342,11 +409,12 @@ impl Config {
         // existed: those entries are keyed on the bare folder name and still land in it.
         let mut seen = std::collections::HashSet::new();
         let mut rows: Vec<String> = Vec::new();
-        let push = |rows: &mut Vec<String>, r: String, seen: &mut std::collections::HashSet<String>| {
-            if seen.insert(r.clone()) {
-                rows.push(r);
-            }
-        };
+        let push =
+            |rows: &mut Vec<String>, r: String, seen: &mut std::collections::HashSet<String>| {
+                if seen.insert(r.clone()) {
+                    rows.push(r);
+                }
+            };
         for f in self.folders.iter().filter(|f| f.as_str() != "Other") {
             for sub in self.subrows.get(f).into_iter().flatten() {
                 push(&mut rows, format!("{f}/{}", sub.name), &mut seen);
@@ -375,13 +443,19 @@ pub fn config_path() -> Option<PathBuf> {
 /// situation entirely and must not be silently ignored: returning the error lets the caller say so
 /// rather than pretending the machine list is empty.
 pub fn load() -> Result<Option<Config>, String> {
-    let Some(path) = config_path() else { return Ok(None) };
+    let Some(path) = config_path() else {
+        return Ok(None);
+    };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    serde_json::from_str(&text).map(Some).map_err(|e| format!("{}: {e}", path.display()))
+    serde_json::from_str::<Config>(&text)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .validate()
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -390,20 +464,16 @@ mod tests {
 
     #[test]
     fn other_is_appended_when_absent() {
-        let c: Config = serde_json::from_str(
-            r#"{"machines":[],"folders":["Terminals","Editors"]}"#,
-        )
-        .unwrap();
+        let c: Config =
+            serde_json::from_str(r#"{"machines":[],"folders":["Terminals","Editors"]}"#).unwrap();
         assert_eq!(c.folder_rows(), vec!["Terminals", "Editors", "Other"]);
     }
 
     /// A repeated label would make every app in that folder appear in two rows at once.
     #[test]
     fn duplicate_folders_are_deduped() {
-        let c: Config = serde_json::from_str(
-            r#"{"machines":[],"folders":["Chat","Editors","Chat"]}"#,
-        )
-        .unwrap();
+        let c: Config =
+            serde_json::from_str(r#"{"machines":[],"folders":["Chat","Editors","Chat"]}"#).unwrap();
         assert_eq!(c.folder_rows(), vec!["Chat", "Editors", "Other"]);
     }
 
@@ -417,13 +487,19 @@ mod tests {
 
     #[test]
     fn a_machine_needs_only_a_name_and_an_inventory_command() {
-        let c: Config = serde_json::from_str(
-            r#"{"machines":[{"name":"box","inventory":["echo","{}"]}]}"#,
-        )
-        .unwrap();
+        let c: Config =
+            serde_json::from_str(r#"{"machines":[{"name":"box","inventory":["echo","{}"]}]}"#)
+                .unwrap();
         assert_eq!(c.machines[0].name, "box");
         assert_eq!(c.machines[0].accent, "#22C55E", "accent defaulted");
-        assert!(c.machines[0].launch.is_empty(), "a read-only column is legitimate");
+        assert_eq!(
+            c.machines[0].inventory_timeout_ms, 5_000,
+            "timeout defaulted"
+        );
+        assert!(
+            c.machines[0].launch.is_empty(),
+            "a read-only column is legitimate"
+        );
     }
 
     /// The inventory contract is exactly what `rlaunch --json` already prints.
@@ -449,5 +525,34 @@ mod tests {
                 .unwrap();
         assert_eq!(inv.error.as_deref(), Some("ssh: timed out"));
         assert!(inv.folders.is_empty());
+    }
+
+    #[test]
+    fn unknown_config_fields_are_errors_not_silent_typos() {
+        let error = serde_json::from_str::<Config>(r#"{"machines":[],"widht":500}"#).unwrap_err();
+        assert!(error.to_string().contains("unknown field `widht`"));
+    }
+
+    #[test]
+    fn machine_names_and_aliases_cannot_collide_by_case() {
+        let config: Config = serde_json::from_str(
+            r#"{"machines":[
+                {"name":"Server","inventory":["true"]},
+                {"name":"laptop","aliases":["server"],"inventory":["true"]}
+            ]}"#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("unique case-insensitively"), "{error}");
+    }
+
+    #[test]
+    fn invalid_dimensions_are_rejected_before_the_ui_uses_them() {
+        let config: Config = serde_json::from_str(
+            r#"{"machines":[],"theme":{"line_width":0,"max_height_fraction":1.5}}"#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("line_width"), "{error}");
     }
 }

@@ -101,9 +101,22 @@ nixlaunch = {
   enable  = true;
   folders = [ "Terminals" "Editors" "Browsers" "Chat" ];   # priority order
   machines = [                                             # column order
-    { name = "laptop";      accent = "#166534"; inventory = [ "rlaunch" "--json" "laptop" ]; }
-    { name = "workstation"; accent = "#B45309"; inventory = [ "rlaunch" "--json" "work" ]; }
+    {
+      name = "laptop";
+      accent = "#166534";
+      inventory = [ "rlaunch" "--json" "laptop" ];
+      launch = [ "{}" ];                                  # explicit local execution
+    }
+    {
+      name = "workstation";
+      aliases = [ "work" ];
+      accent = "#B45309";
+      inventory = [ "rlaunch" "--json" "work" ];
+      inventory_timeout_ms = 5000;
+      launch = [ "waypipe@work" ];                         # argv prefix for remote execution
+    }
   ];
+  terminal = [ "foot" "-e" ];
 };
 ```
 
@@ -116,9 +129,27 @@ change behaviour.
 and a path containing one would fail in a way that looks like an unreachable machine rather than a
 quoting bug.
 
+`launch` is deliberately explicit. An empty list makes a machine read-only; `[ "{}" ]` substitutes
+the inventory entry's `Exec` directly for local execution. A template such as
+`[ "ssh" "work" "{}" ]` substitutes it at that position, while a list without `{}` is an argv
+prefix. Programs declaring `Terminal=true` are refused unless `terminal` names an emulator, so a
+launch never succeeds invisibly.
+
+The Home Manager module also exposes typed `theme`, `surface`, `keyboard`, `keys`, `subrows`, and
+focus-loss options. Key overrides extend the defaults, `null` unbinds one chord, and the explicit
+`launch-line` and `launch-cell` actions retain their meaning in either focus mode. The default
+`launch-selection` remains contextual: cell outside, line inside.
+
+With `daemon.enable = true`, the service starts hidden. A reveal maps the cached grid immediately
+and refreshes every inventory in background; the newest refresh wins, and each command is bounded
+by `inventory_timeout_ms`. Configuration is one coherent startup snapshot, so a Home Manager
+activation restarts the service rather than partially applying a new file to an old process.
+
 ## Status
 
-Working and in daily use against real inventories. Not yet packaged for anything but Nix.
+Working and in daily use against real inventories. The flake provides the Nix package and Home
+Manager module; `packaging/PKGBUILD` provides the native Arch build used when sharing the distro's
+already-resident GTK libraries matters more than a Nix store closure.
 
 Known gaps, stated rather than hidden:
 
@@ -126,26 +157,26 @@ Known gaps, stated rather than hidden:
   "Firefox on one box" is not the same object as "Firefox on another" — a launcher cannot move an
   application between machines, so a drag that looked like it did would be lying about what
   happened.
-- The launch path is wired for the inventory's own `exec`; per-machine `launch` prefixes are
-  declared but not yet exercised on every path.
 
 ## Speed
 
 A launcher is judged on the gap between the keystroke and the window, so the startup path is
-measured rather than assumed. On a three-machine, 191-application inventory:
+measured rather than assumed. On the 191-application reference inventory, a distro-linked GTK+cairo
+build reached its first draw in about 0.10 s when inventory was served locally. Remote inventory is
+the variable cost:
 
 | Phase | Cost | Why it is what it is |
 |---|---|---|
-| exec, dynamic link, GTK init | ~85 ms | The floor. GTK4 is not a small library. |
-| inventory | bounded by the **slowest** machine | One thread per machine. Sequentially this was the sum — 66 + 269 + 324 ms, because two of the three are SSH round trips. |
-| build the grid | ~400 ms | ~900 widgets. The one that still wants work. |
+| exec, dynamic link, GTK init, first draw | ~0.10 s locally | Distro-linked GTK+cairo, measured headlessly. |
+| cold remote inventory | bounded by the **slowest** machine | One worker per machine; sequentially this was 66 + 269 + 324 ms. |
+| resident reveal | cached grid first | Inventory refresh happens asynchronously and cannot block GTK. |
 
 Three things follow from those numbers, and they are the reason the code looks the way it does:
 
 **Concurrency buys exactly one thing.** Asking the machines is the only part that waits on something
-external, so it is the only part threaded. Everything after it is GTK, which is single-threaded by
-construction — no amount of parallelism touches it, and the cost there has to come out of doing less
-work instead.
+external, so it is the only part threaded. Both output pipes are drained while each command runs,
+responses are size-capped, and a timeout kills its process group. Everything after it is GTK, which
+is single-threaded by construction.
 
 **The cairo renderer, by default.** GTK4 picks its GSK renderer by probing the GPU and chooses Vulkan
 where one is available. For a program that draws boxes, labels and icons that is device init, shader
