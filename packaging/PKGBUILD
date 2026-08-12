@@ -36,11 +36,13 @@ url="https://github.com/julian-corbet/nixlaunch-corbet-ch"
 license=('MIT')
 depends=('gtk4' 'gtk4-layer-shell')
 makedepends=('cargo' 'pkgconf')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+_commit=c5a2a9be4053a2ab150a2d4de5f98ec51cb78849
+_srcdir="$pkgname-corbet-ch-$_commit"
+source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz")
+sha256sums=('bbd5ad7d04a2654db0a57464eff752e5c61548cab53ba92084845b964b48aef9')
 
 prepare() {
-  cd "$pkgname-corbet-ch-$pkgver"
+  cd "$_srcdir"
   # Vendor with the target already selected, so the build itself needs no network -- which is what
   # makes this reproducible in a clean chroot rather than only on a developer's machine.
   export RUSTUP_TOOLCHAIN=stable
@@ -48,7 +50,7 @@ prepare() {
 }
 
 build() {
-  cd "$pkgname-corbet-ch-$pkgver"
+  cd "$_srcdir"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   # The layer-shell module is `gtk4-layer-shell-0`, not `gtk4-layer-shell`. Worth stating because
@@ -59,14 +61,14 @@ build() {
 }
 
 check() {
-  cd "$pkgname-corbet-ch-$pkgver"
+  cd "$_srcdir"
   export RUSTUP_TOOLCHAIN=stable
   # The suite is pure model and cache logic -- no display needed, and none available in a chroot.
   cargo test --frozen --release
 }
 
 package() {
-  cd "$pkgname-corbet-ch-$pkgver"
+  cd "$_srcdir"
   install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
   install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
