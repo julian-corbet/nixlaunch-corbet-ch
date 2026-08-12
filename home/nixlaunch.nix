@@ -261,16 +261,29 @@ in
 
       command = lib.mkOption {
         type = lib.types.listOf lib.types.str;
-        default = [ "nixlaunch" "--daemon" ];
-        example = [ "/usr/bin/nixlaunch" "--daemon" ];
+        default =
+          if cfg.package != null
+          then [ "${cfg.package}/bin/nixlaunch" "--daemon" ]
+          else [ "/usr/bin/nixlaunch" "--daemon" ];
+        defaultText = lib.literalExpression ''
+          if config.nixlaunch.package != null
+          then [ "''${config.nixlaunch.package}/bin/nixlaunch" "--daemon" ]
+          else [ "/usr/bin/nixlaunch" "--daemon" ]
+        '';
+        example = [ "/opt/nixlaunch/bin/nixlaunch" "--daemon" ];
         description = ''
           argv for the resident process.
 
-          A bare name by default, resolved against the unit's own PATH. Hosts that take the
-          binary from their distro rather than from this module (see `package`) should give the
-          absolute path, for the same reason every other command on this plane does: a unit does
-          not inherit a login shell's PATH, and the failure looks like the service silently not
-          existing rather than like a missing binary.
+          ALWAYS ABSOLUTE, because a systemd unit does not inherit a login shell's PATH, and the
+          failure mode of getting that wrong is not a missing binary — it is `status=203/EXEC`
+          every three seconds, forever, in a unit nobody is looking at.
+
+          The default derives from `package`, which is the only thing that actually knows where
+          the binary is: set it, and this is that store path, with the dependency the store path
+          implies; leave it null and the host is providing its own, which every Linux distribution
+          puts in `/usr/bin`. Both halves are right without anyone having to say so, which matters
+          because the same values file usually serves hosts of both kinds — one absolute path
+          written by hand is correct on some of them and silently wrong on the rest.
         '';
       };
     };
@@ -322,6 +335,21 @@ in
           # start before one exists.
           After = [ "graphical-session.target" ];
           PartOf = [ "graphical-session.target" ];
+
+          # AND IT GIVES UP. `Restart=on-failure` with no limit is an infinite loop, which is not
+          # what "on failure" sounds like it means: a permanently broken ExecStart -- a wrong path,
+          # a binary that is not installed -- retries every RestartSec until the session ends.
+          # Observed, not theorised: a daemon command that was absolute but pointed at the wrong
+          # distribution's location restarted 14,723 times over about twelve hours, on a host
+          # nobody happened to be looking at, and the only evidence was a line in the journal that
+          # said the same thing 14,723 times.
+          #
+          # Five attempts is generous for the transient case this restart exists for -- a
+          # compositor socket that is not up yet -- and instantly diagnostic for the permanent one,
+          # because a unit in `failed` is visible and a unit in `activating (auto-restart)` looks
+          # for all the world like it is starting.
+          StartLimitIntervalSec = 60;
+          StartLimitBurst = 5;
         };
         Service = {
           ExecStart = lib.escapeShellArgs cfg.daemon.command;
