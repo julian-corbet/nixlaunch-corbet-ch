@@ -113,6 +113,13 @@ pub const DEFAULT_FOLDERS: &[&str] = &[
 /// the arrangement of everything around it.
 pub type Placement = HashMap<String, HashMap<String, Vec<StoredLine>>>;
 
+/// Applications the user chose not to see: machine -> stable application ids.
+///
+/// Separate from placement because the decisions are independent. Hiding an application must not
+/// forget which shelf or position it had; resetting visibility should reveal the exact arrangement
+/// that was there before, not ask the inventory grouping to place it again.
+pub type Visibility = HashMap<String, HashSet<String>>;
+
 /// One arranged line as it is written down: the apps on it, and its name if it has one.
 ///
 /// ── READS THE OLD SHAPE TOO, AND THAT IS THE WHOLE REASON FOR THE UNTAGGED ENUM ─────────────
@@ -167,12 +174,20 @@ impl StoredLine {
 /// STATE, not config: a record of what the user did, written by the program itself, so it belongs
 /// under XDG_STATE_HOME and emphatically not in the Nix store or a config file a rebuild would
 /// overwrite. "This should be permanent" is the whole requirement.
-pub fn placement_path() -> PathBuf {
+fn state_path(name: &str) -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("nixlaunch").join("placement.json")
+    base.join("nixlaunch").join(name)
+}
+
+pub fn placement_path() -> PathBuf {
+    state_path("placement.json")
+}
+
+pub fn visibility_path() -> PathBuf {
+    state_path("visibility.json")
 }
 
 /// A MISSING file is an empty arrangement; a file that exists and does not parse is not, and the
@@ -209,6 +224,27 @@ pub fn save_placement(p: &Placement) {
         return;
     }
     write_atomic(&placement_path(), p);
+}
+
+/// Visibility follows the same fail-closed persistence rule as placement: a malformed existing
+/// file is an error, not permission to replace the user's hidden set with an empty one.
+pub fn load_visibility() -> (Visibility, Option<String>) {
+    let path = visibility_path();
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Visibility::new(), None),
+        Err(e) => (Visibility::new(), Some(format!("{}: {e}", path.display()))),
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(v) => (v, None),
+            Err(e) => (Visibility::new(), Some(format!("{}: {e}", path.display()))),
+        },
+    }
+}
+
+pub fn save_visibility(v: &Visibility) {
+    if cfg!(test) {
+        return;
+    }
+    write_atomic(&visibility_path(), v);
 }
 
 pub fn write_atomic<T: serde::Serialize>(path: &std::path::Path, value: &T) {
@@ -257,6 +293,12 @@ pub struct State {
     pub placement: Placement,
     /// The placement analogue of `usage_writable`; see `load_placement`.
     pub placement_writable: bool,
+    /// Per-machine application ids the user explicitly hid. This filters the derived grid only;
+    /// `base` and `placement` stay pristine so reset can restore both membership and position.
+    pub visibility: Visibility,
+    /// False when an existing visibility file could not be read or parsed. In-memory hiding may
+    /// continue for the session, but must not overwrite state whose contents we could not recover.
+    pub visibility_writable: bool,
     /// `base` with `placement` applied. Filtered into `view`.
     pub machines: Vec<Machine>,
     /// `machines` with the query applied. Navigation and rendering BOTH read this, so the cursor
@@ -327,6 +369,53 @@ impl State {
         if self.usage_writable {
             usage::save(&self.usage);
         }
+    }
+
+    /// Hide one real application on one machine. Identity is machine + provider id, the same pair
+    /// placement and usage use; display names are neither stable nor necessarily unique.
+    pub fn hide_app(&mut self, machine: &str, app: &str) -> bool {
+        let known = self.base.iter().any(|m| {
+            m.name == machine
+                && m.cells
+                    .iter()
+                    .flatten()
+                    .flat_map(|line| line.apps.iter())
+                    .any(|candidate| candidate.id == app)
+        });
+        if !known {
+            return false;
+        }
+        let changed = self
+            .visibility
+            .entry(machine.to_string())
+            .or_default()
+            .insert(app.to_string());
+        if !changed {
+            return false;
+        }
+        if self.visibility_writable {
+            save_visibility(&self.visibility);
+        }
+        self.rebuild();
+        true
+    }
+
+    /// Reveal every hidden application. One reset rather than machine/folder variants keeps the
+    /// recovery gesture absolute: it is impossible to forget which scope still hides something.
+    pub fn reset_visibility(&mut self) -> bool {
+        if self.visibility.is_empty() {
+            return false;
+        }
+        self.visibility.clear();
+        if self.visibility_writable {
+            save_visibility(&self.visibility);
+        }
+        self.rebuild();
+        true
+    }
+
+    pub fn hidden_count(&self) -> usize {
+        self.visibility.values().map(HashSet::len).sum()
     }
 
     /// Rewrite state written when placement and usage were keyed on the DISPLAY NAME.
@@ -419,6 +508,7 @@ impl State {
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
         self.machines = apply_placement(&self.base, &self.placement, &self.folders);
+        apply_visibility(&mut self.machines, &self.visibility);
         collapse_library_rows(&mut self.machines, &self.folders, &self.library_folders);
         // Placement decides MEMBERSHIP -- which folder, which line. Usage decides ORDER within
         // that, and only where the evidence justifies a move. Running it here rather than baking
@@ -960,6 +1050,23 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
         .collect()
 }
 
+/// Remove hidden ids from the derived grid without touching inventory or placement. Empty unnamed
+/// lines disappear with their last app; named rows remain valid drop targets, exactly as they do
+/// when their last application is dragged elsewhere.
+pub fn apply_visibility(machines: &mut [Machine], visibility: &Visibility) {
+    for machine in machines {
+        let Some(hidden) = visibility.get(&machine.name) else {
+            continue;
+        };
+        for cell in &mut machine.cells {
+            for line in cell.iter_mut() {
+                line.apps.retain(|app| !hidden.contains(&app.id));
+            }
+            cell.retain(|line| !line.apps.is_empty() || line.name.is_some());
+        }
+    }
+}
+
 /// A library row is one vector even when ordinary inventory wrapping or an older placement file
 /// supplied several lines. The transformation is deliberately view/model-only: placement remains
 /// valid old data, and the next deliberate drag materialises the single vector through the normal
@@ -1234,6 +1341,8 @@ mod tests {
             base: machines,
             placement: Placement::new(),
             placement_writable: true,
+            visibility: Visibility::new(),
+            visibility_writable: true,
             machines: Vec::new(),
             view: Vec::new(),
             col: 0,
@@ -2139,6 +2248,50 @@ mod tests {
         let back: Placement = serde_json::from_str(&text).unwrap();
         assert_eq!(back, p);
         assert_eq!(back["m"]["Chat"][1].name(), None);
+    }
+
+    #[test]
+    fn hiding_is_per_machine_and_keeps_the_inventory_pristine() {
+        let mut s = state(vec![
+            machine("laptop", 0, vec![vec!["shared", "local"]]),
+            machine("workstation", 0, vec![vec!["shared", "remote"]]),
+        ]);
+
+        assert!(s.hide_app("laptop", "shared"));
+
+        let visible = |machine: &Machine| {
+            machine
+                .cells
+                .iter()
+                .flatten()
+                .flat_map(|line| line.apps.iter())
+                .map(|app| app.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible(&s.view[0]), vec!["local"]);
+        assert_eq!(visible(&s.view[1]), vec!["shared", "remote"]);
+        assert_eq!(
+            visible(&s.base[0]),
+            vec!["shared", "local"],
+            "visibility is a view over inventory, never an inventory mutation"
+        );
+        assert_eq!(s.hidden_count(), 1);
+    }
+
+    #[test]
+    fn resetting_visibility_restores_the_exact_saved_placement() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["alpha", "beta"]])]);
+        s.place_app(0, "alpha", 1, None, None);
+        let placement = s.placement.clone();
+
+        assert!(s.hide_app("m", "alpha"));
+        assert_eq!(s.placement, placement, "hiding did not rewrite the shelf");
+        assert!(s.view[0].cells[1].is_empty(), "alpha is invisible");
+
+        assert!(s.reset_visibility());
+        assert_eq!(s.hidden_count(), 0);
+        assert_eq!(s.placement, placement, "reset did not rewrite the shelf");
+        assert_eq!(s.view[0].cells[1][0].apps[0].id, "alpha");
     }
 
     /// A named row survives being emptied. It is part of the taxonomy, not a by-product of its

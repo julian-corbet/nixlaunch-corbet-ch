@@ -387,10 +387,16 @@ fn build(application: &Application) {
     // A placement that exists and does not parse is reported, never assumed empty: the next drag
     // rewrites whatever we decide it was, so guessing "nothing" would overwrite a real arrangement.
     let (placement, placement_error) = load_placement();
+    let (visibility, visibility_error) = load_visibility();
     let (loaded_usage, usage_error) = usage::load();
     let placement_writable = placement_error.is_none();
+    let visibility_writable = visibility_error.is_none();
     let usage_writable = usage_error.is_none();
-    let startup_error = config_error.clone().or(placement_error).or(usage_error);
+    let startup_error = config_error
+        .clone()
+        .or(placement_error)
+        .or(visibility_error)
+        .or(usage_error);
 
     // NO default size. A launcher should be exactly as big as what it is showing: a fixed size
     // leaves dead space under a short grid and clips a tall one, and BOTH are wrong for a surface
@@ -476,6 +482,8 @@ fn build(application: &Application) {
         base,
         placement,
         placement_writable,
+        visibility,
+        visibility_writable,
         machines: Vec::new(),
         view: Vec::new(),
         col: 0,
@@ -739,16 +747,28 @@ fn build(application: &Application) {
                 search.remove_css_class("empty");
             }
 
-            hint.set_markup(match (s.focus, s.is_library_row(s.row)) {
-                (Focus::Outside, false) =>
-                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> folder   <b>Tab</b>/<b>Enter</b> go inside   <b>Shift+Enter</b> launch the whole cell   <b>drag</b> onto a folder to file  \u{2022}  onto a line to join/reorder it   <b>Esc</b> close",
-                (Focus::Inside, false) =>
-                    "<b>\u{2190}\u{2192}</b> app   <b>\u{2191}\u{2193}</b> line (appset)   <b>Enter</b> launch app   <b>Shift+Enter</b> launch the line   <b>Tab</b>/<b>Esc</b> back out",
-                (Focus::Outside, true) =>
-                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> shelf   <b>Tab</b>/<b>Enter</b>/<b>Shift+Enter</b> browse shelf   <b>drag</b> to file/reorder   <b>Esc</b> close",
-                (Focus::Inside, true) =>
-                    "<b>\u{2190}\u{2192}</b> title   <b>Enter</b>/<b>Shift+Enter</b> launch title   <b>Tab</b>/<b>Esc</b> back out",
-            });
+            let base_hint = match (s.focus, s.is_library_row(s.row)) {
+                (Focus::Outside, false) => {
+                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> folder   <b>Tab</b>/<b>Enter</b> go inside   <b>Shift+Enter</b> launch the whole cell   <b>drag</b> onto a folder to file  \u{2022}  onto a line to join/reorder it   <b>Esc</b> close"
+                }
+                (Focus::Inside, false) => {
+                    "<b>\u{2190}\u{2192}</b> app   <b>\u{2191}\u{2193}</b> line (appset)   <b>Enter</b> launch app   <b>Shift+Enter</b> launch the line   <b>Tab</b>/<b>Esc</b> back out"
+                }
+                (Focus::Outside, true) => {
+                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> shelf   <b>Tab</b>/<b>Enter</b>/<b>Shift+Enter</b> browse shelf   <b>drag</b> to file/reorder   <b>Esc</b> close"
+                }
+                (Focus::Inside, true) => {
+                    "<b>\u{2190}\u{2192}</b> title   <b>Enter</b>/<b>Shift+Enter</b> launch title   <b>Tab</b>/<b>Esc</b> back out"
+                }
+            };
+            let hidden = s.hidden_count();
+            if hidden == 0 {
+                hint.set_markup(&format!("{base_hint}   <b>right-click</b> hide"));
+            } else {
+                hint.set_markup(&format!(
+                    "{base_hint}   <b>right-click</b> hide   <b>Ctrl+Shift+H</b> show all ({hidden} hidden)"
+                ));
+            }
 
             let now = Cursor {
                 col: s.col,
@@ -943,8 +963,6 @@ fn build(application: &Application) {
                 grid.attach(&sublabel, 1, r as i32 + 1, 1, 1);
                 painted.borrow_mut().rowheads.push(rh.clone());
                 let mut row_cells: Vec<CellW> = Vec::with_capacity(s.view.len());
-                let library_row = s.is_library_row(r);
-
                 for (c, m) in s.view.iter().enumerate() {
                     let lines = &m.cells[r];
                     let cell = GBox::new(Orientation::Vertical, 2);
@@ -1083,10 +1101,8 @@ fn build(application: &Application) {
                                 });
                                 b.add_controller(src);
                             }
-                            // A CLICK LAUNCHES IT. The keyboard could start anything and the mouse
-                            // could only rearrange things: drag and drop worked, clicking did
-                            // nothing at all. For a launcher that is not a missing convenience, it
-                            // is a missing half.
+                            // PRIMARY launches. Middle launches and leaves the launcher open.
+                            // Secondary hides this machine's application until visibility is reset.
                             {
                                 let st = state.clone();
                                 let win = window.clone();
@@ -1120,21 +1136,19 @@ fn build(application: &Application) {
                                         .cloned();
                                     let Some(app) = found else { return };
 
-                                    // RIGHT starts the whole line only where a line IS an appset.
-                                    // A library shelf is alternatives, so every mouse button is
-                                    // reduced to the title under it. MIDDLE starts one thing and
-                                    // stays open, for opening a handful in a row.
-                                    let batch: Vec<App> = if button == 3 && !library_row {
-                                        machine
-                                            .cells
-                                            .iter()
-                                            .flatten()
-                                            .find(|l| l.apps.iter().any(|a| a.id == app.id))
-                                            .map(|l| l.apps.clone())
-                                            .unwrap_or_else(|| vec![app.clone()])
-                                    } else {
-                                        vec![app.clone()]
-                                    };
+                                    if button == 3 {
+                                        let changed = st_mut.hide_app(&machine.name, &app.id);
+                                        st_mut.clamp();
+                                        drop(st_mut);
+                                        if changed && let Some(rf) = holder2.borrow().as_ref() {
+                                            rf();
+                                        }
+                                        return;
+                                    }
+
+                                    // The keyboard owns appset launching through Shift+Enter;
+                                    // pointer buttons act on exactly the item under the pointer.
+                                    let batch = vec![app.clone()];
                                     let mut launched = false;
                                     for a in &batch {
                                         if spawn(&machine, a, &term) {
@@ -1349,6 +1363,7 @@ fn build(application: &Application) {
                 // set by hand would be one `s.query.push` away from being wrong, and the symptom
                 // would be a grid that silently stops matching what was typed.
                 let before = s.query.clone();
+                let mut state_rebuilt = false;
                 match (s.focus, act) {
                     // Esc unwinds one layer at a time rather than always closing: a typed query is
                     // state the user can lose accidentally, so it gets its own step.
@@ -1518,6 +1533,9 @@ fn build(application: &Application) {
                         q.pop();
                         s.set_query(q);
                     }
+                    (_, Some(keymap::Action::ResetVisibility)) => {
+                        state_rebuilt = s.reset_visibility();
+                    }
                     _ => {
                         // A chord is a command, not text. Without this, Ctrl-W and Alt-F typed a
                         // literal "w" and "f" into the search box.
@@ -1535,7 +1553,7 @@ fn build(application: &Application) {
                     }
                 }
                 s.clamp();
-                structural = s.query != before;
+                structural = state_rebuilt || s.query != before;
             }
             if structural {
                 render();

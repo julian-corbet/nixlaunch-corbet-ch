@@ -298,17 +298,20 @@ in
         "go-outside"
         "cancel"
         "backspace"
+        "reset-visibility"
       ]));
       default = { };
       example = {
         "ctrl+j" = "move-down";
         "shift+return" = "launch-selection";
         "ctrl+return" = "launch-cell";
+        "ctrl+shift+h" = "reset-visibility";
       };
       description = ''
         Chord-to-action overrides. They extend the defaults; null unbinds a default chord. Explicit
         launch-line and launch-cell actions mean the same thing in either focus mode, while
         launch-selection preserves Shift+Return's contextual default (cell outside, line inside).
+        The built-in Ctrl+Shift+H binding resets applications hidden through the launcher.
       '';
     };
 

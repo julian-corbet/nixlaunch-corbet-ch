@@ -47,6 +47,8 @@ pub enum Action {
     Cancel,
     /// Delete the last character of the query.
     Backspace,
+    /// Reveal every application hidden through the launcher.
+    ResetVisibility,
 }
 
 /// Chord string -> action.
@@ -75,6 +77,7 @@ impl Default for Keymap {
             ("shift+tab", Action::GoOutside),
             ("escape", Action::Cancel),
             ("backspace", Action::Backspace),
+            ("ctrl+shift+h", Action::ResetVisibility),
         ] {
             map.insert(chord.to_string(), action);
         }
@@ -173,6 +176,11 @@ mod tests {
         assert_eq!(k.action("left"), Some(Action::MoveLeft));
         assert_eq!(k.action("shift+return"), Some(Action::LaunchSelection));
         assert_eq!(k.action("escape"), Some(Action::Cancel));
+        assert_eq!(
+            k.action("ctrl+shift+h"),
+            Some(Action::ResetVisibility),
+            "hidden applications always have a discoverable way back"
+        );
     }
 
     /// THE RULE THAT KEEPS IT USABLE: anything unbound is text, so typing a name always works and

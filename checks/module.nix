@@ -91,11 +91,15 @@ let
         let
           r = rendered (lib.recursiveUpdate base {
             nixlaunch.keys."ctrl+j" = "move-down";
+            nixlaunch.keys."ctrl+shift+h" = "reset-visibility";
             nixlaunch.surface = "window";
             nixlaunch.exit_on_focus_loss = false;
           });
         in
-        r.keys."ctrl+j" == "move-down" && r.surface == "window" && !r.exit_on_focus_loss
+        r.keys."ctrl+j" == "move-down"
+        && r.keys."ctrl+shift+h" == "reset-visibility"
+        && r.surface == "window"
+        && !r.exit_on_focus_loss
       )
       "public options must reach the exact JSON the binary reads")
 

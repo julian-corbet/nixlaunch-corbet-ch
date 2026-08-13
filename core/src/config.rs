@@ -1,6 +1,6 @@
 // config.rs — what nixlaunch is TOLD, as opposed to what it discovers or what the user rearranges.
 //
-// THREE KINDS OF DATA, AND KEEPING THEM APART IS THE WHOLE DESIGN:
+// FOUR KINDS OF DATA, AND KEEPING THEM APART IS THE WHOLE DESIGN:
 //
 //   config     (this file)  declared in Nix, rendered to a file, read-only here. Which machines
 //                           exist, what they are called, what colour they are, and HOW TO ASK each
@@ -9,6 +9,8 @@
 //                           -- a re-inventory may replace it wholesale at any time.
 //   placement  (model.rs)   what the user rearranged. Written by this program, and must survive
 //                           both of the above being replaced.
+//   visibility (model.rs)   what the user chose not to see. Also user state, but separate from
+//                           placement so showing an app again restores its exact old position.
 //
 // Conflating any two of them is how a launcher ends up either forgetting your arrangement on every
 // rebuild, or freezing an app list that has since changed.

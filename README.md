@@ -45,6 +45,16 @@ You build them by dragging: drop an app **on a line** to insert it at the positi
 pointer, or on a cell's background to give it a line of its own. Dropping an app back onto its own
 line reorders it. Every arrangement is saved.
 
+## Visibility
+
+Right-click an application to hide it on that machine. Hiding is persistent user state, not an
+inventory or placement edit: the application stays hidden across refreshes and deployments, while
+its folder, line and position remain intact underneath. `Ctrl+Shift+H` shows every hidden
+application again, restored to those exact positions.
+
+The reset is deliberately global. There is no scope to remember and no way for an application to
+remain hidden because it was reset in the wrong machine or folder.
+
 ## "Other" is an inbox, not a category
 
 It is the last row, always, and it is drawn even when empty. Anything the grouping table does not
@@ -78,7 +88,7 @@ fixed string and everything works.
 and a column drawn with a reason on it is honest — where an empty column is indistinguishable from
 a machine that genuinely has nothing installed.
 
-## Three kinds of data, kept apart
+## Four kinds of data, kept apart
 
 This is the design, and conflating any two of them is how launchers end up either forgetting your
 arrangement on every rebuild or freezing an app list that has since moved.
@@ -88,11 +98,15 @@ arrangement on every rebuild or freezing an app list that has since moved.
 | **config** | declared in Nix, rendered to a file, read-only here | replaced by a deploy |
 | **inventory** | discovered per machine, cached | disposable; may be replaced wholesale |
 | **placement** | your rearranging, written by this program | survives both of the above |
+| **visibility** | what you right-clicked away, written by this program | survives until reset |
 
 Placement lives in `$XDG_STATE_HOME/nixlaunch/placement.json` — state, not config, so a rebuild
 cannot overwrite it. It records an **arrangement** (machine → folder → lines of names) rather than
 a folder per app, because a folder map cannot say *where* on a line, *which* line, or in what
 order, and those are exactly what dragging decides.
+
+Visibility lives beside it in `visibility.json`, keyed by machine and stable application id. It is
+not folded into placement because hiding must never erase where an application belongs.
 
 ## Configuration
 
