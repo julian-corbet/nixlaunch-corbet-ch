@@ -109,7 +109,7 @@ window {{ background-color: {ground}; color: {fg}; }}
 .line:hover {{ background-color: alpha({fg}, 0.04); }}
 .cell:hover {{ border-color: alpha({accent}, 0.45); }}
 .colhead:hover, .rowhead:hover, .subrow:hover {{ color: {fg}; }}
-.hide-action {{ padding: 3px; margin-right: 2px; background-color: alpha({ground}, 0.90); }}
+.hide-action {{ padding: 0; margin: 0; background-color: alpha({ground}, 0.90); }}
 .appname {{ font-size: 12px; }}
 .subrow {{ font-size: 10px; color: {muted}; padding-right: 6px; }}
 .dim {{ color: {dim}; font-size: 12px; font-style: italic; }}
@@ -751,24 +751,24 @@ fn build(application: &Application) {
 
             let base_hint = match (s.focus, s.is_library_row(s.row)) {
                 (Focus::Outside, false) => {
-                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> folder   <b>Tab</b>/<b>Enter</b> go inside   <b>Shift+Enter</b> launch the whole cell   <b>drag</b> onto a folder to file  \u{2022}  onto a line to join/reorder it   <b>Esc</b> close"
+                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> folder   <b>Tab</b>/<b>Enter</b> inside   <b>Shift+Enter</b> launch cell   <b>drag</b> file/reorder   <b>Esc</b> close"
                 }
                 (Focus::Inside, false) => {
-                    "<b>\u{2190}\u{2192}</b> app   <b>\u{2191}\u{2193}</b> line (appset)   <b>Enter</b> launch app   <b>Shift+Enter</b> launch the line   <b>Tab</b>/<b>Esc</b> back out"
+                    "<b>\u{2190}\u{2192}</b> app   <b>\u{2191}\u{2193}</b> line   <b>Enter</b> launch   <b>Shift+Enter</b> launch line   <b>Tab</b>/<b>Esc</b> out"
                 }
                 (Focus::Outside, true) => {
-                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> shelf   <b>Tab</b>/<b>Enter</b>/<b>Shift+Enter</b> browse shelf   <b>drag</b> to file/reorder   <b>Esc</b> close"
+                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> shelf   <b>Tab</b>/<b>Enter</b> browse   <b>drag</b> file/reorder   <b>Esc</b> close"
                 }
                 (Focus::Inside, true) => {
-                    "<b>\u{2190}\u{2192}</b> title   <b>Enter</b>/<b>Shift+Enter</b> launch title   <b>Tab</b>/<b>Esc</b> back out"
+                    "<b>\u{2190}\u{2192}</b> title   <b>Enter</b> launch   <b>Tab</b>/<b>Esc</b> out"
                 }
             };
             let hidden = s.hidden_count();
             if hidden == 0 {
-                hint.set_markup(&format!("{base_hint}   <b>right-click</b> actions"));
+                hint.set_markup(&format!("{base_hint}   <b>right-click</b> hide"));
             } else {
                 hint.set_markup(&format!(
-                    "{base_hint}   <b>right-click</b> actions   <b>Ctrl+Shift+H</b> show all ({hidden} hidden)"
+                    "{base_hint}   <b>right-click</b> hide   <b>Ctrl+Shift+H</b> show all ({hidden})"
                 ));
             }
 
@@ -1099,12 +1099,21 @@ fn build(application: &Application) {
                             let b = GBox::new(Orientation::Horizontal, 4);
                             b.add_css_class("app");
 
-                            // The action sits over the application instead of beside it. Revealing
-                            // a normal child changes the layer surface's natural width, and some
-                            // compositors answer that resize with alternating blank/full commits.
-                            // An unmeasured overlay keeps the surface geometry absolutely still.
-                            let app_overlay = gtk::Overlay::new();
-                            app_overlay.set_child(Some(&b));
+                            let img = match icon_cache.borrow_mut().texture(&app.icon, &icon_theme)
+                            {
+                                Some(tex) => Image::from_paintable(Some(&tex)),
+                                None => Image::from_icon_name(&app.icon),
+                            };
+                            img.set_pixel_size(icon_px);
+
+                            // Overlay only the existing icon, never the whole application. The app
+                            // box remains the exact same direct child of the line that it was before
+                            // hiding existed, preserving its expand and natural-width negotiation.
+                            // The action is explicitly excluded from measurement as a second guard:
+                            // revealing it must consume exactly zero new layout space.
+                            let icon_overlay = gtk::Overlay::new();
+                            icon_overlay.set_child(Some(&img));
+                            icon_overlay.set_hexpand(false);
 
                             let hide_action = gtk::Button::new();
                             hide_action.set_has_frame(false);
@@ -1113,10 +1122,13 @@ fn build(application: &Application) {
                             let hide_icon = Image::from_icon_name("view-conceal-symbolic");
                             hide_icon.set_pixel_size(16);
                             hide_action.set_child(Some(&hide_icon));
-                            hide_action.set_halign(gtk::Align::End);
+                            hide_action.set_size_request(icon_px, icon_px);
+                            hide_action.set_halign(gtk::Align::Center);
                             hide_action.set_valign(gtk::Align::Center);
                             hide_action.set_visible(false);
-                            app_overlay.add_overlay(&hide_action);
+                            icon_overlay.add_overlay(&hide_action);
+                            icon_overlay.set_measure_overlay(&hide_action, false);
+                            icon_overlay.set_clip_overlay(&hide_action, true);
                             // The payload carries the COLUMN it came from as well as the name, so
                             // the drop side can refuse a cross-machine drag without having to ask
                             // anyone: filing is per machine, and "Firefox on one machine" is not the
@@ -1237,17 +1249,11 @@ fn build(application: &Application) {
                                 });
                                 b.add_controller(click);
                             }
-                            let img = match icon_cache.borrow_mut().texture(&app.icon, &icon_theme)
-                            {
-                                Some(tex) => Image::from_paintable(Some(&tex)),
-                                None => Image::from_icon_name(&app.icon),
-                            };
-                            img.set_pixel_size(icon_px);
-                            b.append(&img);
+                            b.append(&icon_overlay);
                             let l = Label::new(Some(&app.name));
                             l.add_css_class("appname");
                             b.append(&l);
-                            lb.append(&app_overlay);
+                            lb.append(&b);
                             line_apps.push(b);
                         }
                         cell.append(&lb);
