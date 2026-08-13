@@ -195,6 +195,21 @@ in
       '';
     };
 
+    folderModes = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.enum [ "appset" "library" ]);
+      default = { };
+      example = { Games = "library"; };
+      description = ''
+        Per-folder row behavior. Unlisted folders use `appset`: inventory is wrapped at
+        `theme.line_width`, and launching a line or cell starts the whole appset.
+
+        `library` keeps each named row as one horizontally navigable vector regardless of length.
+        Bulk launch gestures are reduced to the selected item, so a genre shelf cannot start every
+        game on it. This is presentation and interaction policy only; inventory and placement keep
+        the same schema.
+      '';
+    };
+
     theme = lib.mkOption {
       type = lib.types.submodule {
         options = {
@@ -413,6 +428,14 @@ in
           + "unknown key is otherwise silently discarded.";
       }
       {
+        assertion = lib.all
+          (folder: folder != "Other" && lib.elem folder cfg.folders)
+          (lib.attrNames cfg.folderModes);
+        message =
+          "nixlaunch.folderModes: every key must name a configured folder other than Other -- an "
+          + "unknown key cannot affect any rendered row.";
+      }
+      {
         assertion =
           let names = map (m: m.name) cfg.machines;
           in lib.length (lib.unique names) == lib.length names;
@@ -483,6 +506,7 @@ in
     # no second place for the two to disagree.
     xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
       inherit (cfg) folders subrows terminal keyboard surface exit_on_focus_loss keys theme;
+      folder_modes = cfg.folderModes;
       machines = map
         (m: { inherit (m) name aliases accent inventory inventory_timeout_ms launch; })
         cfg.machines;

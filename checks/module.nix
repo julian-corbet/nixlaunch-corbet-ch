@@ -99,6 +99,13 @@ let
       )
       "public options must reach the exact JSON the binary reads")
 
+    (check "library folder mode reaches the rendered contract"
+      ((rendered (lib.recursiveUpdate base {
+        nixlaunch.folderModes.Games = "library";
+        nixlaunch.folders = [ "Terminals" "Editors" "Games" ];
+      })).folder_modes.Games == "library")
+      "a library row must survive module rendering so the binary can suppress wrapping and bulk launch")
+
     # The module writes nothing at all rather than an empty config, so a fresh checkout falls back
     # to the binary's own demo data instead of rendering an empty launcher.
     (check "no machines renders no file"
@@ -134,6 +141,16 @@ let
           ];
         } != [ ])
       "the search box resolves case-insensitively and takes the first match")
+
+    (check "folder mode for an undeclared folder is refused"
+      (failures
+        {
+          nixlaunch.enable = true;
+          nixlaunch.folders = [ "Files" ];
+          nixlaunch.folderModes.Games = "library";
+          nixlaunch.machines = [{ name = "box"; inventory = [ "inv" ]; }];
+        } != [ ])
+      "a mode for a row that cannot render would otherwise be accepted and silently ignored")
 
     (check "daemon service renders the bounded lifecycle policy"
       (

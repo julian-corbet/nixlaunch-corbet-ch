@@ -12,7 +12,7 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -237,6 +237,9 @@ pub struct State {
     /// The row set as CONFIG declared it, in the same order as every machine's `cells`.
     /// Frecency never permutes rows: configured order is the launcher's spatial contract.
     pub folders: Vec<String>,
+    /// Folder names whose rows are catalogues of alternatives rather than launchable appsets.
+    /// Stored by the base folder name; `Games/strategy` therefore inherits Games' mode.
+    pub library_folders: HashSet<String>,
     /// How often each thing is reached for. See usage.rs.
     pub usage: Usage,
     /// False when the on-disk usage file existed but could not be read or parsed. In-memory use may
@@ -279,6 +282,13 @@ pub struct State {
 static NO_LINES: Vec<Line> = Vec::new();
 
 impl State {
+    pub fn is_library_row(&self, row: usize) -> bool {
+        self.folders
+            .get(row)
+            .and_then(|label| label.split('/').next())
+            .is_some_and(|folder| self.library_folders.contains(folder))
+    }
+
     pub fn cell(&self) -> &Vec<Line> {
         match self.view.get(self.col).and_then(|m| m.cells.get(self.row)) {
             Some(c) => c,
@@ -409,6 +419,7 @@ impl State {
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
         self.machines = apply_placement(&self.base, &self.placement, &self.folders);
+        collapse_library_rows(&mut self.machines, &self.folders, &self.library_folders);
         // Placement decides MEMBERSHIP -- which folder, which line. Usage decides ORDER within
         // that, and only where the evidence justifies a move. Running it here rather than baking
         // it into the placement file keeps the two separable: the file stays a record of what the
@@ -444,7 +455,8 @@ impl State {
         // usage decides order, and the file "stays a record of what the user arranged, never of
         // what the statistics did to it". This recomputes the placement-only grid so that promise
         // is true rather than merely stated.
-        let placed = apply_placement(&self.base, &self.placement, &self.folders);
+        let mut placed = apply_placement(&self.base, &self.placement, &self.folders);
+        collapse_library_rows(&mut placed, &self.folders, &self.library_folders);
         let m = &placed[mi];
         let mut folders: HashMap<String, Vec<StoredLine>> = HashMap::new();
         for (r, lines) in m.cells.iter().enumerate() {
@@ -544,6 +556,7 @@ impl State {
         }
 
         self.materialise(mi);
+        let library = self.is_library_row(folder);
         let machine = self.machines[mi].name.clone();
         let target_label = self.folders[folder].clone();
         // An anchor that survives the removal: any name on the target line that is not the one
@@ -566,11 +579,17 @@ impl State {
         // Find the target AFTER the removal, never before: taking the app out can empty a line and
         // delete it, which shifts every later line down one. A target located beforehand would
         // then name the wrong line -- the same class of bug as the rendered indices this replaced.
-        let target_line = anchor.as_ref().and_then(|a| {
+        let target_line = if library {
             folders
                 .get(&target_label)
-                .and_then(|ls| ls.iter().position(|l| l.apps().iter().any(|n| n == a)))
-        });
+                .and_then(|lines| (!lines.is_empty()).then_some(0))
+        } else {
+            anchor.as_ref().and_then(|a| {
+                folders
+                    .get(&target_label)
+                    .and_then(|ls| ls.iter().position(|l| l.apps().iter().any(|n| n == a)))
+            })
+        };
 
         let lines = folders.entry(target_label).or_default();
         match target_line {
@@ -941,6 +960,30 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
         .collect()
 }
 
+/// A library row is one vector even when ordinary inventory wrapping or an older placement file
+/// supplied several lines. The transformation is deliberately view/model-only: placement remains
+/// valid old data, and the next deliberate drag materialises the single vector through the normal
+/// placement path rather than running a migration behind the user's back.
+pub fn collapse_library_rows(
+    machines: &mut [Machine],
+    folders: &[String],
+    library_folders: &HashSet<String>,
+) {
+    for machine in machines {
+        for (row, lines) in machine.cells.iter_mut().enumerate() {
+            let is_library = folders
+                .get(row)
+                .and_then(|label| label.split('/').next())
+                .is_some_and(|folder| library_folders.contains(folder));
+            if !is_library || lines.len() <= 1 {
+                continue;
+            }
+            let apps = lines.drain(..).flat_map(|line| line.apps).collect();
+            lines.push(Line { name: None, apps });
+        }
+    }
+}
+
 /// Build the argv that actually starts `app` on `machine`.
 ///
 /// FIELD CODES ARE STRIPPED. A `.desktop` Exec carries placeholders the spec defines -- %f %F %u
@@ -1180,6 +1223,7 @@ mod tests {
     fn state(machines: Vec<Machine>) -> State {
         let mut s = State {
             folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
+            library_folders: HashSet::new(),
             // No usage in the model tests: they are about placement and navigation, and a live
             // reordering pass would make their expectations depend on statistics they are not
             // testing. usage.rs owns those, with its own suite.
@@ -1203,6 +1247,26 @@ mod tests {
         s.machines = apply_placement(&s.base, &s.placement, &s.folders);
         s.refilter();
         s
+    }
+
+    #[test]
+    fn library_rows_collapse_wrapped_lines_into_one_vector() {
+        let folders = vec!["Games/strategy".to_string()];
+        let mut libraries = HashSet::new();
+        libraries.insert("Games".to_string());
+        let mut machines = vec![machine("m", 0, vec![vec!["Alpha"], vec!["Beta", "Gamma"]])];
+
+        collapse_library_rows(&mut machines, &folders, &libraries);
+
+        assert_eq!(machines[0].cells[0].len(), 1);
+        assert_eq!(
+            machines[0].cells[0][0]
+                .apps
+                .iter()
+                .map(|app| app.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Beta", "Gamma"]
+        );
     }
 
     /// A cell is a real 2D grid, not a list of lists: moving DOWN keeps the column.

@@ -71,6 +71,20 @@ pub struct SubRow {
     pub apps: Vec<String>,
 }
 
+/// Whether a folder contains appsets or catalogue shelves.
+///
+/// Appsets wrap at the configured line width and may be launched as a group. A library row is one
+/// long vector whose members are alternatives, never a batch. Kept per folder because every
+/// subrow and the catch-all inside that folder must agree; mixing the two meanings in one box
+/// would make the same gesture change semantics while moving vertically inside it.
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FolderMode {
+    #[default]
+    Appset,
+    Library,
+}
+
 /// The JSON one `inventory` command must print. Deliberately identical to what
 /// `rlaunch --json <host>` already emits, so the common case needs no adapter.
 #[derive(Deserialize, Debug, Clone)]
@@ -320,6 +334,10 @@ pub struct Config {
     #[serde(default)]
     pub subrows: std::collections::HashMap<String, Vec<SubRow>>,
 
+    /// Per-folder interaction/layout mode. Missing means appsets, preserving the original model.
+    #[serde(default)]
+    pub folder_modes: std::collections::HashMap<String, FolderMode>,
+
     /// Key bindings, as chord -> action. Overrides the defaults rather than replacing them, and a
 
     /// null action unbinds -- see `keymap` for why both matter.
@@ -389,7 +407,21 @@ impl Config {
                 ));
             }
         }
+        for folder in self.folder_modes.keys() {
+            if folder == "Other" || !self.folders.iter().any(|f| f == folder) {
+                return Err(format!(
+                    "folder_modes.{folder} has no declared folder; modes must belong to a configured folder other than Other"
+                ));
+            }
+        }
         Ok(self)
+    }
+
+    pub fn library_folders(&self) -> std::collections::HashSet<String> {
+        self.folder_modes
+            .iter()
+            .filter_map(|(folder, mode)| (*mode == FolderMode::Library).then_some(folder.clone()))
+            .collect()
     }
 
     /// Row labels, with the inbox guaranteed present and last.
@@ -585,5 +617,26 @@ mod tests {
         .unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.contains("line_width"), "{error}");
+    }
+
+    #[test]
+    fn library_folder_modes_are_typed_and_scoped() {
+        let config: Config = serde_json::from_str(
+            r#"{"machines":[],"folders":["Games"],"folder_modes":{"Games":"library"}}"#,
+        )
+        .unwrap();
+        assert!(config.library_folders().contains("Games"));
+        assert!(config.validate().is_ok());
+
+        let invalid: Config = serde_json::from_str(
+            r#"{"machines":[],"folders":["Files"],"folder_modes":{"Games":"library"}}"#,
+        )
+        .unwrap();
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("folder_modes.Games")
+        );
     }
 }

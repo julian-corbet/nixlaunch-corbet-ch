@@ -141,6 +141,18 @@ focus-loss options. Key overrides extend the defaults, `null` unbinds one chord,
 `launch-line` and `launch-cell` actions retain their meaning in either focus mode. The default
 `launch-selection` remains contextual: cell outside, line inside.
 
+Folders are appset grids by default. A folder that represents a catalogue rather than groups to
+start together can opt into a library layout:
+
+```nix
+nixlaunch.folderModes.Games = "library";
+```
+
+Each named row then stays one horizontal vector instead of wrapping at `theme.line_width`; moving
+the selection pans the viewport. A bulk-launch gesture outside enters the shelf, and inside it
+starts only the selected item, so a long genre shelf cannot accidentally launch every title it
+contains.
+
 With `daemon.enable = true`, the service starts hidden. A reveal maps the cached grid immediately,
 re-reads `config.json`, and refreshes every inventory in the background; the newest refresh wins,
 and each command is bounded by `inventory_timeout_ms`. Model inputs — folders, subrows, machines,

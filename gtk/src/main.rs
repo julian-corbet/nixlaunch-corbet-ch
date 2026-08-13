@@ -44,6 +44,7 @@ type CallbackSlot = Rc<RefCell<Option<Callback>>>;
 
 struct World {
     folders: Vec<String>,
+    library_folders: std::collections::HashSet<String>,
     machines: Vec<Machine>,
     theme: config::Theme,
     terminal: Vec<String>,
@@ -373,6 +374,7 @@ fn main() {
 fn build(application: &Application) {
     let World {
         folders,
+        library_folders,
         machines: base,
         theme,
         terminal: terminal_cmd_outer,
@@ -464,6 +466,7 @@ fn build(application: &Application) {
 
     let state = Rc::new(RefCell::new(State {
         folders,
+        library_folders,
         usage: loaded_usage,
         usage_writable,
         // Two standard errors, ~95% confidence. Lower and the grid twitches; higher and a real
@@ -736,11 +739,15 @@ fn build(application: &Application) {
                 search.remove_css_class("empty");
             }
 
-            hint.set_markup(match s.focus {
-                Focus::Outside =>
+            hint.set_markup(match (s.focus, s.is_library_row(s.row)) {
+                (Focus::Outside, false) =>
                     "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> folder   <b>Tab</b>/<b>Enter</b> go inside   <b>Shift+Enter</b> launch the whole cell   <b>drag</b> onto a folder to file  \u{2022}  onto a line to join/reorder it   <b>Esc</b> close",
-                Focus::Inside =>
+                (Focus::Inside, false) =>
                     "<b>\u{2190}\u{2192}</b> app   <b>\u{2191}\u{2193}</b> line (appset)   <b>Enter</b> launch app   <b>Shift+Enter</b> launch the line   <b>Tab</b>/<b>Esc</b> back out",
+                (Focus::Outside, true) =>
+                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> shelf   <b>Tab</b>/<b>Enter</b>/<b>Shift+Enter</b> browse shelf   <b>drag</b> to file/reorder   <b>Esc</b> close",
+                (Focus::Inside, true) =>
+                    "<b>\u{2190}\u{2192}</b> title   <b>Enter</b>/<b>Shift+Enter</b> launch title   <b>Tab</b>/<b>Esc</b> back out",
             });
 
             let now = Cursor {
@@ -772,7 +779,18 @@ fn build(application: &Application) {
                 // that follows a rebuild runs before layout, and `compute_bounds` on an
                 // unallocated widget answers with nothing (or with zeroes, which would scroll to
                 // the top and look like the viewport jumping on its own).
-                let bx = cell.bx.clone();
+                // A normal outside cursor selects the whole cell. Inside a catalogue the useful
+                // target is the title itself: following the cell would reveal only the shelf's
+                // left edge while a selection hundreds of items to the right remained invisible.
+                let bx = if now.inside {
+                    cell.lines
+                        .get(now.line)
+                        .and_then(|line| line.apps.get(now.item))
+                        .cloned()
+                        .unwrap_or_else(|| cell.bx.clone())
+                } else {
+                    cell.bx.clone()
+                };
                 let scroller = scroller.clone();
                 let grid = grid_for_scroll.clone();
                 gtk::glib::idle_add_local_once(move || {
@@ -925,6 +943,7 @@ fn build(application: &Application) {
                 grid.attach(&sublabel, 1, r as i32 + 1, 1, 1);
                 painted.borrow_mut().rowheads.push(rh.clone());
                 let mut row_cells: Vec<CellW> = Vec::with_capacity(s.view.len());
+                let library_row = s.is_library_row(r);
 
                 for (c, m) in s.view.iter().enumerate() {
                     let lines = &m.cells[r];
@@ -1101,11 +1120,11 @@ fn build(application: &Application) {
                                         .cloned();
                                     let Some(app) = found else { return };
 
-                                    // RIGHT starts the whole line -- the appset, which is the
-                                    // point of a line existing. MIDDLE starts one thing and stays
-                                    // open, for when you are opening a handful in a row and having
-                                    // to reopen between each is the whole cost.
-                                    let batch: Vec<App> = if button == 3 {
+                                    // RIGHT starts the whole line only where a line IS an appset.
+                                    // A library shelf is alternatives, so every mouse button is
+                                    // reduced to the title under it. MIDDLE starts one thing and
+                                    // stays open, for opening a handful in a row.
+                                    let batch: Vec<App> = if button == 3 && !library_row {
                                         machine
                                             .cells
                                             .iter()
@@ -1252,17 +1271,25 @@ fn build(application: &Application) {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             std::thread::spawn(move || {
                 let rows = cfg.folder_rows();
-                let fresh = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
-                let _ = tx.send((rows, fresh));
+                let library_folders = cfg.library_folders();
+                let fresh = inventory_all(
+                    &cfg.machines,
+                    &rows,
+                    cfg.theme.line_width,
+                    &cfg.subrows,
+                    &library_folders,
+                );
+                let _ = tx.send((rows, library_folders, fresh));
             });
             let state = state.clone();
             let render = render.clone();
             gtk::glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
                 match rx.try_recv() {
-                    Ok((rows, fresh)) => {
+                    Ok((rows, library_folders, fresh)) => {
                         if latest.get() == generation {
                             let mut s = state.borrow_mut();
                             s.folders = rows;
+                            s.library_folders = library_folders;
                             s.base = fresh;
                             s.rebuild();
                             s.clamp();
@@ -1377,6 +1404,21 @@ fn build(application: &Application) {
                             | keymap::Action::LaunchSelection),
                         ),
                     ) => {
+                        // A catalogue has no meaningful whole-cell action. The same chord that
+                        // launches an appset enters the shelf instead, where every launch action
+                        // is deliberately reduced to the selected title.
+                        if s.is_library_row(s.row) {
+                            if !s.cell().is_empty() {
+                                s.focus = Focus::Inside;
+                                s.line = 0;
+                                s.item = 0;
+                                s.item_goal = 0;
+                            }
+                            s.clamp();
+                            drop(s);
+                            paint();
+                            return gtk::glib::Propagation::Stop;
+                        }
                         let Some(machine) = s.view.get(s.col).cloned() else {
                             return gtk::glib::Propagation::Stop;
                         };
@@ -1433,19 +1475,27 @@ fn build(application: &Application) {
                         let Some(machine) = s.view.get(s.col).cloned() else {
                             return gtk::glib::Propagation::Stop;
                         };
-                        let apps: Vec<App> = match action {
-                            keymap::Action::Enter => s
-                                .current_line()
+                        let apps: Vec<App> = if s.is_library_row(s.row) {
+                            s.current_line()
                                 .and_then(|l| l.apps.get(s.item))
                                 .cloned()
                                 .into_iter()
-                                .collect(),
-                            keymap::Action::LaunchCell => s
-                                .cell()
-                                .iter()
-                                .flat_map(|l| l.apps.iter().cloned())
-                                .collect(),
-                            _ => s.current_line().map(|l| l.apps.clone()).unwrap_or_default(),
+                                .collect()
+                        } else {
+                            match action {
+                                keymap::Action::Enter => s
+                                    .current_line()
+                                    .and_then(|l| l.apps.get(s.item))
+                                    .cloned()
+                                    .into_iter()
+                                    .collect(),
+                                keymap::Action::LaunchCell => s
+                                    .cell()
+                                    .iter()
+                                    .flat_map(|l| l.apps.iter().cloned())
+                                    .collect(),
+                                _ => s.current_line().map(|l| l.apps.clone()).unwrap_or_default(),
+                            }
                         };
                         let mut launched = false;
                         for app in &apps {
@@ -1533,6 +1583,7 @@ fn load_world() -> World {
     match config::load() {
         Err(e) => World {
             folders: default_rows(),
+            library_folders: std::collections::HashSet::new(),
             machines: fixture(),
             theme: config::Theme::default(),
             terminal: vec![],
@@ -1544,6 +1595,7 @@ fn load_world() -> World {
         },
         Ok(None) => World {
             folders: default_rows(),
+            library_folders: std::collections::HashSet::new(),
             machines: fixture(),
             theme: config::Theme::default(),
             terminal: vec![],
@@ -1555,9 +1607,17 @@ fn load_world() -> World {
         },
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
-            let machines = inventory_all(&cfg.machines, &rows, cfg.theme.line_width, &cfg.subrows);
+            let library_folders = cfg.library_folders();
+            let machines = inventory_all(
+                &cfg.machines,
+                &rows,
+                cfg.theme.line_width,
+                &cfg.subrows,
+                &library_folders,
+            );
             World {
                 folders: rows,
+                library_folders,
                 machines,
                 theme: cfg.theme.clone(),
                 terminal: cfg.terminal.clone(),
@@ -1596,11 +1656,14 @@ fn inventory_all(
     rows: &[String],
     line_width: usize,
     subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
+    library_folders: &std::collections::HashSet<String>,
 ) -> Vec<Machine> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = machines
             .iter()
-            .map(|mc| scope.spawn(move || inventory(mc, rows, line_width, subrows)))
+            .map(|mc| {
+                scope.spawn(move || inventory(mc, rows, line_width, subrows, library_folders))
+            })
             .collect();
         handles
             .into_iter()
@@ -1629,6 +1692,7 @@ fn inventory(
     rows: &[String],
     line_width: usize,
     subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
+    library_folders: &std::collections::HashSet<String>,
 ) -> Machine {
     let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
     // Declared without a value: both arms of the match below assign it, so an initial `None`
@@ -1664,6 +1728,7 @@ fn inventory(
             // The machine reporting its own failure outranks anything inferred here.
             error = inv.error;
             for folder in inv.folders {
+                let library = library_folders.contains(&folder.label);
                 // A label this estate does not list falls into the inbox rather than being
                 // dropped: an app nobody categorised must still be reachable.
                 // WHICH ROW, and a declared subcategory beats the catch-all.
@@ -1707,7 +1772,12 @@ fn inventory(
                     .enumerate()
                     .filter(|(_, apps)| !apps.is_empty())
                 {
-                    for chunk in apps.chunks(line_width.max(1)) {
+                    let chunks: Vec<&[&config::InventoryApp]> = if library {
+                        vec![apps.as_slice()]
+                    } else {
+                        apps.chunks(line_width.max(1)).collect()
+                    };
+                    for chunk in chunks {
                         cells[r].push(Line {
                             name: None,
                             apps: chunk
