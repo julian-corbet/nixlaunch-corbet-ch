@@ -73,20 +73,6 @@ pub struct SubRow {
     pub apps: Vec<String>,
 }
 
-/// Whether a folder contains appsets or catalogue shelves.
-///
-/// Appsets wrap at the configured line width and may be launched as a group. A library row is one
-/// long vector whose members are alternatives, never a batch. Kept per folder because every
-/// subrow and the catch-all inside that folder must agree; mixing the two meanings in one box
-/// would make the same gesture change semantics while moving vertically inside it.
-#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum FolderMode {
-    #[default]
-    Appset,
-    Library,
-}
-
 /// The JSON one `inventory` command must print. Deliberately identical to what
 /// `rlaunch --json <host>` already emits, so the common case needs no adapter.
 #[derive(Deserialize, Debug, Clone)]
@@ -176,6 +162,90 @@ fn default_inventory_timeout_ms() -> u64 {
     5_000
 }
 
+/// How an ordered row vector is presented inside one machine column.
+///
+/// This is deliberately count-based. Measuring every label before choosing a shape creates a
+/// second layout engine beside GTK and makes the result depend on when fonts finish loading. A
+/// bounded label plus an item count gives the stable answer the eye actually needs: short vectors
+/// remain compact, medium ones balance over at most three lines, and long ones pan locally.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct Layout {
+    pub equal_columns: bool,
+    pub max_items_per_line: usize,
+    pub max_inline_items: usize,
+    pub max_label_chars: i32,
+    /// Per-row terse overrides: `1x6`, `2x5`, `3x4`, or `rail`.
+    pub rows: std::collections::HashMap<String, String>,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            equal_columns: true,
+            max_items_per_line: 5,
+            max_inline_items: 12,
+            max_label_chars: 16,
+            rows: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Layout {
+    fn override_shape(&self, row: &str) -> Result<Option<(usize, usize)>, String> {
+        let Some(value) = self.rows.get(row) else {
+            return Ok(None);
+        };
+        if value == "rail" {
+            return Ok(Some((0, 0)));
+        }
+        let Some((lines, per_line)) = value.split_once('x') else {
+            return Err(format!(
+                "layout.rows.{row} must be `rail` or a shape such as `1x6`, got {value:?}"
+            ));
+        };
+        let lines = lines.parse::<usize>().ok();
+        let per_line = per_line.parse::<usize>().ok();
+        match (lines, per_line) {
+            (Some(lines @ 1..=3), Some(per_line @ 1..)) => Ok(Some((lines, per_line))),
+            _ => Err(format!(
+                "layout.rows.{row} must use one to three positive-width lines, got {value:?}"
+            )),
+        }
+    }
+
+    /// Balanced line lengths, or `None` when this vector belongs in its local rail.
+    pub fn line_lengths(&self, row: &str, items: usize) -> Option<Vec<usize>> {
+        if items == 0 {
+            return Some(Vec::new());
+        }
+        let (max_lines, per_line, capacity) = match self.override_shape(row).ok().flatten() {
+            Some((0, 0)) => return None,
+            Some((lines, per_line)) => (lines, per_line, lines.saturating_mul(per_line)),
+            None => (
+                self.max_inline_items.div_ceil(self.max_items_per_line),
+                self.max_items_per_line,
+                self.max_inline_items,
+            ),
+        };
+        if items > capacity {
+            return None;
+        }
+        let lines = items.div_ceil(per_line).min(max_lines).max(1);
+        let short = items / lines;
+        let longer = items % lines;
+        Some(
+            (0..lines)
+                .map(|line| short + usize::from(line < longer))
+                .collect(),
+        )
+    }
+
+    pub fn is_rail(&self, row: &str, items: usize) -> bool {
+        self.line_lengths(row, items).is_none()
+    }
+}
+
 /// The palette, as VALUES rather than as code.
 ///
 /// The defaults below are a working dark set so the launcher is usable the moment it is installed
@@ -213,11 +283,6 @@ pub struct Theme {
 
     #[serde(default = "default_logo_size")]
     pub logo_size: i32,
-    /// Apps per line when packing a fresh inventory. Taste, not mechanism: it is how many
-    /// left/right steps a row costs before up/down is the faster move, and the answer depends on
-    /// how many machine columns you have and how wide the display is. Two machines on an ultrawide
-    /// want more; six on a laptop want fewer.
-    pub line_width: usize,
     /// How much of the display the grid may occupy before it scrolls. Display-RELATIVE is
     /// mechanism and stays; the fraction itself is a preference about how much of the session
     /// stays visible behind the launcher.
@@ -252,8 +317,7 @@ impl Default for Theme {
             icon_size: 20,
             logo: String::new(),
             logo_size: default_logo_size(),
-            line_width: 4,
-            max_height_fraction: 0.66,
+            max_height_fraction: 0.9,
             max_width_fraction: 0.9,
             width: 560,
         }
@@ -308,6 +372,8 @@ pub struct Config {
     pub terminal: Vec<String>,
     #[serde(default)]
     pub theme: Theme,
+    #[serde(default)]
+    pub layout: Layout,
     /// Row order. "Other" is appended automatically if absent and forced last if present -- it is
     /// the inbox, not a category, and a config that could bury it in the middle would defeat it.
     #[serde(default)]
@@ -335,10 +401,6 @@ pub struct Config {
 
     #[serde(default)]
     pub subrows: std::collections::HashMap<String, Vec<SubRow>>,
-
-    /// Per-folder interaction/layout mode. Missing means appsets, preserving the original model.
-    #[serde(default)]
-    pub folder_modes: std::collections::HashMap<String, FolderMode>,
 
     /// Key bindings, as chord -> action. Overrides the defaults rather than replacing them, and a
 
@@ -368,8 +430,20 @@ impl Config {
         if self.theme.icon_size <= 0 || self.theme.logo_size <= 0 || self.theme.width <= 0 {
             return Err("theme icon_size, logo_size, and width must be positive".to_string());
         }
-        if self.theme.line_width == 0 {
-            return Err("theme.line_width must be positive".to_string());
+        if self.layout.max_items_per_line == 0
+            || self.layout.max_inline_items == 0
+            || self.layout.max_label_chars <= 0
+        {
+            return Err(
+                "layout max_items_per_line, max_inline_items, and max_label_chars must be positive"
+                    .to_string(),
+            );
+        }
+        if self.layout.max_inline_items > self.layout.max_items_per_line.saturating_mul(3) {
+            return Err(
+                "layout.max_inline_items must fit within three lines at max_items_per_line"
+                    .to_string(),
+            );
         }
         for (name, value) in [
             ("max_height_fraction", self.theme.max_height_fraction),
@@ -409,21 +483,16 @@ impl Config {
                 ));
             }
         }
-        for folder in self.folder_modes.keys() {
-            if folder == "Other" || !self.folders.iter().any(|f| f == folder) {
+        let rows = self.folder_rows();
+        for row in self.layout.rows.keys() {
+            if !rows.iter().any(|known| known == row) {
                 return Err(format!(
-                    "folder_modes.{folder} has no declared folder; modes must belong to a configured folder other than Other"
+                    "layout.rows.{row} has no configured row; use Folder/subrow for named rungs"
                 ));
             }
+            self.layout.override_shape(row)?;
         }
         Ok(self)
-    }
-
-    pub fn library_folders(&self) -> std::collections::HashSet<String> {
-        self.folder_modes
-            .iter()
-            .filter_map(|(folder, mode)| (*mode == FolderMode::Library).then_some(folder.clone()))
-            .collect()
     }
 
     /// Row labels, with the inbox guaranteed present and last.
@@ -614,31 +683,46 @@ mod tests {
     #[test]
     fn invalid_dimensions_are_rejected_before_the_ui_uses_them() {
         let config: Config = serde_json::from_str(
-            r#"{"machines":[],"theme":{"line_width":0,"max_height_fraction":1.5}}"#,
+            r#"{"machines":[],"layout":{"max_items_per_line":0},"theme":{"max_height_fraction":1.5}}"#,
         )
         .unwrap();
         let error = config.validate().unwrap_err();
-        assert!(error.contains("line_width"), "{error}");
+        assert!(error.contains("max_items_per_line"), "{error}");
     }
 
     #[test]
-    fn library_folder_modes_are_typed_and_scoped() {
-        let config: Config = serde_json::from_str(
-            r#"{"machines":[],"folders":["Games"],"folder_modes":{"Games":"library"}}"#,
+    fn adaptive_vectors_balance_then_become_a_rail() {
+        let layout = Layout::default();
+        assert_eq!(layout.line_lengths("Games/rpg", 5), Some(vec![5]));
+        assert_eq!(layout.line_lengths("Games/rpg", 6), Some(vec![3, 3]));
+        assert_eq!(layout.line_lengths("Games/rpg", 9), Some(vec![5, 4]));
+        assert_eq!(layout.line_lengths("Games/rpg", 11), Some(vec![4, 4, 3]));
+        assert_eq!(layout.line_lengths("Games/rpg", 12), Some(vec![4, 4, 4]));
+        assert_eq!(layout.line_lengths("Games/rpg", 13), None);
+    }
+
+    #[test]
+    fn a_row_shape_can_keep_six_short_items_on_one_line() {
+        let mut layout = Layout::default();
+        layout.rows.insert("Code/term".into(), "1x6".into());
+        assert_eq!(layout.line_lengths("Code/term", 6), Some(vec![6]));
+        assert_eq!(layout.line_lengths("Code/term", 7), None);
+        layout.rows.insert("Games/rpg".into(), "rail".into());
+        assert_eq!(layout.line_lengths("Games/rpg", 1), None);
+    }
+
+    #[test]
+    fn layout_overrides_name_real_rows_and_valid_shapes() {
+        let valid: Config = serde_json::from_str(
+            r#"{"machines":[],"folders":["Code"],"subrows":{"Code":[{"name":"term"}]},"layout":{"rows":{"Code/term":"1x6"}}}"#,
         )
         .unwrap();
-        assert!(config.library_folders().contains("Games"));
-        assert!(config.validate().is_ok());
+        assert!(valid.validate().is_ok());
 
         let invalid: Config = serde_json::from_str(
-            r#"{"machines":[],"folders":["Files"],"folder_modes":{"Games":"library"}}"#,
+            r#"{"machines":[],"folders":["Code"],"layout":{"rows":{"Code/term":"4x0"}}}"#,
         )
         .unwrap();
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .contains("folder_modes.Games")
-        );
+        assert!(invalid.validate().is_err());
     }
 }

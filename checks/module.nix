@@ -103,12 +103,13 @@ let
       )
       "public options must reach the exact JSON the binary reads")
 
-    (check "library folder mode reaches the rendered contract"
+    (check "row layout override reaches the rendered contract"
       ((rendered (lib.recursiveUpdate base {
-        nixlaunch.folderModes.Games = "library";
+        nixlaunch.layout.rows."Games/launch" = "1x6";
         nixlaunch.folders = [ "Terminals" "Editors" "Games" ];
-      })).folder_modes.Games == "library")
-      "a library row must survive module rendering so the binary can suppress wrapping and bulk launch")
+        nixlaunch.subrows.Games = [{ name = "launch"; }];
+      })).layout.rows."Games/launch" == "1x6")
+      "a terse row guide must survive module rendering exactly")
 
     # The module writes nothing at all rather than an empty config, so a fresh checkout falls back
     # to the binary's own demo data instead of rendering an empty launcher.
@@ -146,15 +147,15 @@ let
         } != [ ])
       "the search box resolves case-insensitively and takes the first match")
 
-    (check "folder mode for an undeclared folder is refused"
+    (check "layout override for an undeclared row is refused"
       (failures
         {
           nixlaunch.enable = true;
           nixlaunch.folders = [ "Files" ];
-          nixlaunch.folderModes.Games = "library";
+          nixlaunch.layout.rows."Games/launch" = "1x6";
           nixlaunch.machines = [{ name = "box"; inventory = [ "inv" ]; }];
         } != [ ])
-      "a mode for a row that cannot render would otherwise be accepted and silently ignored")
+      "an override for a row that cannot render would otherwise be accepted and silently ignored")
 
     (check "daemon service renders the bounded lifecycle policy"
       (

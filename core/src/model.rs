@@ -7,6 +7,7 @@
 // tests at the bottom of this file rather than by opening the launcher and squinting.
 //
 // The rule that keeps it that way: nothing in this file may import gtk.
+use crate::config::Layout;
 use crate::usage::{self, Usage};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -273,13 +274,10 @@ pub struct State {
     /// The row set as CONFIG declared it, in the same order as every machine's `cells`.
     /// Frecency never permutes rows: configured order is the launcher's spatial contract.
     pub folders: Vec<String>,
-    /// Folder names whose rows are catalogues of alternatives rather than launchable appsets.
-    /// Stored by the base folder name; `Games/strategy` therefore inherits Games' mode.
-    pub library_folders: HashSet<String>,
-    /// Maximum applications in an automatically packed line. Kept in the model because hiding is
-    /// a view transformation: it needs the same width inventory used in order to close sparse gaps
-    /// without rewriting placement.
-    pub line_width: usize,
+    /// Presentation policy for every ordered row vector. It lives in the model because search,
+    /// visibility and drag/drop all change vectors; reflowing only during inventory would leave
+    /// stale gaps until the next refresh.
+    pub layout: Layout,
     /// How often each thing is reached for. See usage.rs.
     pub usage: Usage,
     /// False when the on-disk usage file existed but could not be read or parsed. In-memory use may
@@ -328,13 +326,6 @@ pub struct State {
 static NO_LINES: Vec<Line> = Vec::new();
 
 impl State {
-    pub fn is_library_row(&self, row: usize) -> bool {
-        self.folders
-            .get(row)
-            .and_then(|label| label.split('/').next())
-            .is_some_and(|folder| self.library_folders.contains(folder))
-    }
-
     pub fn cell(&self) -> &Vec<Line> {
         match self.view.get(self.col).and_then(|m| m.cells.get(self.row)) {
             Some(c) => c,
@@ -512,8 +503,11 @@ impl State {
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
         self.machines = apply_placement(&self.base, &self.placement, &self.folders);
-        apply_visibility(&mut self.machines, &self.visibility, self.line_width);
-        collapse_library_rows(&mut self.machines, &self.folders, &self.library_folders);
+        apply_visibility(
+            &mut self.machines,
+            &self.visibility,
+            self.layout.max_items_per_line,
+        );
         // Placement decides MEMBERSHIP -- which folder, which line. Usage decides ORDER within
         // that, and only where the evidence justifies a move. Running it here rather than baking
         // it into the placement file keeps the two separable: the file stays a record of what the
@@ -549,8 +543,7 @@ impl State {
         // usage decides order, and the file "stays a record of what the user arranged, never of
         // what the statistics did to it". This recomputes the placement-only grid so that promise
         // is true rather than merely stated.
-        let mut placed = apply_placement(&self.base, &self.placement, &self.folders);
-        collapse_library_rows(&mut placed, &self.folders, &self.library_folders);
+        let placed = apply_placement(&self.base, &self.placement, &self.folders);
         let m = &placed[mi];
         let mut folders: HashMap<String, Vec<StoredLine>> = HashMap::new();
         for (r, lines) in m.cells.iter().enumerate() {
@@ -650,7 +643,6 @@ impl State {
         }
 
         self.materialise(mi);
-        let library = self.is_library_row(folder);
         let machine = self.machines[mi].name.clone();
         let target_label = self.folders[folder].clone();
         // An anchor that survives the removal: any name on the target line that is not the one
@@ -673,17 +665,11 @@ impl State {
         // Find the target AFTER the removal, never before: taking the app out can empty a line and
         // delete it, which shifts every later line down one. A target located beforehand would
         // then name the wrong line -- the same class of bug as the rendered indices this replaced.
-        let target_line = if library {
+        let target_line = anchor.as_ref().and_then(|a| {
             folders
                 .get(&target_label)
-                .and_then(|lines| (!lines.is_empty()).then_some(0))
-        } else {
-            anchor.as_ref().and_then(|a| {
-                folders
-                    .get(&target_label)
-                    .and_then(|ls| ls.iter().position(|l| l.apps().iter().any(|n| n == a)))
-            })
-        };
+                .and_then(|ls| ls.iter().position(|l| l.apps().iter().any(|n| n == a)))
+        });
 
         let lines = folders.entry(target_label).or_default();
         match target_line {
@@ -812,6 +798,10 @@ impl State {
                 },
             })
             .collect();
+        // Shape the CURRENT vectors, not the inventory snapshot. Search and visibility can change
+        // a row from 7 items to 5 (two lines to one), while a refresh or reset can cross the rail
+        // threshold in the other direction. This count-only pass is cheap and deterministic.
+        reflow_vectors(&mut self.view, &self.folders, &self.layout);
         self.snap_to_content();
     }
 
@@ -1119,26 +1109,34 @@ pub fn apply_visibility(machines: &mut [Machine], visibility: &Visibility, line_
     }
 }
 
-/// A library row is one vector even when ordinary inventory wrapping or an older placement file
-/// supplied several lines. The transformation is deliberately view/model-only: placement remains
-/// valid old data, and the next deliberate drag materialises the single vector through the normal
-/// placement path rather than running a migration behind the user's back.
-pub fn collapse_library_rows(
-    machines: &mut [Machine],
-    folders: &[String],
-    library_folders: &HashSet<String>,
-) {
+/// Present every cell as one ordered vector, split into balanced visual lines or one bounded rail.
+///
+/// Placement may still contain several stored lines because it records ordering independently of
+/// the current display. Flattening happens only in the derived view: a label cutoff, a search, or
+/// hiding an application can therefore reflow immediately without rewriting user state.
+pub fn reflow_vectors(machines: &mut [Machine], folders: &[String], layout: &Layout) {
     for machine in machines {
-        for (row, lines) in machine.cells.iter_mut().enumerate() {
-            let is_library = folders
-                .get(row)
-                .and_then(|label| label.split('/').next())
-                .is_some_and(|folder| library_folders.contains(folder));
-            if !is_library || lines.len() <= 1 {
+        for (row, cell) in machine.cells.iter_mut().enumerate() {
+            let Some(label) = folders.get(row) else {
+                continue;
+            };
+            let apps: Vec<App> = std::mem::take(cell)
+                .into_iter()
+                .flat_map(|line| line.apps)
+                .collect();
+            if apps.is_empty() {
                 continue;
             }
-            let apps = lines.drain(..).flat_map(|line| line.apps).collect();
-            lines.push(Line { name: None, apps });
+            let lengths = layout
+                .line_lengths(label, apps.len())
+                .unwrap_or_else(|| vec![apps.len()]);
+            let mut apps = apps.into_iter();
+            for length in lengths {
+                cell.push(Line {
+                    name: None,
+                    apps: apps.by_ref().take(length).collect(),
+                });
+            }
         }
     }
 }
@@ -1382,8 +1380,7 @@ mod tests {
     fn state(machines: Vec<Machine>) -> State {
         let mut s = State {
             folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
-            library_folders: HashSet::new(),
-            line_width: 4,
+            layout: Layout::default(),
             // No usage in the model tests: they are about placement and navigation, and a live
             // reordering pass would make their expectations depend on statistics they are not
             // testing. usage.rs owns those, with its own suite.
@@ -1412,22 +1409,28 @@ mod tests {
     }
 
     #[test]
-    fn library_rows_collapse_wrapped_lines_into_one_vector() {
+    fn vectors_are_reflowed_from_current_item_count() {
         let folders = vec!["Games/strategy".to_string()];
-        let mut libraries = HashSet::new();
-        libraries.insert("Games".to_string());
-        let mut machines = vec![machine("m", 0, vec![vec!["Alpha"], vec!["Beta", "Gamma"]])];
+        let mut machines = vec![machine(
+            "m",
+            0,
+            vec![
+                vec!["Alpha", "Beta", "Gamma"],
+                vec!["Delta", "Epsilon", "Zeta", "Eta"],
+            ],
+        )];
 
-        collapse_library_rows(&mut machines, &folders, &libraries);
+        reflow_vectors(&mut machines, &folders, &Layout::default());
 
-        assert_eq!(machines[0].cells[0].len(), 1);
+        assert_eq!(machines[0].cells[0].len(), 2);
+        assert_eq!(machines[0].cells[0][0].apps.len(), 4);
         assert_eq!(
-            machines[0].cells[0][0]
-                .apps
+            machines[0].cells[0]
                 .iter()
+                .flat_map(|line| line.apps.iter())
                 .map(|app| app.name.as_str())
                 .collect::<Vec<_>>(),
-            ["Alpha", "Beta", "Gamma"]
+            ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta"]
         );
     }
 
@@ -1455,11 +1458,21 @@ mod tests {
     /// instead of drifting left -- the bug a naive `item = min(item, len-1)` produces.
     #[test]
     fn a_short_line_does_not_eat_the_goal_column() {
-        let mut s = state(vec![machine(
-            "m",
-            0,
-            vec![vec!["a", "b", "c"], vec!["solo"], vec!["x", "y", "z"]],
-        )]);
+        let mut s = state(vec![machine("m", 0, vec![vec!["placeholder"]])]);
+        s.view[0].cells[0] = vec![
+            Line {
+                name: None,
+                apps: vec![app("a"), app("b"), app("c")],
+            },
+            Line {
+                name: None,
+                apps: vec![app("solo")],
+            },
+            Line {
+                name: None,
+                apps: vec![app("x"), app("y"), app("z")],
+            },
+        ];
         s.focus = Focus::Inside;
         s.item = 2;
         s.item_goal = 2;
@@ -2348,55 +2361,27 @@ mod tests {
     }
 
     #[test]
-    fn hiding_repacks_only_the_affected_unnamed_run() {
-        let mut m = machine("m", 0, vec![]);
-        m.cells[0] = vec![
-            Line {
-                name: None,
-                apps: vec![app("a"), app("b"), app("c")],
-            },
-            Line {
-                name: None,
-                apps: vec![app("d"), app("e")],
-            },
-            Line {
-                name: Some("deliberate appset".into()),
-                apps: vec![app("f"), app("g")],
-            },
-            Line {
-                name: None,
-                apps: vec![app("h"), app("i"), app("j")],
-            },
-            Line {
-                name: None,
-                apps: vec![app("k")],
-            },
-        ];
-        let mut s = state(vec![m]);
+    fn hiding_rebalances_the_current_vector() {
+        let mut s = state(vec![machine(
+            "m",
+            0,
+            vec![vec!["a", "b", "c", "d", "e", "f", "g"]],
+        )]);
 
         assert!(s.hide_app("m", "b"));
 
         let lines = &s.view[0].cells[0];
-        assert_eq!(lines.len(), 4, "the sparse first pair became one line");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].apps.len(), 3);
+        assert_eq!(lines[1].apps.len(), 3);
         assert_eq!(
-            lines[0]
-                .apps
+            lines
                 .iter()
+                .flat_map(|line| line.apps.iter())
                 .map(|app| app.id.as_str())
                 .collect::<Vec<_>>(),
-            ["a", "c", "d", "e"]
+            ["a", "c", "d", "e", "f", "g"]
         );
-        assert_eq!(lines[1].name.as_deref(), Some("deliberate appset"));
-        assert_eq!(
-            lines[2]
-                .apps
-                .iter()
-                .map(|app| app.id.as_str())
-                .collect::<Vec<_>>(),
-            ["h", "i", "j"],
-            "a named appset is a hard boundary and an untouched run is not rewritten"
-        );
-        assert_eq!(lines[3].apps[0].id, "k");
     }
 
     /// A named row survives being emptied. It is part of the taxonomy, not a by-product of its

@@ -44,9 +44,9 @@ type CallbackSlot = Rc<RefCell<Option<Callback>>>;
 
 struct World {
     folders: Vec<String>,
-    library_folders: std::collections::HashSet<String>,
     machines: Vec<Machine>,
     theme: config::Theme,
+    layout: config::Layout,
     terminal: Vec<String>,
     surface: String,
     keyboard: String,
@@ -144,6 +144,10 @@ struct LineW {
 struct CellW {
     bx: GBox,
     lines: Vec<LineW>,
+    /// A long vector scrolls inside its own cell. Without this boundary the vector's
+    /// natural width becomes the width of the entire machine column, leaving the same blank
+    /// expanse in every ordinary row above it.
+    rail: Option<gtk::ScrolledWindow>,
 }
 
 /// Handles for the widgets that carry selection state, so moving the cursor does not have to
@@ -375,9 +379,9 @@ fn main() {
 fn build(application: &Application) {
     let World {
         folders,
-        library_folders,
         machines: base,
         theme,
+        layout,
         terminal: terminal_cmd_outer,
         surface: surface_mode,
         keyboard: keyboard_mode,
@@ -473,8 +477,7 @@ fn build(application: &Application) {
 
     let state = Rc::new(RefCell::new(State {
         folders,
-        library_folders,
-        line_width: theme.line_width,
+        layout: layout.clone(),
         usage: loaded_usage,
         usage_writable,
         // Two standard errors, ~95% confidence. Lower and the grid twitches; higher and a real
@@ -496,6 +499,7 @@ fn build(application: &Application) {
         focus: Focus::Outside,
         query: String::new(),
     }));
+    let layout = Rc::new(RefCell::new(layout));
     // Carry arrangements written before ids existed. Runs before the first rebuild, because a
     // rebuild against unmigrated state would find nothing and draw the computed grouping -- which
     // looks exactly like "my arrangement is gone".
@@ -758,6 +762,7 @@ fn build(application: &Application) {
 
     let paint: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
+        let layout = layout.clone();
         let painted = painted.clone();
         let search = search.clone();
         let hint = hint.clone();
@@ -787,7 +792,12 @@ fn build(application: &Application) {
                 search.remove_css_class("empty");
             }
 
-            let base_hint = match (s.focus, s.is_library_row(s.row)) {
+            let rail = s.folders.get(s.row).is_some_and(|row| {
+                layout
+                    .borrow()
+                    .is_rail(row, s.cell().iter().map(|line| line.apps.len()).sum())
+            });
+            let base_hint = match (s.focus, rail) {
                 (Focus::Outside, false) => {
                     "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> folder   <b>Tab</b>/<b>Enter</b> inside   <b>Shift+Enter</b> launch cell   <b>drag</b> file/reorder   <b>Esc</b> close"
                 }
@@ -795,7 +805,7 @@ fn build(application: &Application) {
                     "<b>\u{2190}\u{2192}</b> app   <b>\u{2191}\u{2193}</b> line   <b>Enter</b> launch   <b>Shift+Enter</b> launch line   <b>Tab</b>/<b>Esc</b> out"
                 }
                 (Focus::Outside, true) => {
-                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> shelf   <b>Tab</b>/<b>Enter</b> browse   <b>drag</b> file/reorder   <b>Esc</b> close"
+                    "<b>\u{2190}\u{2192}</b> machine   <b>\u{2191}\u{2193}</b> rail   <b>Tab</b>/<b>Enter</b> browse   <b>drag</b> file/reorder   <b>Esc</b> close"
                 }
                 (Focus::Inside, true) => {
                     "<b>\u{2190}\u{2192}</b> title   <b>Enter</b> launch   <b>Tab</b>/<b>Esc</b> out"
@@ -839,10 +849,11 @@ fn build(application: &Application) {
                 // that follows a rebuild runs before layout, and `compute_bounds` on an
                 // unallocated widget answers with nothing (or with zeroes, which would scroll to
                 // the top and look like the viewport jumping on its own).
-                // A normal outside cursor selects the whole cell. Inside a catalogue the useful
-                // target is the title itself: following the cell would reveal only the shelf's
-                // left edge while a selection hundreds of items to the right remained invisible.
-                let bx = if now.inside {
+                // The OUTER scroller follows the whole rail cell; the title itself lives in
+                // that cell's private horizontal viewport and is revealed separately below.
+                // Letting its coordinates drive the outer scroller would pan the entire matrix
+                // to follow content which no longer belongs to the matrix's width negotiation.
+                let bx = if now.inside && cell.rail.is_none() {
                     cell.lines
                         .get(now.line)
                         .and_then(|line| line.apps.get(now.item))
@@ -851,6 +862,13 @@ fn build(application: &Application) {
                 } else {
                     cell.bx.clone()
                 };
+                let rail_target = cell.rail.as_ref().and_then(|rail| {
+                    cell.lines.get(now.line).and_then(|line| {
+                        line.apps
+                            .get(now.item)
+                            .map(|app| (rail.clone(), line.bx.clone(), app.clone()))
+                    })
+                });
                 let scroller = scroller.clone();
                 let grid = grid_for_scroll.clone();
                 gtk::glib::idle_add_local_once(move || {
@@ -882,6 +900,15 @@ fn build(application: &Application) {
                         b.x() as f64,
                         (b.x() + b.width()) as f64,
                     );
+                    if let Some((rail, line, app)) = rail_target
+                        && let Some(b) = app.compute_bounds(&line)
+                    {
+                        reveal(
+                            &rail.hadjustment(),
+                            b.x() as f64,
+                            (b.x() + b.width()) as f64,
+                        );
+                    }
                 });
             }
         }
@@ -895,6 +922,7 @@ fn build(application: &Application) {
 
     let render: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
+        let layout = layout.clone();
         let grid = grid.clone();
         let spacer_folder = spacer_folder.clone();
         let spacer_sub = spacer_sub.clone();
@@ -933,6 +961,10 @@ fn build(application: &Application) {
             // rather than an approximation of either.
             let subcol = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
             subcol.add_widget(&spacer_sub);
+            let machine_columns = layout
+                .borrow()
+                .equal_columns
+                .then(|| gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal));
 
             for (c, m) in s.view.iter().enumerate() {
                 let head = Label::new(None);
@@ -953,6 +985,9 @@ fn build(application: &Application) {
                 });
                 if let Some(e) = &m.error {
                     head.set_tooltip_text(Some(e));
+                }
+                if let Some(group) = &machine_columns {
+                    group.add_widget(&head);
                 }
                 grid.attach(&head, c as i32 + 2, 0, 1, 1);
             }
@@ -998,8 +1033,14 @@ fn build(application: &Application) {
                 let mut row_cells: Vec<CellW> = Vec::with_capacity(s.view.len());
                 for (c, m) in s.view.iter().enumerate() {
                     let lines = &m.cells[r];
+                    let items = lines.iter().map(|line| line.apps.len()).sum();
+                    let rail = layout.borrow().is_rail(folder, items);
                     let cell = GBox::new(Orientation::Vertical, 2);
                     cell.add_css_class("cell");
+                    if let Some(group) = &machine_columns {
+                        group.add_widget(&cell);
+                    }
+                    let mut rail_viewport = None;
                     // Dropping onto a cell files the app into that folder, for that machine,
                     // permanently. Same column only -- see the drag payload's own note.
                     {
@@ -1274,11 +1315,32 @@ fn build(application: &Application) {
                             b.append(&icon_overlay);
                             let l = Label::new(Some(&app.name));
                             l.add_css_class("appname");
+                            l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                            l.set_max_width_chars(layout.borrow().max_label_chars);
+                            l.set_tooltip_text(Some(&app.name));
                             b.append(&l);
                             lb.append(&b);
                             line_apps.push(b);
                         }
-                        cell.append(&lb);
+                        if rail {
+                            // A rail is deliberately one long vector, but that does not make
+                            // it the width authority for every row in this machine column. Give
+                            // the vector a local viewport whose natural width does not propagate;
+                            // ordinary appset rows now decide the compact column width, and only
+                            // the rail pans when a title lies beyond it.
+                            let viewport = gtk::ScrolledWindow::new();
+                            viewport.add_css_class("vector-rail");
+                            viewport.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+                            viewport.set_overlay_scrolling(true);
+                            viewport.set_propagate_natural_width(false);
+                            viewport.set_propagate_natural_height(true);
+                            viewport.set_hexpand(true);
+                            viewport.set_child(Some(&lb));
+                            cell.append(&viewport);
+                            rail_viewport = Some(viewport);
+                        } else {
+                            cell.append(&lb);
+                        }
                         cell_lines.push(LineW {
                             bx: lb.clone(),
                             apps: line_apps,
@@ -1288,6 +1350,7 @@ fn build(application: &Application) {
                     row_cells.push(CellW {
                         bx: cell.clone(),
                         lines: cell_lines,
+                        rail: rail_viewport,
                     });
                 }
                 painted.borrow_mut().cells.push(row_cells);
@@ -1322,6 +1385,7 @@ fn build(application: &Application) {
         let state = state.clone();
         let render = render.clone();
         let arm_focus = arm_focus.clone();
+        let layout = layout.clone();
         // LAST KNOWN GOOD. Home Manager replaces the file atomically, but direct editors need not;
         // a parse failure during a save must not replace the coherent grid with fixtures or empty
         // columns. The next reveal tries again. This also lets a daemon started before config.json
@@ -1346,7 +1410,7 @@ fn build(application: &Application) {
 
             // Reading one small local JSON file is bounded work and belongs here on the GTK thread;
             // inventory remains in the worker below. Only model inputs reload live: folders,
-            // subrows, machines, launch prefixes and line width. CSS, key bindings, the terminal
+            // subrows, machines, launch prefixes and vector layout. CSS, key bindings, the terminal
             // wrapper and layer-shell/window construction were bound above and deliberately remain
             // restart-only rather than being half-reconfigured under a mapped window.
             let latest_config = match config::load() {
@@ -1369,31 +1433,25 @@ fn build(application: &Application) {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             std::thread::spawn(move || {
                 let rows = cfg.folder_rows();
-                let library_folders = cfg.library_folders();
-                let line_width = cfg.theme.line_width;
-                let fresh = inventory_all(
-                    &cfg.machines,
-                    &rows,
-                    line_width,
-                    &cfg.subrows,
-                    &library_folders,
-                );
-                let _ = tx.send((rows, library_folders, line_width, fresh));
+                let layout = cfg.layout.clone();
+                let fresh = inventory_all(&cfg.machines, &rows, &cfg.subrows);
+                let _ = tx.send((rows, layout, fresh));
             });
             let state = state.clone();
+            let layout_state = layout.clone();
             let render = render.clone();
             gtk::glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
                 match rx.try_recv() {
-                    Ok((rows, library_folders, line_width, fresh)) => {
+                    Ok((rows, new_layout, fresh)) => {
                         if latest.get() == generation {
                             let mut s = state.borrow_mut();
                             s.folders = rows;
-                            s.library_folders = library_folders;
-                            s.line_width = line_width;
+                            s.layout = new_layout.clone();
                             s.base = fresh;
                             s.rebuild();
                             s.clamp();
                             drop(s);
+                            *layout_state.borrow_mut() = new_layout;
                             render();
                         }
                         gtk::glib::ControlFlow::Break
@@ -1418,6 +1476,7 @@ fn build(application: &Application) {
         let paint = paint.clone();
         let terminal_cmd = terminal_cmd_outer.clone();
         let keys_map = keys_map.clone();
+        let layout = layout.clone();
         keys.connect_key_pressed(move |_, key, _, mods| {
             let shift = mods.contains(ModifierType::SHIFT_MASK);
             // WHAT the key means comes from the keymap, not from this match. GTK reports the
@@ -1450,6 +1509,11 @@ fn build(application: &Application) {
                 // would be a grid that silently stops matching what was typed.
                 let before = s.query.clone();
                 let mut state_rebuilt = false;
+                let rail = s.folders.get(s.row).is_some_and(|row| {
+                    layout
+                        .borrow()
+                        .is_rail(row, s.cell().iter().map(|line| line.apps.len()).sum())
+                });
                 match (s.focus, act) {
                     // Esc unwinds one layer at a time rather than always closing: a typed query is
                     // state the user can lose accidentally, so it gets its own step.
@@ -1505,10 +1569,10 @@ fn build(application: &Application) {
                             | keymap::Action::LaunchSelection),
                         ),
                     ) => {
-                        // A catalogue has no meaningful whole-cell action. The same chord that
-                        // launches an appset enters the shelf instead, where every launch action
+                        // A long rail has no safe whole-cell action. The same chord that launches
+                        // an inline vector enters the rail, where every launch action
                         // is deliberately reduced to the selected title.
-                        if s.is_library_row(s.row) {
+                        if rail {
                             if !s.cell().is_empty() {
                                 s.focus = Focus::Inside;
                                 s.line = 0;
@@ -1576,7 +1640,7 @@ fn build(application: &Application) {
                         let Some(machine) = s.view.get(s.col).cloned() else {
                             return gtk::glib::Propagation::Stop;
                         };
-                        let apps: Vec<App> = if s.is_library_row(s.row) {
+                        let apps: Vec<App> = if rail {
                             s.current_line()
                                 .and_then(|l| l.apps.get(s.item))
                                 .cloned()
@@ -1687,9 +1751,9 @@ fn load_world() -> World {
     match config::load() {
         Err(e) => World {
             folders: default_rows(),
-            library_folders: std::collections::HashSet::new(),
             machines: fixture(),
             theme: config::Theme::default(),
+            layout: config::Layout::default(),
             terminal: vec![],
             surface: "layer".into(),
             keyboard: "exclusive".into(),
@@ -1699,9 +1763,9 @@ fn load_world() -> World {
         },
         Ok(None) => World {
             folders: default_rows(),
-            library_folders: std::collections::HashSet::new(),
             machines: fixture(),
             theme: config::Theme::default(),
+            layout: config::Layout::default(),
             terminal: vec![],
             surface: "layer".into(),
             keyboard: "exclusive".into(),
@@ -1711,19 +1775,12 @@ fn load_world() -> World {
         },
         Ok(Some(cfg)) => {
             let rows = cfg.folder_rows();
-            let library_folders = cfg.library_folders();
-            let machines = inventory_all(
-                &cfg.machines,
-                &rows,
-                cfg.theme.line_width,
-                &cfg.subrows,
-                &library_folders,
-            );
+            let machines = inventory_all(&cfg.machines, &rows, &cfg.subrows);
             World {
                 folders: rows,
-                library_folders,
                 machines,
                 theme: cfg.theme.clone(),
+                layout: cfg.layout.clone(),
                 terminal: cfg.terminal.clone(),
                 surface: cfg.surface.clone(),
                 keyboard: cfg.keyboard.clone(),
@@ -1758,16 +1815,12 @@ fn load_world() -> World {
 fn inventory_all(
     machines: &[config::MachineConfig],
     rows: &[String],
-    line_width: usize,
     subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
-    library_folders: &std::collections::HashSet<String>,
 ) -> Vec<Machine> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = machines
             .iter()
-            .map(|mc| {
-                scope.spawn(move || inventory(mc, rows, line_width, subrows, library_folders))
-            })
+            .map(|mc| scope.spawn(move || inventory(mc, rows, subrows)))
             .collect();
         handles
             .into_iter()
@@ -1794,9 +1847,7 @@ fn inventory_all(
 fn inventory(
     mc: &config::MachineConfig,
     rows: &[String],
-    line_width: usize,
     subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
-    library_folders: &std::collections::HashSet<String>,
 ) -> Machine {
     let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
     // Declared without a value: both arms of the match below assign it, so an initial `None`
@@ -1832,13 +1883,12 @@ fn inventory(
             // The machine reporting its own failure outranks anything inferred here.
             error = inv.error;
             for folder in inv.folders {
-                let library = library_folders.contains(&folder.label);
                 // A label this estate does not list falls into the inbox rather than being
                 // dropped: an app nobody categorised must still be reachable.
                 // WHICH ROW, and a declared subcategory beats the catch-all.
                 //
                 // The category table said which BOX this belongs in; the subcategory says which
-                // shelf inside it. Matching happens here, once, against the operator's own list,
+                // rung inside it. Matching happens here, once, against the operator's own list,
                 // rather than each application having to be dragged into place -- two hundred of
                 // them is not a drag-and-drop job.
                 let declared = subrows.get(&folder.label);
@@ -1876,26 +1926,19 @@ fn inventory(
                     .enumerate()
                     .filter(|(_, apps)| !apps.is_empty())
                 {
-                    let chunks: Vec<&[&config::InventoryApp]> = if library {
-                        vec![apps.as_slice()]
-                    } else {
-                        apps.chunks(line_width.max(1)).collect()
-                    };
-                    for chunk in chunks {
-                        cells[r].push(Line {
-                            name: None,
-                            apps: chunk
-                                .iter()
-                                .map(|a| App {
-                                    id: a.id.clone().unwrap_or_else(|| a.name.clone()),
-                                    name: a.name.clone(),
-                                    icon: a.icon.clone(),
-                                    exec: a.exec.clone(),
-                                    terminal: a.terminal,
-                                })
-                                .collect(),
-                        });
-                    }
+                    cells[r].push(Line {
+                        name: None,
+                        apps: apps
+                            .iter()
+                            .map(|a| App {
+                                id: a.id.clone().unwrap_or_else(|| a.name.clone()),
+                                name: a.name.clone(),
+                                icon: a.icon.clone(),
+                                exec: a.exec.clone(),
+                                terminal: a.terminal,
+                            })
+                            .collect(),
+                    });
                 }
             }
         }

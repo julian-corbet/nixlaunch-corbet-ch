@@ -34,7 +34,7 @@ impl Probe {
         let machines = cfg
             .machines
             .iter()
-            .map(|mc| inventory(mc, &folders, cfg.theme.line_width))
+            .map(|mc| inventory(mc, &folders, &cfg.layout))
             .collect();
         Probe { machines, folders }
     }
@@ -62,7 +62,7 @@ impl Probe {
 /// The same shape as the real shell's, minus everything that is not needed to draw once: no icon
 /// handling, no terminal wrapping, no error column. Sequential rather than threaded, because a
 /// prototype measuring steady-state memory does not care which order the machines answer in.
-fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> model::Machine {
+fn inventory(mc: &config::MachineConfig, rows: &[String], layout: &config::Layout) -> model::Machine {
     let mut cells: Vec<Vec<model::Line>> = vec![Vec::new(); rows.len()];
     if let Some((bin, args)) = mc.inventory.split_first() {
         if let Ok(out) = std::process::Command::new(bin).args(args).output() {
@@ -72,7 +72,13 @@ fn inventory(mc: &config::MachineConfig, rows: &[String], line_width: usize) -> 
                         .iter()
                         .position(|x| *x == folder.label)
                         .unwrap_or(rows.len().saturating_sub(1));
-                    for chunk in folder.apps.chunks(line_width.max(1)) {
+                    let lengths = layout
+                        .line_lengths(&rows[r], folder.apps.len())
+                        .unwrap_or_else(|| vec![folder.apps.len()]);
+                    let mut offset = 0;
+                    for length in lengths {
+                        let chunk = &folder.apps[offset..offset + length];
+                        offset += length;
                         cells[r].push(model::Line {
                             name: None,
                             apps: chunk

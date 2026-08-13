@@ -195,18 +195,47 @@ in
       '';
     };
 
-    folderModes = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.enum [ "appset" "library" ]);
+    layout = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          equal_columns = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = "Prefer equal machine-column widths after every row has been bounded.";
+          };
+          max_items_per_line = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 5;
+          };
+          max_inline_items = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 12;
+          };
+          max_label_chars = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 16;
+          };
+          rows = lib.mkOption {
+            type = lib.types.attrsOf (lib.types.strMatching "(rail|[1-3]x[1-9][0-9]*)");
+            default = { };
+            example = { "Code/term" = "1x6"; };
+            description = ''
+              Optional one-line formatting guides keyed by the rendered row label. `1x6`, `2x5`,
+              and `3x4` set an inline shape; content beyond that shape becomes a local horizontal
+              rail. `rail` forces the bounded viewport immediately.
+            '';
+          };
+        };
+      };
       default = { };
-      example = { Games = "library"; };
       description = ''
-        Per-folder row behavior. Unlisted folders use `appset`: inventory is wrapped at
-        `theme.line_width`, and launching a line or cell starts the whole appset.
+        Adaptive vector presentation. With the defaults, one to five items use one line, six to
+        ten balance over two, eleven or twelve balance over three, and longer rows become bounded
+        horizontal rails. Labels are visually ellipsized at `max_label_chars`; their full text
+        remains the searchable, launchable name and is shown in a tooltip.
 
-        `library` keeps each named row as one horizontally navigable vector regardless of length.
-        Bulk launch gestures are reduced to the selected item, so a genre shelf cannot start every
-        game on it. This is presentation and interaction policy only; inventory and placement keep
-        the same schema.
+        Every row is an ordered vector. These settings choose only how that vector is viewed; no
+        row may enlarge a machine column merely because it contains more or longer items.
       '';
     };
 
@@ -224,12 +253,11 @@ in
           logo = lib.mkOption { type = lib.types.str; default = ""; };
           icon_size = lib.mkOption { type = lib.types.ints.positive; default = 20; };
           logo_size = lib.mkOption { type = lib.types.ints.positive; default = 28; };
-          line_width = lib.mkOption { type = lib.types.ints.positive; default = 4; };
           width = lib.mkOption { type = lib.types.ints.positive; default = 560; };
           max_height_fraction = lib.mkOption {
             type = lib.types.addCheck (lib.types.either lib.types.int lib.types.float)
               (value: value > 0 && value <= 1);
-            default = 0.66;
+            default = 0.9;
           };
           max_width_fraction = lib.mkOption {
             type = lib.types.addCheck (lib.types.either lib.types.int lib.types.float)
@@ -255,10 +283,8 @@ in
         `icon_size` because the corner has a header row to fill while an application icon has to
         sit inside a line of text.
 
-        Numbers: `icon_size` (default 20, keep it in proportion to your UI font), `line_width`
-        (default 4 — apps per line, which is how many left/right steps a row costs before up/down
-        is the faster move; more machine columns or a narrower display want fewer),
-        `max_height_fraction` (default 0.66 — how much of the display height the grid may take),
+        Numbers: `icon_size` (default 20, keep it in proportion to your UI font),
+        `max_height_fraction` (default 0.9 — how much of the display height the grid may take),
         `max_width_fraction` (default 0.9 — the corresponding width cap), and `width` (default 560,
         the minimum window width). Both fractions must be greater than zero and at most one.
 
@@ -431,12 +457,20 @@ in
           + "unknown key is otherwise silently discarded.";
       }
       {
-        assertion = lib.all
-          (folder: folder != "Other" && lib.elem folder cfg.folders)
-          (lib.attrNames cfg.folderModes);
+        assertion = cfg.layout.max_inline_items <= cfg.layout.max_items_per_line * 3;
         message =
-          "nixlaunch.folderModes: every key must name a configured folder other than Other -- an "
-          + "unknown key cannot affect any rendered row.";
+          "nixlaunch.layout.max_inline_items must fit within three lines at max_items_per_line.";
+      }
+      {
+        assertion = lib.all
+          (row: lib.elem row (lib.concatMap
+            (folder:
+              (map (subrow: "${folder}/${subrow.name}") (cfg.subrows.${folder} or [ ]))
+              ++ [ folder ])
+            cfg.folders))
+          (lib.attrNames cfg.layout.rows);
+        message =
+          "nixlaunch.layout.rows: every override must name a rendered Folder/subrow or folder row.";
       }
       {
         assertion =
@@ -508,8 +542,7 @@ in
     # schema, so anything that type-checks here serialises correctly by construction and there is
     # no second place for the two to disagree.
     xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
-      inherit (cfg) folders subrows terminal keyboard surface exit_on_focus_loss keys theme;
-      folder_modes = cfg.folderModes;
+      inherit (cfg) folders subrows terminal keyboard surface exit_on_focus_loss keys theme layout;
       machines = map
         (m: { inherit (m) name aliases accent inventory inventory_timeout_ms launch; })
         cfg.machines;

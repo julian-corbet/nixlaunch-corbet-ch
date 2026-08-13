@@ -35,15 +35,15 @@ Typing searches, fuzzily, across **every** machine at once — because "where do
 is a question only a matrix can answer, and a filter scoped to the current column would throw that
 away.
 
-## Appsets
+## Rows are vectors
 
-A **line** is an appset. The apps on it are meant to start together, and the fact that they sit on
-one line is the whole declaration — no separate group concept, no naming ceremony. `Shift+Enter`
-starts the line.
+Every configured row is one ordered vector. Its visual lines are presentation, not a second kind
+of category: short rows stay on one line, medium rows balance across at most three, and long rows
+pan inside their own bounded rail. `Shift+Enter` starts the current visual line.
 
-You build them by dragging: drop an app **on a line** to insert it at the position nearest your
-pointer, or on a cell's background to give it a line of its own. Dropping an app back onto its own
-line reorders it. Every arrangement is saved.
+You arrange a vector by dragging: drop an app on a line to insert it at the position nearest your
+pointer, or on a cell's background to append it. Dropping an app back onto its own row reorders it.
+Every arrangement is saved.
 
 ## Visibility
 
@@ -53,10 +53,9 @@ placement edit: the application stays hidden across refreshes and deployments, w
 line and position remain intact underneath. `Ctrl+Shift+H` shows every hidden application again,
 restored to those exact positions.
 
-When hiding leaves an automatically wrapped line sparse, the affected run closes up to
-`theme.line_width`; two partial lines can therefore become one. Named appsets are boundaries and
-untouched runs keep their grouping. This reflow exists only in the hidden view, so reset still
-reconstructs the saved arrangement exactly.
+Hiding immediately reshapes the current vector using the same adaptive layout as inventory and
+search; a `4 + 3` row can therefore become one line when only five items remain. This reflow exists
+only in the derived view, so reset still reconstructs the saved arrangement exactly.
 
 The reset is deliberately global. There is no scope to remember and no way for an application to
 remain hidden because it was reset in the wrong machine or folder.
@@ -161,22 +160,25 @@ focus-loss options. Key overrides extend the defaults, `null` unbinds one chord,
 `launch-line` and `launch-cell` actions retain their meaning in either focus mode. The default
 `launch-selection` remains contextual: cell outside, line inside.
 
-Folders are appset grids by default. A folder that represents a catalogue rather than groups to
-start together can opt into a library layout:
+The adaptive vector defaults are five items per visual line and twelve inline items overall:
+`1–5` use one line, `6–10` balance across two, `11–12` across three, and `13+` use a local
+horizontal rail. One terse row guide can override that presentation when names are unusually short
+or long:
 
 ```nix
-nixlaunch.folderModes.Games = "library";
+nixlaunch.layout.rows."Code/term" = "1x6";
 ```
 
-Each named row then stays one horizontal vector instead of wrapping at `theme.line_width`; moving
-the selection pans the viewport. A bulk-launch gesture outside enters the shelf, and inside it
-starts only the selected item, so a long genre shelf cannot accidentally launch every title it
-contains.
+`2x5`, `3x4`, and `rail` are also valid. Content beyond an explicit shape becomes a rail rather
+than growing a fourth line. Every rail has its own viewport, so a long vector cannot widen its
+machine's entire column and fill unrelated rows with blank space; moving the selection pans only
+that rail. Labels are visually capped by `layout.max_label_chars`, while their complete names stay
+available to search, launch and tooltips.
 
 With `daemon.enable = true`, the service starts hidden. A reveal maps the cached grid immediately,
 re-reads `config.json`, and refreshes every inventory in the background; the newest refresh wins,
 and each command is bounded by `inventory_timeout_ms`. Model inputs — folders, subrows, machines,
-launch prefixes, and inventory line width — update on that reveal. Settings bound to the existing
+launch prefixes, and vector layout — update on that reveal. Settings bound to the existing
 GTK process or window — CSS/theme, key bindings, terminal wrapper, focus policy, and surface mode —
 take effect at the next ordinary process start instead of half-reconfiguring a mapped window.
 
