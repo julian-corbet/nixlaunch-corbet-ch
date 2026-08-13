@@ -276,6 +276,10 @@ pub struct State {
     /// Folder names whose rows are catalogues of alternatives rather than launchable appsets.
     /// Stored by the base folder name; `Games/strategy` therefore inherits Games' mode.
     pub library_folders: HashSet<String>,
+    /// Maximum applications in an automatically packed line. Kept in the model because hiding is
+    /// a view transformation: it needs the same width inventory used in order to close sparse gaps
+    /// without rewriting placement.
+    pub line_width: usize,
     /// How often each thing is reached for. See usage.rs.
     pub usage: Usage,
     /// False when the on-disk usage file existed but could not be read or parsed. In-memory use may
@@ -508,7 +512,7 @@ impl State {
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
         self.machines = apply_placement(&self.base, &self.placement, &self.folders);
-        apply_visibility(&mut self.machines, &self.visibility);
+        apply_visibility(&mut self.machines, &self.visibility, self.line_width);
         collapse_library_rows(&mut self.machines, &self.folders, &self.library_folders);
         // Placement decides MEMBERSHIP -- which folder, which line. Usage decides ORDER within
         // that, and only where the evidence justifies a move. Running it here rather than baking
@@ -1050,19 +1054,67 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
         .collect()
 }
 
-/// Remove hidden ids from the derived grid without touching inventory or placement. Empty unnamed
-/// lines disappear with their last app; named rows remain valid drop targets, exactly as they do
-/// when their last application is dragged elsewhere.
-pub fn apply_visibility(machines: &mut [Machine], visibility: &Visibility) {
+/// Remove hidden ids from the derived grid without touching inventory or placement. The anonymous
+/// wrapped run that lost an application is repacked to the configured width, so hiding one item
+/// can turn two sparse display lines back into one. Named appsets are hard boundaries, and an
+/// untouched anonymous run is left byte-for-byte in its existing grouping.
+pub fn apply_visibility(machines: &mut [Machine], visibility: &Visibility, line_width: usize) {
+    let line_width = line_width.max(1);
     for machine in machines {
         let Some(hidden) = visibility.get(&machine.name) else {
             continue;
         };
         for cell in &mut machine.cells {
-            for line in cell.iter_mut() {
+            let old = std::mem::take(cell);
+            let mut packed = Vec::with_capacity(old.len());
+            let mut run: Vec<Line> = Vec::new();
+
+            let flush_run = |run: &mut Vec<Line>, packed: &mut Vec<Line>| {
+                if run.is_empty() {
+                    return;
+                }
+                let mut touched = false;
+                for line in run.iter_mut() {
+                    let before = line.apps.len();
+                    line.apps.retain(|app| !hidden.contains(&app.id));
+                    touched |= line.apps.len() != before;
+                }
+                if !touched {
+                    packed.append(run);
+                    return;
+                }
+
+                let apps = std::mem::take(run).into_iter().flat_map(|line| line.apps);
+                for app in apps {
+                    if packed
+                        .last()
+                        .is_none_or(|line| line.name.is_some() || line.apps.len() == line_width)
+                    {
+                        packed.push(Line {
+                            name: None,
+                            apps: Vec::with_capacity(line_width),
+                        });
+                    }
+                    packed
+                        .last_mut()
+                        .expect("line was just created")
+                        .apps
+                        .push(app);
+                }
+            };
+
+            for mut line in old {
+                if line.name.is_none() {
+                    run.push(line);
+                    continue;
+                }
+                flush_run(&mut run, &mut packed);
                 line.apps.retain(|app| !hidden.contains(&app.id));
+                // Named rows remain valid drop targets even when their final app is hidden.
+                packed.push(line);
             }
-            cell.retain(|line| !line.apps.is_empty() || line.name.is_some());
+            flush_run(&mut run, &mut packed);
+            *cell = packed;
         }
     }
 }
@@ -1331,6 +1383,7 @@ mod tests {
         let mut s = State {
             folders: DEFAULT_FOLDERS.iter().map(|f| f.to_string()).collect(),
             library_folders: HashSet::new(),
+            line_width: 4,
             // No usage in the model tests: they are about placement and navigation, and a live
             // reordering pass would make their expectations depend on statistics they are not
             // testing. usage.rs owns those, with its own suite.
@@ -2292,6 +2345,58 @@ mod tests {
         assert_eq!(s.hidden_count(), 0);
         assert_eq!(s.placement, placement, "reset did not rewrite the shelf");
         assert_eq!(s.view[0].cells[1][0].apps[0].id, "alpha");
+    }
+
+    #[test]
+    fn hiding_repacks_only_the_affected_unnamed_run() {
+        let mut m = machine("m", 0, vec![]);
+        m.cells[0] = vec![
+            Line {
+                name: None,
+                apps: vec![app("a"), app("b"), app("c")],
+            },
+            Line {
+                name: None,
+                apps: vec![app("d"), app("e")],
+            },
+            Line {
+                name: Some("deliberate appset".into()),
+                apps: vec![app("f"), app("g")],
+            },
+            Line {
+                name: None,
+                apps: vec![app("h"), app("i"), app("j")],
+            },
+            Line {
+                name: None,
+                apps: vec![app("k")],
+            },
+        ];
+        let mut s = state(vec![m]);
+
+        assert!(s.hide_app("m", "b"));
+
+        let lines = &s.view[0].cells[0];
+        assert_eq!(lines.len(), 4, "the sparse first pair became one line");
+        assert_eq!(
+            lines[0]
+                .apps
+                .iter()
+                .map(|app| app.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c", "d", "e"]
+        );
+        assert_eq!(lines[1].name.as_deref(), Some("deliberate appset"));
+        assert_eq!(
+            lines[2]
+                .apps
+                .iter()
+                .map(|app| app.id.as_str())
+                .collect::<Vec<_>>(),
+            ["h", "i", "j"],
+            "a named appset is a hard boundary and an untouched run is not rewritten"
+        );
+        assert_eq!(lines[3].apps[0].id, "k");
     }
 
     /// A named row survives being emptied. It is part of the taxonomy, not a by-product of its

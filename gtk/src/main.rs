@@ -109,6 +109,7 @@ window {{ background-color: {ground}; color: {fg}; }}
 .line:hover {{ background-color: alpha({fg}, 0.04); }}
 .cell:hover {{ border-color: alpha({accent}, 0.45); }}
 .colhead:hover, .rowhead:hover, .subrow:hover {{ color: {fg}; }}
+.hide-action {{ padding: 5px 8px; }}
 .appname {{ font-size: 12px; }}
 .subrow {{ font-size: 10px; color: {muted}; padding-right: 6px; }}
 .dim {{ color: {dim}; font-size: 12px; font-style: italic; }}
@@ -473,6 +474,7 @@ fn build(application: &Application) {
     let state = Rc::new(RefCell::new(State {
         folders,
         library_folders,
+        line_width: theme.line_width,
         usage: loaded_usage,
         usage_writable,
         // Two standard errors, ~95% confidence. Lower and the grid twitches; higher and a real
@@ -763,10 +765,10 @@ fn build(application: &Application) {
             };
             let hidden = s.hidden_count();
             if hidden == 0 {
-                hint.set_markup(&format!("{base_hint}   <b>right-click</b> hide"));
+                hint.set_markup(&format!("{base_hint}   <b>right-click</b> actions"));
             } else {
                 hint.set_markup(&format!(
-                    "{base_hint}   <b>right-click</b> hide   <b>Ctrl+Shift+H</b> show all ({hidden} hidden)"
+                    "{base_hint}   <b>right-click</b> actions   <b>Ctrl+Shift+H</b> show all ({hidden} hidden)"
                 ));
             }
 
@@ -1102,7 +1104,8 @@ fn build(application: &Application) {
                                 b.add_controller(src);
                             }
                             // PRIMARY launches. Middle launches and leaves the launcher open.
-                            // Secondary hides this machine's application until visibility is reset.
+                            // Secondary opens a small action popover: hiding must be a visible,
+                            // deliberate command rather than an irreversible-looking surprise.
                             {
                                 let st = state.clone();
                                 let win = window.clone();
@@ -1114,15 +1117,67 @@ fn build(application: &Application) {
                                 // filters, a drag reorders, frecency moves a line -- and an index
                                 // would by then name a different application.
                                 let id = app.id.clone();
+
+                                let popover = gtk::Popover::new();
+                                popover.set_has_arrow(true);
+                                popover.set_autohide(true);
+                                popover.set_position(gtk::PositionType::Bottom);
+                                popover.set_parent(&b);
+
+                                let hide_action = gtk::Button::new();
+                                hide_action.set_has_frame(false);
+                                hide_action.add_css_class("hide-action");
+                                hide_action.set_tooltip_text(Some(&format!("Hide {}", app.name)));
+                                let hide_content = GBox::new(Orientation::Horizontal, 6);
+                                let hide_icon = Image::from_icon_name("view-conceal-symbolic");
+                                hide_icon.set_pixel_size(16);
+                                hide_content.append(&hide_icon);
+                                hide_content.append(&Label::new(Some("Hide")));
+                                hide_action.set_child(Some(&hide_content));
+                                popover.set_child(Some(&hide_action));
+
+                                {
+                                    let st = st.clone();
+                                    let holder = holder2.clone();
+                                    let popover = popover.clone();
+                                    let machine = m.name.clone();
+                                    let id = id.clone();
+                                    hide_action.connect_clicked(move |_| {
+                                        popover.popdown();
+                                        let mut state = st.borrow_mut();
+                                        let changed = state.hide_app(&machine, &id);
+                                        state.clamp();
+                                        drop(state);
+                                        if changed && let Some(render) = holder.borrow().as_ref() {
+                                            render();
+                                        }
+                                    });
+                                }
+
                                 let click = gtk::GestureClick::new();
                                 // Every button, so middle and right arrive here too rather than
                                 // only the primary one.
                                 click.set_button(0);
-                                click.connect_released(move |g, _, _, _| {
+                                click.connect_released(move |g, _, x, y| {
                                     let button = g.current_button();
                                     // Claimed, so the drag source on this same widget does not
                                     // also read the press as the beginning of a drag.
                                     g.set_state(gtk::EventSequenceState::Claimed);
+
+                                    if button == 3 {
+                                        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                                            x.round() as i32,
+                                            y.round() as i32,
+                                            1,
+                                            1,
+                                        )));
+                                        popover.popup();
+                                        return;
+                                    }
+                                    if button != 1 && button != 2 {
+                                        return;
+                                    }
+
                                     let mut st_mut = st.borrow_mut();
                                     let Some(machine) = st_mut.view.get(c).cloned() else {
                                         return;
@@ -1135,16 +1190,6 @@ fn build(application: &Application) {
                                         .find(|a| a.id == id)
                                         .cloned();
                                     let Some(app) = found else { return };
-
-                                    if button == 3 {
-                                        let changed = st_mut.hide_app(&machine.name, &app.id);
-                                        st_mut.clamp();
-                                        drop(st_mut);
-                                        if changed && let Some(rf) = holder2.borrow().as_ref() {
-                                            rf();
-                                        }
-                                        return;
-                                    }
 
                                     // The keyboard owns appset launching through Shift+Enter;
                                     // pointer buttons act on exactly the item under the pointer.
@@ -1286,24 +1331,26 @@ fn build(application: &Application) {
             std::thread::spawn(move || {
                 let rows = cfg.folder_rows();
                 let library_folders = cfg.library_folders();
+                let line_width = cfg.theme.line_width;
                 let fresh = inventory_all(
                     &cfg.machines,
                     &rows,
-                    cfg.theme.line_width,
+                    line_width,
                     &cfg.subrows,
                     &library_folders,
                 );
-                let _ = tx.send((rows, library_folders, fresh));
+                let _ = tx.send((rows, library_folders, line_width, fresh));
             });
             let state = state.clone();
             let render = render.clone();
             gtk::glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
                 match rx.try_recv() {
-                    Ok((rows, library_folders, fresh)) => {
+                    Ok((rows, library_folders, line_width, fresh)) => {
                         if latest.get() == generation {
                             let mut s = state.borrow_mut();
                             s.folders = rows;
                             s.library_folders = library_folders;
+                            s.line_width = line_width;
                             s.base = fresh;
                             s.rebuild();
                             s.clamp();
