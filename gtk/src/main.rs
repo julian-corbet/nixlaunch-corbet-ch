@@ -585,46 +585,84 @@ fn build(application: &Application) {
     // the top and bottom are simply unreachable, since a layer surface has no titlebar to drag.
     // Two thirds leaves the session visible behind it, which is most of why this is an overlay
     // rather than a window.
-    // The SMALLEST attached monitor, not the first-enumerated one. Which output the compositor
-    // places an unanchored layer surface on is not knowable before it maps, so sizing to monitor 0
-    // overflows the moment it lands on a shorter panel -- and a layer surface has no titlebar to
-    // drag back into view. Fitting the smallest is correct wherever it ends up.
+    // Before the surface maps GTK cannot tell us which output the compositor will choose. Use the
+    // largest as the initial width so a launcher on that output does not map narrow and stay
+    // narrow (GTK top levels do not grow merely because a ScrolledWindow's maximum increases).
+    // The output-enter handler below then shrinks the mapped surface when the compositor chose a
+    // smaller one. Height remains conservative from the outset because covering the display
+    // vertically is the less recoverable failure.
     let extreme = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32, want_max: bool| {
         gtk::gdk::Display::default()
             .map(|d| {
                 let ms = d.monitors();
-                let vals = (0..ms.n_items())
+                let values = (0..ms.n_items())
                     .filter_map(|i| ms.item(i).and_downcast::<gtk::gdk::Monitor>())
                     .map(|m| pick(&m.geometry()))
                     .filter(|v| *v > 0);
-                if want_max { vals.max() } else { vals.min() }.unwrap_or(fallback)
+                if want_max {
+                    values.max().unwrap_or(fallback)
+                } else {
+                    values.min().unwrap_or(fallback)
+                }
             })
             .unwrap_or(fallback)
     };
-    let largest =
-        |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| extreme(pick, fallback, true);
-    let smallest =
-        |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| extreme(pick, fallback, false);
-    // HEIGHT against the smallest monitor, WIDTH against the largest, and the asymmetry is the
-    // whole lesson of this cap.
-    //
-    // Capping width at 0.9 of the SMALLEST display looked symmetrical and was wrong: the grid
-    // needs about 3270px for three machines, the smallest display here is 1920 wide, so the window
-    // was cut to 1728 and two of the three machines were pushed into the horizontal scroll that
-    // had just been added. The launcher looked like it had lost them. A cap that hides the primary
-    // content is worse than the overflow it was guarding against.
-    //
-    // Width can afford the largest because overflow is now REACHABLE -- the viewport follows the
-    // cursor on both axes, so a column past the edge scrolls into view when you arrow to it.
-    // Height stays on the smallest because a too-tall window is the thing that is genuinely
-    // unpleasant: it covers the session it is supposed to sit over.
-    let screen_h = smallest(|g| g.height(), 1080);
-    let screen_w = largest(|g| g.width(), 1920);
+    let screen_h = extreme(|g| g.height(), 1080, false);
+    let screen_w = extreme(|g| g.width(), 1920, true);
     scroller.set_max_content_height((screen_h as f64 * theme.max_height_fraction) as i32);
     // The width cap is the same rule as the height one and exists for the same reason: content is
     // allowed to decide the window's size right up to the point where it would put part of itself
     // off the screen, and past that it scrolls instead.
     scroller.set_max_content_width((screen_w as f64 * theme.max_width_fraction) as i32);
+
+    // Once realised, listen for the compositor assigning the surface to an output. Replace the
+    // conservative initial cap with that output's width rather than the largest output attached
+    // to the session. Using the largest made a launcher opened on a smaller panel wider than the
+    // panel itself; using the smallest forever needlessly hid columns on a larger screen.
+    // `enter-monitor` is authoritative when the backend emits it after our handler is connected.
+    // Some Wayland backends deliver the first enter while the surface is being realised, so a
+    // one-shot probe after the initial layer configure covers that ordering without making every
+    // reveal pay for polling.
+    {
+        let scroller = scroller.clone();
+        let fraction = theme.max_width_fraction;
+        window.connect_realize(move |w| {
+            let Some(surface) = w.surface() else { return };
+            let apply_monitor: Rc<dyn Fn(&gtk::gdk::Monitor)> = Rc::new({
+                let scroller = scroller.clone();
+                let window = w.clone();
+                move |monitor| {
+                    let width = monitor.geometry().width();
+                    if width <= 0 {
+                        return;
+                    }
+                    let cap = (width as f64 * fraction) as i32;
+                    scroller.set_max_content_width(cap);
+                    scroller.queue_resize();
+                    if window.width() > cap {
+                        window.set_default_width(cap);
+                    }
+                }
+            });
+            surface.connect_enter_monitor({
+                let apply_monitor = apply_monitor.clone();
+                move |_, monitor| apply_monitor(monitor)
+            });
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(100), {
+                let surface = surface.clone();
+                let apply_monitor = apply_monitor.clone();
+                move || {
+                    let Some(display) = gtk::gdk::Display::default() else {
+                        return;
+                    };
+                    let Some(monitor) = display.monitor_at_surface(&surface) else {
+                        return;
+                    };
+                    apply_monitor(&monitor);
+                }
+            });
+        });
+    }
 
     let grid = gtk::Grid::new();
     // NOT column-homogeneous. That makes EVERY column the same width including column 0, which
@@ -887,12 +925,6 @@ fn build(application: &Application) {
                 grid.remove(&c);
             }
 
-            // Equal widths for the MACHINE columns only. `set_column_homogeneous` would drag
-            // column 0 (the folder labels) in with them; hexpand alone only shares SPARE width, so
-            // a column holding "IntelliJ IDEA" ends up wider than one holding "Foot" and the thing
-            // stops reading as a grid. A horizontal SizeGroup sizes every member to the widest of
-            // them and leaves column 0 alone, which is exactly the subset rule Grid cannot express.
-            let cols = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
             // Rebuilt every render rather than kept: the row-head widgets are recreated each time,
             // and a long-lived group would accumulate memberships for widgets that no longer exist.
             let labelcol = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
@@ -906,15 +938,6 @@ fn build(application: &Application) {
                 let head = Label::new(None);
                 head.set_xalign(0.0);
                 head.add_css_class("colhead");
-                // NOT hexpand. A widget in a horizontal SizeGroup already takes the width of the
-                // widest member, and asking it to ALSO absorb spare width makes the two rules
-                // circular: the group's width depends on the allocation, the allocation depends on
-                // the group's width, and inside a ScrolledWindow propagating its child's natural
-                // size the loop has nothing to damp it. The symptom was not a wrong layout -- it
-                // was a window that repainted ~21 times a second forever and never went idle,
-                // roughly one launch in six. The SizeGroup alone gives equal machine columns; the
-                // window sizes to content regardless, so nothing needs to absorb slack.
-                cols.add_widget(&head);
                 // A machine that could not be asked says so IN ITS OWN HEADING, next to its name.
                 // The alternative -- an empty column -- reads identically to a machine that simply
                 // has nothing installed, which is the one thing it must not be confused with.
@@ -977,7 +1000,6 @@ fn build(application: &Application) {
                     let lines = &m.cells[r];
                     let cell = GBox::new(Orientation::Vertical, 2);
                     cell.add_css_class("cell");
-                    cols.add_widget(&cell);
                     // Dropping onto a cell files the app into that folder, for that machine,
                     // permanently. Same column only -- see the drag payload's own note.
                     {
