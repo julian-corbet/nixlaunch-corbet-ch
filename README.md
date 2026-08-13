@@ -47,11 +47,11 @@ line reorders it. Every arrangement is saved.
 
 ## Visibility
 
-Right-click an application to open its compact action popover, then choose the eye-slash **Hide**
-action to hide it on that machine. Hiding is persistent user state, not an inventory or placement
-edit: the application stays hidden across refreshes and deployments, while its folder, line and
-position remain intact underneath. `Ctrl+Shift+H` shows every hidden application again, restored
-to those exact positions.
+Right-click an application to reveal its compact inline eye-slash **Hide** action, then choose it
+to hide the application on that machine. Hiding is persistent user state, not an inventory or
+placement edit: the application stays hidden across refreshes and deployments, while its folder,
+line and position remain intact underneath. `Ctrl+Shift+H` shows every hidden application again,
+restored to those exact positions.
 
 When hiding leaves an automatically wrapped line sparse, the affected run closes up to
 `theme.line_width`; two partial lines can therefore become one. Named appsets are boundaries and

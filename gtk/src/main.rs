@@ -109,7 +109,7 @@ window {{ background-color: {ground}; color: {fg}; }}
 .line:hover {{ background-color: alpha({fg}, 0.04); }}
 .cell:hover {{ border-color: alpha({accent}, 0.45); }}
 .colhead:hover, .rowhead:hover, .subrow:hover {{ color: {fg}; }}
-.hide-action {{ padding: 5px 8px; }}
+.hide-action {{ padding: 3px; margin-right: 2px; background-color: alpha({ground}, 0.90); }}
 .appname {{ font-size: 12px; }}
 .subrow {{ font-size: 10px; color: {muted}; padding-right: 6px; }}
 .dim {{ color: {dim}; font-size: 12px; font-style: italic; }}
@@ -849,6 +849,12 @@ fn build(application: &Application) {
         }
     });
 
+    // The currently revealed inline action, if any. Only one is shown at a time so right-clicking
+    // another application moves the affordance instead of leaving a trail of Hide buttons.
+    // Inline is important: a GtkPopover creates a second Wayland surface, which makes the layer
+    // window report focus loss and correctly triggers this launcher's dismiss-on-blur policy.
+    let visible_hide_action = Rc::new(RefCell::new(None::<gtk::Button>));
+
     let render: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
         let grid = grid.clone();
@@ -861,6 +867,7 @@ fn build(application: &Application) {
         let icon_px = theme.icon_size;
         let icon_theme = icon_theme.clone();
         let icon_cache = icon_cache.clone();
+        let visible_hide_action = visible_hide_action.clone();
         // For the click path: launching needs the window to dismiss, the terminal wrapper for
         // programs that draw none, and the state to record the launch against.
         let window = window.clone();
@@ -874,6 +881,7 @@ fn build(application: &Application) {
             // remove a class from a widget that is no longer in the tree -- harmless, and a silent
             // way for the real selection to keep a highlight it should have lost.
             painted.borrow_mut().reset();
+            *visible_hide_action.borrow_mut() = None;
 
             while let Some(c) = grid.first_child() {
                 grid.remove(&c);
@@ -1090,6 +1098,25 @@ fn build(application: &Application) {
                         for app in ln.apps.iter() {
                             let b = GBox::new(Orientation::Horizontal, 4);
                             b.add_css_class("app");
+
+                            // The action sits over the application instead of beside it. Revealing
+                            // a normal child changes the layer surface's natural width, and some
+                            // compositors answer that resize with alternating blank/full commits.
+                            // An unmeasured overlay keeps the surface geometry absolutely still.
+                            let app_overlay = gtk::Overlay::new();
+                            app_overlay.set_child(Some(&b));
+
+                            let hide_action = gtk::Button::new();
+                            hide_action.set_has_frame(false);
+                            hide_action.add_css_class("hide-action");
+                            hide_action.set_tooltip_text(Some(&format!("Hide {}", app.name)));
+                            let hide_icon = Image::from_icon_name("view-conceal-symbolic");
+                            hide_icon.set_pixel_size(16);
+                            hide_action.set_child(Some(&hide_icon));
+                            hide_action.set_halign(gtk::Align::End);
+                            hide_action.set_valign(gtk::Align::Center);
+                            hide_action.set_visible(false);
+                            app_overlay.add_overlay(&hide_action);
                             // The payload carries the COLUMN it came from as well as the name, so
                             // the drop side can refuse a cross-machine drag without having to ask
                             // anyone: filing is per machine, and "Firefox on one machine" is not the
@@ -1104,7 +1131,7 @@ fn build(application: &Application) {
                                 b.add_controller(src);
                             }
                             // PRIMARY launches. Middle launches and leaves the launcher open.
-                            // Secondary opens a small action popover: hiding must be a visible,
+                            // Secondary reveals a small inline action: hiding must be a visible,
                             // deliberate command rather than an irreversible-looking surprise.
                             {
                                 let st = state.clone();
@@ -1118,32 +1145,14 @@ fn build(application: &Application) {
                                 // would by then name a different application.
                                 let id = app.id.clone();
 
-                                let popover = gtk::Popover::new();
-                                popover.set_has_arrow(true);
-                                popover.set_autohide(true);
-                                popover.set_position(gtk::PositionType::Bottom);
-                                popover.set_parent(&b);
-
-                                let hide_action = gtk::Button::new();
-                                hide_action.set_has_frame(false);
-                                hide_action.add_css_class("hide-action");
-                                hide_action.set_tooltip_text(Some(&format!("Hide {}", app.name)));
-                                let hide_content = GBox::new(Orientation::Horizontal, 6);
-                                let hide_icon = Image::from_icon_name("view-conceal-symbolic");
-                                hide_icon.set_pixel_size(16);
-                                hide_content.append(&hide_icon);
-                                hide_content.append(&Label::new(Some("Hide")));
-                                hide_action.set_child(Some(&hide_content));
-                                popover.set_child(Some(&hide_action));
-
                                 {
                                     let st = st.clone();
                                     let holder = holder2.clone();
-                                    let popover = popover.clone();
+                                    let visible = visible_hide_action.clone();
                                     let machine = m.name.clone();
                                     let id = id.clone();
                                     hide_action.connect_clicked(move |_| {
-                                        popover.popdown();
+                                        *visible.borrow_mut() = None;
                                         let mut state = st.borrow_mut();
                                         let changed = state.hide_app(&machine, &id);
                                         state.clamp();
@@ -1154,24 +1163,26 @@ fn build(application: &Application) {
                                     });
                                 }
 
+                                let hide_action_for_click = hide_action.clone();
+                                let visible = visible_hide_action.clone();
                                 let click = gtk::GestureClick::new();
                                 // Every button, so middle and right arrive here too rather than
                                 // only the primary one.
                                 click.set_button(0);
-                                click.connect_released(move |g, _, x, y| {
+                                click.connect_released(move |g, _, _, _| {
                                     let button = g.current_button();
                                     // Claimed, so the drag source on this same widget does not
                                     // also read the press as the beginning of a drag.
                                     g.set_state(gtk::EventSequenceState::Claimed);
 
                                     if button == 3 {
-                                        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
-                                            x.round() as i32,
-                                            y.round() as i32,
-                                            1,
-                                            1,
-                                        )));
-                                        popover.popup();
+                                        if let Some(previous) = visible
+                                            .borrow_mut()
+                                            .replace(hide_action_for_click.clone())
+                                        {
+                                            previous.set_visible(false);
+                                        }
+                                        hide_action_for_click.set_visible(true);
                                         return;
                                     }
                                     if button != 1 && button != 2 {
@@ -1236,7 +1247,7 @@ fn build(application: &Application) {
                             let l = Label::new(Some(&app.name));
                             l.add_css_class("appname");
                             b.append(&l);
-                            lb.append(&b);
+                            lb.append(&app_overlay);
                             line_apps.push(b);
                         }
                         cell.append(&lb);
