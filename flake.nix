@@ -74,6 +74,7 @@
                   pkgs.bash pkgs.coreutils pkgs.dbus pkgs.python3 pkgs.wtype
                   nixscroll.packages.${system}.scroll
                 ]}:$PATH
+                export DBUS_SESSION_CONF=${pkgs.dbus}/share/dbus-1/session.conf
                 exec ${pkgs.bash}/bin/bash ${./checks/headless-session.sh} \
                   ${self.packages.${system}.nixlaunch}/bin/nixlaunch \
                   ${nixscroll.packages.${system}.scroll}/bin/scroll "$@"

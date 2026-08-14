@@ -72,7 +72,12 @@ export XDG_RUNTIME_DIR="$RIG"
 export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_HEADLESS_OUTPUTS=2 WLR_LIBINPUT_NO_DEVICES=1
 unset WAYLAND_DISPLAY SWAYSOCK SCROLLSOCK I3SOCK DISPLAY
 
-dbus-run-session -- "$COMPOSITOR" -c "$RIG/scroll.conf" > "$RIG/compositor.log" 2>&1 &
+# A session bus needs a config file, and a Nix-provided dbus has no /etc/dbus-1 to find one in --
+# so the caller may name it. Empty means the system default, which is right everywhere else.
+DBUS=(dbus-run-session)
+[ -n "${DBUS_SESSION_CONF:-}" ] && DBUS+=(--config-file="$DBUS_SESSION_CONF")
+
+"${DBUS[@]}" -- "$COMPOSITOR" -c "$RIG/scroll.conf" > "$RIG/compositor.log" 2>&1 &
 COMP=$!
 
 for _ in $(seq 100); do
@@ -84,7 +89,7 @@ export WAYLAND_DISPLAY=wayland-1
 
 # The launcher and the client have to share one session bus, so both run inside a single
 # dbus-run-session; otherwise the client cannot reach the resident instance and silently exits 0.
-dbus-run-session -- bash -c '
+"${DBUS[@]}" -- bash -c '
   set -u
   NIXLAUNCH_TRACE=1 XDG_STATE_HOME="$1/state" NIXLAUNCH_CONFIG="$1/config.json" "$2" --daemon &
   D=$!
