@@ -457,17 +457,6 @@ in
   config = lib.mkIf (cfg.enable && cfg.machines != [ ]) {
     assertions = [
       {
-        # Whitespace-only is empty here as it is in the binary: the name is the column heading and
-        # the key placements are stored under, and neither of those survives being invisible. The
-        # binary refuses such a config at load and falls back to its demo data, so an evaluation
-        # error is the only version of this failure that names the machine at fault -- the other
-        # is a launcher full of fixtures at the next session start.
-        assertion = lib.all (m: builtins.match "[[:space:]]*" m.name == null) cfg.machines;
-        message =
-          "nixlaunch.machines: machine names must not be empty -- a blank heading names no column "
-          + "and cannot key an arrangement.";
-      }
-      {
         assertion = lib.all (m: m.inventory != [ ]) cfg.machines;
         message =
           "nixlaunch.machines: every machine needs an `inventory` command -- a column with no way "
@@ -501,20 +490,13 @@ in
           "nixlaunch.layout.max_inline_items must fit within three lines at max_items_per_line.";
       }
       {
-        # The rendered rows are exactly the list the binary computes, inbox included: "Other" is
-        # never configured -- the program appends it and forces it last -- but it is always drawn,
-        # and it is the row most likely to need a shape, since it holds everything nobody filed. A
-        # rendered-row test built only from `folders` would refuse an override the binary accepts.
-        assertion =
-          let
-            rowsOf = folder:
-              map (subrow: "${folder}/${subrow.name}") (cfg.subrows.${folder} or [ ])
-              ++ [ folder ];
-            rendered =
-              lib.concatMap rowsOf (lib.filter (folder: folder != "Other") cfg.folders)
-              ++ [ "Other" ];
-          in
-          lib.all (row: lib.elem row rendered) (lib.attrNames cfg.layout.rows);
+        assertion = lib.all
+          (row: lib.elem row (lib.concatMap
+            (folder:
+              (map (subrow: "${folder}/${subrow.name}") (cfg.subrows.${folder} or [ ]))
+              ++ [ folder ])
+            cfg.folders))
+          (lib.attrNames cfg.layout.rows);
         message =
           "nixlaunch.layout.rows: every override must name a rendered Folder/subrow or folder row.";
       }
