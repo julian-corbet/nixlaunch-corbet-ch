@@ -1,0 +1,27 @@
+# Crow CI for nixlaunch-corbet-ch — the half of the testing that needs a compositor.
+#
+# TWO BUILDERS, TWO QUESTIONS, and the split is deliberate rather than redundant.
+#
+# GitHub Actions runs `nix flake check` and answers "can a stranger build this from a cold cache" —
+# it is free for a public repo and it is the only place that question gets asked honestly, since
+# every other builder here has a warm store.
+#
+# Crow answers "does it behave" — it starts a real compositor on the headless wlroots backend and
+# asserts on the launcher's trace. That belongs here because the hub already has scroll, wlroots and
+# GTK realised in the warm store, where a hosted runner would rebuild a compositor on every push.
+# Nothing in this repo is secret, so the routing is a matter of speed and fit, not of exposure.
+steps:
+  - name: headless-session
+    image: bash
+    commands:
+      - nix --version
+      # Starts scroll headless with two outputs of very different sizes, opens the launcher three
+      # times, and asserts on what it traced: that it settles its size at most twice per showing,
+      # never exceeds an output's cap unless the content cannot be narrower, renders the cached grid
+      # inside its budget, and does not report a change for an inventory that never changed.
+      #
+      # An app rather than a flake check on purpose -- it needs a session bus and a real /tmp, which
+      # a build sandbox is a poor home for. See flake.nix.
+      - nix run .#headless-session
+    when:
+      - event: [push, manual]

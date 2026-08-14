@@ -266,6 +266,27 @@ const MIN_SEARCH_WIDTH: i32 = 200;
 /// Anonymous and writable only, and never the stack: this is about data the program is finished
 /// with for now, not about pages it is standing on. A failure anywhere is ignored -- the kernel
 /// declining to reclaim is not a reason for a launcher to misbehave.
+/// Whether to print the machine-readable trace, decided once from `NIXLAUNCH_TRACE`.
+fn tracing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NIXLAUNCH_TRACE").is_some())
+}
+
+/// One line of machine-readable progress, for the headless session check.
+///
+/// A LAYER SURFACE IS INVISIBLE TO THE COMPOSITOR'S IPC -- it is not a window and never appears in
+/// `get_tree` -- so a test has no way to ask where this one mapped, how large it is, or how often
+/// it resized. Without something like this the only observable is pixels, and asserting on
+/// screenshots means a test that fails whenever a font or a colour changes.
+///
+/// Off unless asked for, printed to stderr rather than stdout, and deliberately dull: `key=value`
+/// pairs a shell can grep, never a format anything is expected to parse cleverly.
+fn trace(fields: std::fmt::Arguments<'_>) {
+    if tracing_on() {
+        eprintln!("nixlaunch-trace {fields}");
+    }
+}
+
 fn release_idle_pages() {
     unsafe {
         malloc_trim(0);
@@ -764,6 +785,15 @@ fn build(application: &Application) {
             let (_, width, _, _) = root.measure(gtk::Orientation::Horizontal, -1);
             let (_, height, _, _) = root.measure(gtk::Orientation::Vertical, width);
             window.set_default_size(width, height);
+            trace(format_args!(
+                "settle output={} size={}x{} cap={}x{} min={}",
+                monitor.connector().unwrap_or_default(),
+                width,
+                height,
+                width_cap,
+                (geometry.height() as f64 * height_fraction) as i32,
+                minimum
+            ));
         }
     });
 
@@ -807,6 +837,7 @@ fn build(application: &Application) {
                     // different screen than it was last time, and the guard above must not answer
                     // for a map it never saw.
                     settled.set(false);
+                    trace(format_args!("map"));
                     let window = w.clone();
                     let apply_monitor = apply_monitor.clone();
                     gtk::glib::timeout_add_local_once(
@@ -1625,6 +1656,7 @@ fn build(application: &Application) {
         let refresh_config = Rc::new(RefCell::new(loaded_config.clone()));
         let refresh_generation = Rc::new(std::cell::Cell::new(0u64));
         let reveal: Rc<dyn Fn()> = Rc::new(move || {
+            let t_reveal = std::time::Instant::now();
             arm_focus();
             // Reveal the coherent cached grid immediately. Inventory refresh is external I/O and
             // belongs off the GTK thread; one wedged peer must not stop the existing window from
@@ -1639,6 +1671,7 @@ fn build(application: &Application) {
                 s.clamp();
             }
             render();
+            trace(format_args!("render ms={}", t_reveal.elapsed().as_millis()));
 
             // Reading one small local JSON file is bounded work and belongs here on the GTK thread;
             // inventory remains in the worker below. Only model inputs reload live: folders,
@@ -1683,6 +1716,10 @@ fn build(application: &Application) {
                             let mut s = state.borrow_mut();
                             let changed = s.replace_inventory(rows, new_layout.clone(), fresh);
                             drop(s);
+                            trace(format_args!(
+                                "inventory ms={} changed={changed}",
+                                t_reveal.elapsed().as_millis()
+                            ));
                             if changed {
                                 *layout_state.borrow_mut() = new_layout;
                                 render();
