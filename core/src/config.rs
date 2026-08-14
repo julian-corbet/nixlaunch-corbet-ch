@@ -291,9 +291,7 @@ pub struct Theme {
     ///
     /// The companion to `max_height_fraction`, and it exists for the same reason rather than for
     /// symmetry: more machine columns than fit meant a window wider than the screen, with the far
-    /// columns unreachable by scrollbar, keyboard or drag. Higher than the height fraction because
-    /// a launcher spanning most of the width still leaves the session legible behind it, where one
-    /// spanning most of the height does not.
+    /// columns unreachable by scrollbar, keyboard or drag.
     pub max_width_fraction: f64,
     /// Minimum width of the search bar, and so effectively of the window.
     pub width: i32,

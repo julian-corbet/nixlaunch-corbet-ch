@@ -21,9 +21,14 @@ rustPlatform.buildRustPackage {
     # Keep the store copy to the things that actually affect the build. Without this every
     # screenshot or scratch file in the working tree becomes part of the derivation's input hash,
     # and the package rebuilds because a note changed.
+    #
+    # `packaging`, `experiments` and `studies` are excluded by name for exactly that reason: the
+    # PKGBUILD, the side-shell prototypes and the write-ups are read by people, never by this
+    # build, so a commit that only touches one of them costs every consumer a rebuild otherwise.
     filter = path: type:
       let base = baseNameOf path; in
-        !(lib.hasPrefix "." base || base == "target" || base == "result");
+        !(lib.hasPrefix "." base
+          || lib.elem base [ "target" "result" "packaging" "experiments" "studies" ]);
   };
 
   cargoLock.lockFile = ./Cargo.lock;
@@ -32,6 +37,12 @@ rustPlatform.buildRustPackage {
   # work -- a GTK4 program launched without GSETTINGS_SCHEMA_DIR and the icon/theme paths set
   # starts and then fails at the first icon lookup, which looks like a broken icon theme rather
   # than a packaging mistake.
+  #
+  # The wrapper sets no renderer. Defaulting GSK_RENDERER to cairo is the PROGRAM's policy, made
+  # where every build of it -- Nix, distro, plain cargo -- gets the same answer, and it defers to
+  # an inherited GSK_RENDERER. A wrapper argument here would sit above the environment instead of
+  # below it, so `GSK_RENDERER=vulkan nixlaunch` would silently keep rendering with cairo and the
+  # escape hatch the program documents would exist everywhere except on Nix.
   nativeBuildInputs = [ pkg-config wrapGAppsHook4 ];
   nativeCheckInputs = [ clippy rustfmt ];
   buildInputs = [ gtk4 gtk4-layer-shell ];
@@ -43,27 +54,6 @@ rustPlatform.buildRustPackage {
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features --profile release \
       --target ${stdenv.targetPlatform.rust.rustcTargetSpec} --offline -- -D warnings
-  '';
-
-  # THE CAIRO RENDERER, BY DEFAULT.
-  #
-  # GTK4 picks its GSK renderer by probing the GPU, and on a machine with a working Vulkan driver it
-  # picks Vulkan. For this program that is the wrong trade in both directions, measured on a
-  # three-machine, 191-application inventory:
-  #
-  #   cairo    settles in 0.52-0.55s, ~560ms CPU, 10 Wayland frames -- every run
-  #   vulkan   one run was still burning CPU at 4.6s and had emitted 80 frames when it was killed
-  #
-  # Vulkan never reaching idle is its own bug and is being chased separately, but the renderer
-  # choice is not a workaround for it: a launcher draws boxes, labels and icons, and there is
-  # nothing here for a GPU pipeline to do. Bringing one up costs device init, shader compilation and
-  # a driver thread pool -- entirely on the path between the keystroke and the window, which is the
-  # only latency this program is judged on.
-  #
-  # `--set-default`, so this is a default and not a decree: GSK_RENDERER in the environment still
-  # wins, which is what makes it possible to reproduce the comparison above without rebuilding.
-  preFixup = ''
-    gappsWrapperArgs+=(--set-default GSK_RENDERER cairo)
   '';
 
   meta = {

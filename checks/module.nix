@@ -147,6 +147,24 @@ let
         } != [ ])
       "the search box resolves case-insensitively and takes the first match")
 
+    (check "a layout override may name the inbox row"
+      (failures
+        {
+          nixlaunch.enable = true;
+          nixlaunch.folders = [ "Files" ];
+          nixlaunch.layout.rows.Other = "1x6";
+          nixlaunch.machines = [{ name = "box"; inventory = [ "inv" ]; }];
+        } == [ ])
+      "the binary appends Other and draws it like any other row, so a shape for it must render")
+
+    (check "a blank machine name is refused"
+      (failures
+        {
+          nixlaunch.enable = true;
+          nixlaunch.machines = [{ name = "  "; inventory = [ "inv" ]; }];
+        } != [ ])
+      "the binary refuses it at load and falls back to demo data, which names nothing at fault")
+
     (check "layout override for an undeclared row is refused"
       (failures
         {
