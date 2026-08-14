@@ -26,6 +26,12 @@
 //
 // The failure mode this chooses is the right way round: a stale cache shows a stale icon until the
 // next package operation, while an over-eager check costs latency on every launch forever.
+//
+// ONE CLASS OF ENTRY IS EXEMPT, and stating it is the point of this paragraph. An `Icon=` may name
+// an absolute FILE rather than a theme icon, and such a file is reachable by no icon theme index --
+// so the theme stamp cannot see it change, and the argument above simply does not hold for it.
+// Those entries carry the file's own modification time in their key instead, which costs one stat
+// on a path we were about to open anyway and makes them self-validating rather than trusted.
 use gtk4::prelude::*;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -34,7 +40,12 @@ use std::path::PathBuf;
 
 /// Bumped whenever the on-disk layout changes, so an old file is discarded rather than
 /// misread. A cache that cannot be parsed is simply absent -- never a reason to fail to start.
-const MAGIC: &[u8; 6] = b"NLIC02";
+const MAGIC: &[u8; 6] = b"NLIC03";
+
+/// Separates an absolute icon path from the modification time that validates it. U+0001 because a
+/// key is otherwise an icon name or a file path, and neither may contain a control character --
+/// so no real name can be mistaken for a stamped one, whatever it is called.
+const STAMP_SEPARATOR: char = '\u{1}';
 
 pub struct Icons {
     px: i32,
@@ -53,6 +64,30 @@ pub struct Icons {
     textures: HashMap<String, Option<gtk4::gdk::Texture>>,
     /// Set when a name was decoded that the file did not have, i.e. the file is worth rewriting.
     dirty: bool,
+}
+
+/// What this icon is filed under, which for an absolute path includes when that file last changed.
+///
+/// A theme icon is keyed by its name and validated wholesale by the theme stamp. An absolute path
+/// cannot be: no theme index mentions it, so nothing about installing or removing software moves
+/// the stamp when such a file is replaced -- and a game that updates its artwork in place would
+/// otherwise show the old picture until something unrelated invalidated the whole cache. Folding
+/// the modification time into the key means a rewritten file simply misses and is decoded again.
+///
+/// A file that cannot be stated keeps its bare path, which is the conservative answer: it will be
+/// looked up and fail, rather than being cached under a key that claims to know something.
+fn cache_key(name: &str) -> String {
+    let path = std::path::Path::new(name);
+    if !path.is_absolute() {
+        return name.to_string();
+    }
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return name.to_string();
+    };
+    let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return name.to_string();
+    };
+    format!("{name}{STAMP_SEPARATOR}{}", age.as_nanos())
 }
 
 fn cache_path(px: i32) -> PathBuf {
@@ -161,11 +196,12 @@ impl Icons {
         if name.is_empty() {
             return None;
         }
-        if let Some(hit) = self.textures.get(name) {
+        let key = cache_key(name);
+        if let Some(hit) = self.textures.get(&key) {
             return hit.clone();
         }
         let px = self.px;
-        let made = match self.pixels.get(name) {
+        let made = match self.pixels.get(&key) {
             // THE WARM PATH, and the whole point: no lookup, no file, no rasteriser.
             Some(data) => Some(gtk4::gdk::MemoryTexture::new(
                 px,
@@ -180,13 +216,13 @@ impl Icons {
                 if let Some(ref pb) = decoded
                     && let Some(raw) = rgba_square(pb, px)
                 {
-                    self.pixels.insert(name.to_string(), raw);
+                    self.pixels.insert(key.clone(), raw);
                     self.dirty = true;
                 }
                 decoded.map(|pb| gtk4::gdk::Texture::for_pixbuf(&pb).upcast())
             }
         };
-        self.textures.insert(name.to_string(), made.clone());
+        self.textures.insert(key, made.clone());
         made
     }
 
@@ -232,17 +268,34 @@ impl Icons {
 /// and a PNG at the file's own size, so going through the pixbuf loader for both is what makes the
 /// result uniformly small rather than uniformly whatever upstream shipped.
 fn decode(name: &str, px: i32, theme: &gtk4::IconTheme) -> Option<gtk4::gdk_pixbuf::Pixbuf> {
-    let path = theme
-        .lookup_icon(
-            name,
-            &[],
-            px,
-            1,
-            gtk4::TextDirection::None,
-            gtk4::IconLookupFlags::empty(),
-        )
-        .file()?
-        .path()?;
+    // Icon= may be either a theme name or an absolute file. Passing a file path to
+    // IconTheme::lookup_icon does not load that file; it searches for a theme icon literally
+    // carrying all those slash-separated characters and returns the missing-image paintable.
+    // Steam and standalone-game entries legitimately use absolute PNG paths, so recognise that
+    // half of the desktop-entry contract before asking the theme about ordinary names.
+    let candidate = PathBuf::from(name);
+    let path = if candidate.is_absolute() {
+        // IS IT THERE. `is_absolute` is a purely lexical test, and an entry naming a file that has
+        // since been uninstalled would otherwise be handed to the loader as if it existed. Asking
+        // the theme about it instead would be worse than useless: no theme contains an icon called
+        // `/opt/something/icon.png`, so the lookup can only return the missing-image paintable.
+        if !candidate.is_file() {
+            return None;
+        }
+        candidate
+    } else {
+        theme
+            .lookup_icon(
+                name,
+                &[],
+                px,
+                1,
+                gtk4::TextDirection::None,
+                gtk4::IconLookupFlags::empty(),
+            )
+            .file()?
+            .path()?
+    };
     gtk4::gdk_pixbuf::Pixbuf::from_file_at_size(&path, px, px).ok()
 }
 
@@ -299,6 +352,52 @@ mod tests {
             textures: HashMap::new(),
             dirty: true,
         }
+    }
+
+    /// A theme icon is filed under its own name, because the theme stamp is what validates it and
+    /// a name carries nothing else worth knowing.
+    #[test]
+    fn a_theme_icon_is_keyed_by_its_name_alone() {
+        assert_eq!(cache_key("firefox"), "firefox");
+        // Relative paths are not part of the desktop-entry contract and are treated as names, so
+        // they must not acquire a stamp either.
+        assert_eq!(cache_key("icons/thing.png"), "icons/thing.png");
+    }
+
+    /// An absolute path is the one entry the theme stamp cannot see, so it validates itself: the
+    /// key moves when the file does, and a rewritten icon is decoded again instead of being served
+    /// from the cache until something unrelated invalidates the whole file.
+    #[test]
+    fn a_rewritten_icon_file_gets_a_new_key() {
+        let path = tmp("rewritten").with_file_name("art.png");
+        std::fs::write(&path, b"first").unwrap();
+        let name = path.to_str().unwrap();
+        let first = cache_key(name);
+        assert_ne!(first, name, "an absolute path must carry its own stamp");
+
+        // Two writes within one filesystem timestamp tick would be indistinguishable, which is a
+        // property of the clock rather than of this code -- so the file is given an explicitly
+        // different modification time rather than being raced against it.
+        std::fs::write(&path, b"second").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        assert_ne!(
+            cache_key(name),
+            first,
+            "a file rewritten behind an unchanged path must miss the cache"
+        );
+    }
+
+    /// A path that names nothing is not asked about: the theme cannot hold an icon called
+    /// `/opt/thing/icon.png`, so falling through to it could only produce the missing-image glyph.
+    #[test]
+    fn an_absolute_path_that_is_not_there_keeps_its_bare_name() {
+        let missing = "/nonexistent/nixlaunch-test/icon.png";
+        assert_eq!(cache_key(missing), missing);
     }
 
     /// A file this program did not write, or wrote in an older shape, reads as "no cache" rather
