@@ -266,6 +266,14 @@ const MIN_SEARCH_WIDTH: i32 = 200;
 /// Anonymous and writable only, and never the stack: this is about data the program is finished
 /// with for now, not about pages it is standing on. A failure anywhere is ignored -- the kernel
 /// declining to reclaim is not a reason for a launcher to misbehave.
+/// The last thing every machine printed, kept so an unchanged answer can be recognised without
+/// parsing it. See `inventory_bytes` for why the raw output is the right thing to compare.
+struct Inventories {
+    printed: Vec<Result<Vec<u8>, String>>,
+    rows: Vec<String>,
+    layout: config::Layout,
+}
+
 /// Whether to print the machine-readable trace, decided once from `NIXLAUNCH_TRACE`.
 fn tracing_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1672,6 +1680,10 @@ fn build(application: &Application) {
         // existed begin using it once the file appears.
         let refresh_config = Rc::new(RefCell::new(loaded_config.clone()));
         let refresh_generation = Rc::new(std::cell::Cell::new(0u64));
+        // Shared with the worker thread rather than owned by it: the worker is created fresh on
+        // every reveal, and recognising an unchanged answer is precisely a memory ACROSS reveals.
+        let inventories: std::sync::Arc<std::sync::Mutex<Option<Inventories>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         let reveal: Rc<dyn Fn()> = Rc::new(move || {
             let t_reveal = std::time::Instant::now();
             arm_focus();
@@ -1716,24 +1728,51 @@ fn build(application: &Application) {
             refresh_generation.set(generation);
             let latest = refresh_generation.clone();
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let seen = inventories.clone();
             std::thread::spawn(move || {
                 let rows = cfg.folder_rows();
                 let layout = cfg.layout.clone();
-                let fresh = inventory_all(&cfg.machines, &rows, &cfg.subrows);
-                let _ = tx.send((rows, layout, fresh));
+                let printed = inventory_bytes_all(&cfg.machines);
+                // NOTHING MOVED, SO THERE IS NOTHING TO DO. The rows and the layout are compared
+                // too because either can change without a machine saying anything different, and
+                // both decide which row an application lands in.
+                let unchanged = {
+                    let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+                    seen.as_ref().is_some_and(|last| {
+                        last.printed == printed && last.rows == rows && last.layout == layout
+                    })
+                };
+                if unchanged {
+                    let _ = tx.send(None);
+                    return;
+                }
+                let fresh = machines_from(&cfg.machines, &printed, &rows, &cfg.subrows);
+                *seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(Inventories {
+                    printed,
+                    rows: rows.clone(),
+                    layout: layout.clone(),
+                });
+                let _ = tx.send(Some((rows, layout, fresh)));
             });
             let state = state.clone();
             let layout_state = layout.clone();
             let render = render.clone();
             gtk::glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
                 match rx.try_recv() {
-                    Ok((rows, new_layout, fresh)) => {
+                    Ok(None) => {
+                        trace(format_args!(
+                            "inventory ms={} changed=false skipped=true",
+                            t_reveal.elapsed().as_millis()
+                        ));
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Ok(Some((rows, new_layout, fresh))) => {
                         if latest.get() == generation {
                             let mut s = state.borrow_mut();
                             let changed = s.replace_inventory(rows, new_layout.clone(), fresh);
                             drop(s);
                             trace(format_args!(
-                                "inventory ms={} changed={changed}",
+                                "inventory ms={} changed={changed} skipped=false",
                                 t_reveal.elapsed().as_millis()
                             ));
                             if changed {
@@ -2107,31 +2146,46 @@ fn load_world() -> World {
 /// A panicking thread yields that machine's column as unreachable rather than taking the process
 /// with it. One machine's inventory command is not a reason for the other two to be unavailable,
 /// and an inventory command is arbitrary user-supplied argv.
+/// Ask every machine at once and keep the answers unparsed.
+///
+/// Concurrency buys exactly one thing here, and this is it: asking is the only part that waits on
+/// something outside this process. Everything after it is arithmetic.
+fn inventory_bytes_all(machines: &[config::MachineConfig]) -> Vec<Result<Vec<u8>, String>> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = machines
+            .iter()
+            .map(|mc| scope.spawn(move || inventory_bytes(mc)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("inventory panicked".into()))
+            })
+            .collect()
+    })
+}
+
+/// The grid those answers describe. Pure, so it can be skipped when the answers have not moved.
+fn machines_from(
+    machines: &[config::MachineConfig],
+    printed: &[Result<Vec<u8>, String>],
+    rows: &[String],
+    subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
+) -> Vec<Machine> {
+    machines
+        .iter()
+        .zip(printed)
+        .map(|(mc, raw)| machine_from(mc, raw, rows, subrows))
+        .collect()
+}
+
 fn inventory_all(
     machines: &[config::MachineConfig],
     rows: &[String],
     subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
 ) -> Vec<Machine> {
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = machines
-            .iter()
-            .map(|mc| scope.spawn(move || inventory(mc, rows, subrows)))
-            .collect();
-        handles
-            .into_iter()
-            .zip(machines)
-            .map(|(h, mc)| {
-                h.join().unwrap_or_else(|_| Machine {
-                    name: mc.name.clone(),
-                    aliases: mc.aliases.clone(),
-                    accent: mc.accent.clone(),
-                    launch: mc.launch.clone(),
-                    error: Some("inventory panicked".into()),
-                    cells: vec![Vec::new(); rows.len()],
-                })
-            })
-            .collect()
-    })
+    machines_from(machines, &inventory_bytes_all(machines), rows, subrows)
 }
 
 /// Ask ONE machine what it has, by running the command config named for it.
@@ -2139,18 +2193,16 @@ fn inventory_all(
 /// Everything this program knows about detection is in these few lines: run argv, read JSON. No
 /// SSH, no .desktop parsing, no package managers -- see config.rs on why that boundary is the
 /// point rather than a simplification.
-fn inventory(
-    mc: &config::MachineConfig,
-    rows: &[String],
-    subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
-) -> Machine {
-    let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
-    // Declared without a value: both arms of the match below assign it, so an initial `None`
-    // would be a value nothing ever reads -- which is exactly what the compiler was saying.
-    let error;
-
-    let parsed = mc
-        .inventory
+/// WHAT THE MACHINE PRINTED, unparsed -- or why it could not be asked.
+///
+/// Split from building the grid because the BYTES are the identity of the answer. A resident
+/// launcher re-asks every machine on every open, and the overwhelmingly common outcome is that
+/// nothing has changed since the last open: measured on a real three-machine inventory, the refresh
+/// reported no change on every single reveal. Comparing the raw output first lets that case cost a
+/// spawn, a read and a memcmp, instead of parsing two hundred applications, regrouping them into
+/// rows and subrows, and then deep-comparing the result to discover it was identical.
+fn inventory_bytes(mc: &config::MachineConfig) -> Result<Vec<u8>, String> {
+    mc.inventory
         .split_first()
         .ok_or_else(|| "no inventory command configured".to_string())
         .and_then(|(bin, args)| {
@@ -2162,7 +2214,7 @@ fn inventory(
         })
         .and_then(|out| {
             if out.status.success() {
-                config::parse_inventory(&out.stdout)
+                Ok(out.stdout)
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 Err(if stderr.is_empty() {
@@ -2171,7 +2223,25 @@ fn inventory(
                     stderr
                 })
             }
-        });
+        })
+}
+
+/// Turn one machine's printed answer into its column. Pure: no processes, no clock, no I/O.
+fn machine_from(
+    mc: &config::MachineConfig,
+    printed: &Result<Vec<u8>, String>,
+    rows: &[String],
+    subrows: &std::collections::HashMap<String, Vec<config::SubRow>>,
+) -> Machine {
+    let mut cells: Vec<Vec<Line>> = vec![Vec::new(); rows.len()];
+    // Declared without a value: both arms of the match below assign it, so an initial `None`
+    // would be a value nothing ever reads -- which is exactly what the compiler was saying.
+    let error;
+
+    let parsed = match printed {
+        Ok(bytes) => config::parse_inventory(bytes),
+        Err(e) => Err(e.clone()),
+    };
 
     match parsed {
         Ok(inv) => {

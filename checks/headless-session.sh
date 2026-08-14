@@ -177,6 +177,16 @@ for r in refreshes:
     if r.get("changed") == "true":
         failures.append("a static inventory reported changed=true, forcing a second render")
 
+# AND IT MUST STOP RE-READING AN ANSWER IT ALREADY HAS. The first open has nothing to compare
+# against and does the work; every open after it should recognise the identical output and skip
+# parsing it. Measured on a real inventory that is 16ms of the 42ms refresh, thrown away on every
+# open before this. A run where nothing skips means the comparison stopped matching.
+later = [r for r in refreshes[1:]]
+if later and not all(r.get("skipped") == "true" for r in later):
+    failures.append(
+        "an unchanged inventory was parsed again instead of skipped: "
+        + ", ".join(r.get("skipped", "?") for r in later))
+
 print(f"maps={maps} settles={[len(g) for g in settles]} "
       f"rebuilds={[f'{us}us/{n}apps' for us, n in renders]} refresh={refreshes}")
 if failures:
