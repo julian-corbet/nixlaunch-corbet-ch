@@ -234,6 +234,14 @@ unsafe extern "C" {
 /// would eventually do anyway.
 const MADV_PAGEOUT: i32 = 21;
 
+/// How far the search bar may be squeezed to let a narrow output honour its width cap.
+///
+/// A floor rather than nothing at all: the point of giving width back is to keep the far machine
+/// column on screen, and a search bar squeezed to a few characters would trade one unusable thing
+/// for another. Below this the screen is simply too narrow for the configured grid, which is a
+/// scrollbar's problem and not a sizing one.
+const MIN_SEARCH_WIDTH: i32 = 200;
+
 /// Hand the idle heap back to the kernel, which on this class of machine means handing it to a
 /// compressor.
 ///
@@ -663,27 +671,26 @@ fn build(application: &Application) {
 
     // THE OUTPUT WE ARE ACTUALLY ON -- on every map, on both axes, in both directions.
     //
-    // This ran once from `realize` and could only ever make the window smaller. Both halves were
-    // wrong for a resident daemon, and together they left the launcher stuck at the size of the
-    // smallest screen attached to the session:
+    // A resident process makes this decision repeatedly, and it used to be made once and then
+    // remembered. Whichever output the FIRST resolution happened to name sized the window for the
+    // rest of the process, which on a desk with screens of different sizes is a launcher that opens
+    // with machine columns hanging off the right edge and never recovers:
     //
-    //   * A daemon starts HIDDEN, so its surface is realised without ever being mapped. Asking an
-    //     unmapped surface which output it is on does not fail, it answers -- with whichever
-    //     output owns the origin. Beside a large landscape screen, a small portrait panel at 0,0
-    //     won that question every time, and nothing about the answer looked wrong.
-    //   * The cap was then applied with `set_default_width`, which PINS a toplevel's size. A later
-    //     reveal on the large output could raise the ScrolledWindow's maximum all it liked; the
-    //     window had a remembered size and kept it, holding whole machine columns off the right
-    //     edge for the rest of the session.
+    //   * The cap was applied with `set_default_width`, and a GTK default size is REMEMBERED. It
+    //     survives the hide, and every later size negotiation is computed from it rather than from
+    //     what the content measures, so one narrow answer outlives the situation that produced it.
+    //   * Raising the ScrolledWindow's maximum again on a wider output did nothing, because that
+    //     maximum only bounds a natural width the window had stopped consulting.
     //
-    // `enter-monitor` is the authority now and it fires on every map, height comes from that same
-    // output instead of a global minimum, and the new size is requested by dropping the remembered
-    // one and re-measuring -- the same mechanism that sized the window in the first place, which
-    // is why it grows as readily as it shrinks.
+    // So the caps are re-derived from the entered output every map, height included -- deriving it
+    // from the smallest attached screen was the same mistake one axis over -- and the size is
+    // measured and requested outright rather than left to be remembered.
     let apply_monitor: Rc<dyn Fn(&gtk::gdk::Monitor)> = Rc::new({
         let scroller = scroller.clone();
         let root = root.clone();
+        let search = search.clone();
         let window = window.clone();
+        let search_width = theme.width;
         let width_fraction = theme.max_width_fraction;
         let height_fraction = theme.max_height_fraction;
         move |monitor: &gtk::gdk::Monitor| {
@@ -691,8 +698,29 @@ fn build(application: &Application) {
             if geometry.width() <= 0 || geometry.height() <= 0 {
                 return;
             }
-            scroller.set_max_content_width((geometry.width() as f64 * width_fraction) as i32);
+            let width_cap = (geometry.width() as f64 * width_fraction) as i32;
+            scroller.set_max_content_width(width_cap);
             scroller.set_max_content_height((geometry.height() as f64 * height_fraction) as i32);
+
+            // THE SEARCH BAR DOES NOT GET TO OUTVOTE THE SCREEN.
+            //
+            // `theme.width` is a minimum, and a minimum is a floor no cap can reach under: at the
+            // default 560, plus the row's padding and the label column beside it, the window cannot
+            // measure much under 700px however small the fraction makes the cap. On a narrow panel
+            // that quietly turns the cap off -- on precisely the screen it exists to protect, since
+            // a wide one was never in danger. Hand the excess back by asking the search bar for
+            // less: it is the only widget here whose width is a preference rather than content, and
+            // a shorter search bar is a smaller thing to lose than the right-hand machine column.
+            //
+            // Reset first, so returning to a large screen restores the configured width instead of
+            // inheriting whatever the smallest screen visited so far settled on.
+            search.set_width_request(search_width);
+            let (minimum, _, _, _) = root.measure(gtk::Orientation::Horizontal, -1);
+            let overrun = minimum - width_cap;
+            if overrun > 0 {
+                search.set_width_request((search_width - overrun).max(MIN_SEARCH_WIDTH));
+            }
+
             // MEASURE, THEN ASK FOR EXACTLY THAT -- rather than clearing the size and hoping the
             // window follows its content down.
             //
