@@ -744,6 +744,12 @@ fn build(application: &Application) {
     // So the caps are re-derived from the entered output every map, height included -- deriving it
     // from the smallest attached screen was the same mistake one axis over -- and the size is
     // measured and requested outright rather than left to be remembered.
+    // WHEN THIS SHOWING BEGAN, so the frame callback below can say how long it took to become
+    // pixels. Every other number this program reports is internal work; this is the only one that
+    // measures what a person waits for.
+    let revealed_at: Rc<std::cell::Cell<Option<std::time::Instant>>> =
+        Rc::new(std::cell::Cell::new(None));
+
     let apply_monitor: Rc<dyn Fn(&gtk::gdk::Monitor)> = Rc::new({
         let scroller = scroller.clone();
         let root = root.clone();
@@ -811,6 +817,7 @@ fn build(application: &Application) {
 
     {
         let apply_monitor = apply_monitor.clone();
+        let revealed_at = revealed_at.clone();
         window.connect_realize(move |w| {
             let Some(surface) = w.surface() else { return };
             // ONCE PER MAP, and this guard is load-bearing rather than tidiness.
@@ -844,12 +851,27 @@ fn build(application: &Application) {
             w.connect_map({
                 let apply_monitor = apply_monitor.clone();
                 let settled = settled.clone();
+                let revealed_at = revealed_at.clone();
                 move |w| {
                     // A new showing is a new question: the launcher may well be opened on a
                     // different screen than it was last time, and the guard above must not answer
                     // for a map it never saw.
                     settled.set(false);
                     trace(format_args!("map"));
+                    // THE FIRST FRAME AFTER THE MAP. A tick callback runs as the frame clock
+                    // paints, so this is the moment the window becomes something on a screen
+                    // rather than a size negotiation -- and it removes itself immediately, because
+                    // the interesting frame is the first one and a launcher must not hold a repaint
+                    // loop open behind it.
+                    if tracing_on() {
+                        let started = revealed_at.clone();
+                        w.add_tick_callback(move |_, _| {
+                            if let Some(t) = started.take() {
+                                trace(format_args!("presented us={}", t.elapsed().as_micros()));
+                            }
+                            gtk::glib::ControlFlow::Break
+                        });
+                    }
                     let window = w.clone();
                     let apply_monitor = apply_monitor.clone();
                     gtk::glib::timeout_add_local_once(
@@ -1674,6 +1696,7 @@ fn build(application: &Application) {
         let arm_focus = arm_focus.clone();
         let layout = layout.clone();
         let prefer_output = prefer_output.clone();
+        let revealed_at = revealed_at.clone();
         // LAST KNOWN GOOD. Home Manager replaces the file atomically, but direct editors need not;
         // a parse failure during a save must not replace the coherent grid with fixtures or empty
         // columns. The next reveal tries again. This also lets a daemon started before config.json
@@ -1686,6 +1709,7 @@ fn build(application: &Application) {
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let reveal: Rc<dyn Fn()> = Rc::new(move || {
             let t_reveal = std::time::Instant::now();
+            revealed_at.set(Some(t_reveal));
             arm_focus();
             // Reveal the coherent cached grid immediately. Inventory refresh is external I/O and
             // belongs off the GTK thread; one wedged peer must not stop the existing window from
