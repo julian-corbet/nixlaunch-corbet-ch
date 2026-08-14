@@ -386,11 +386,23 @@ fn main() {
 
 /// The first configured output that is actually attached, if any.
 ///
-/// Matched case-insensitively against three names for the same screen, because which one a person
-/// has to hand differs: the CONNECTOR (`DP-1`, `HDMI-A-1`) is what a compositor prints, the MODEL
-/// (`DELL U4323QE`) is what the screen calls itself, and `manufacturer model` is how a settings
-/// panel usually renders it. Only the model survives being plugged into another machine or another
-/// port, so accepting all three is what lets one configured value mean one physical screen.
+/// TWO KINDS OF MATCH, because a monitor has two kinds of name and they behave differently.
+///
+/// The CONNECTOR (`DP-1`, `HDMI-A-1`) is an exact handle and is matched exactly: it is short,
+/// there is one per output, and a substring rule on something that short would have `DP-1` claim
+/// `DP-11`.
+///
+/// Everything else is matched as a case-insensitive SUBSTRING of the monitor's descriptive names,
+/// and that is not laxity, it is the shape of the data. GDK fills `manufacturer` and `model` only
+/// when the backend hands them over separately; on wlroots compositors both come back as the
+/// literal string `Unknown` and the entire identity arrives in the DESCRIPTION instead:
+///
+///     connector "DP-1"   manufacturer "Unknown"   model "Unknown"
+///     description "Dell Inc. DELL U4323QE DPMH1P3 (DP-1)"
+///
+/// A configured `DELL U4323QE` has to find that. Exact-matching a field that also carries the
+/// vendor, the serial and the connector could only ever fail, and failing here is quiet -- it
+/// falls back to the compositor's choice, which looks exactly like the option not being read.
 fn preferred_monitor(outputs: &[String]) -> Option<gtk::gdk::Monitor> {
     if outputs.is_empty() {
         return None;
@@ -406,28 +418,47 @@ fn preferred_monitor(outputs: &[String]) -> Option<gtk::gdk::Monitor> {
     // arbitrary answer this option exists to replace.
     outputs.iter().find_map(|wanted| {
         let wanted = wanted.trim().to_lowercase();
+        if wanted.is_empty() {
+            return None;
+        }
         attached
             .iter()
-            .find(|monitor| monitor_names(monitor).iter().any(|name| *name == wanted))
+            .find(|monitor| monitor_matches(monitor, &wanted))
             .cloned()
     })
 }
 
-/// Every name one monitor answers to, lowercased, with the blanks dropped.
-fn monitor_names(monitor: &gtk::gdk::Monitor) -> Vec<String> {
+/// Whether one already-lowercased configured name identifies this monitor.
+fn monitor_matches(monitor: &gtk::gdk::Monitor, wanted: &str) -> bool {
     let text = |value: Option<gtk::glib::GString>| {
         value
             .map(|s| s.trim().to_lowercase())
             .unwrap_or_else(String::new)
     };
-    let connector = text(monitor.connector());
-    let model = text(monitor.model());
-    let manufacturer = text(monitor.manufacturer());
-    let full = format!("{manufacturer} {model}").trim().to_string();
-    [connector, model, full]
+    if text(monitor.connector()) == wanted {
+        return true;
+    }
+    // "Unknown" is not a name, it is GDK saying it was told nothing -- and it is the SAME
+    // non-answer on every output, so honouring it would make one configured word match whichever
+    // screen happened to be enumerated first.
+    let known = |value: String| {
+        if value.is_empty() || value == "unknown" {
+            None
+        } else {
+            Some(value)
+        }
+    };
+    let manufacturer = known(text(monitor.manufacturer()));
+    let model = known(text(monitor.model()));
+    let described = known(text(monitor.description()));
+    let full = match (&manufacturer, &model) {
+        (Some(m), Some(n)) => Some(format!("{m} {n}")),
+        _ => None,
+    };
+    [model, described, full, manufacturer]
         .into_iter()
-        .filter(|name| !name.is_empty())
-        .collect()
+        .flatten()
+        .any(|name| name.contains(wanted))
 }
 
 fn build(application: &Application) {
