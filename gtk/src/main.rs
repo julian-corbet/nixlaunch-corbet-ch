@@ -1445,14 +1445,12 @@ fn build(application: &Application) {
                     Ok((rows, new_layout, fresh)) => {
                         if latest.get() == generation {
                             let mut s = state.borrow_mut();
-                            s.folders = rows;
-                            s.layout = new_layout.clone();
-                            s.base = fresh;
-                            s.rebuild();
-                            s.clamp();
+                            let changed = s.replace_inventory(rows, new_layout.clone(), fresh);
                             drop(s);
-                            *layout_state.borrow_mut() = new_layout;
-                            render();
+                            if changed {
+                                *layout_state.borrow_mut() = new_layout;
+                                render();
+                            }
                         }
                         gtk::glib::ControlFlow::Break
                     }

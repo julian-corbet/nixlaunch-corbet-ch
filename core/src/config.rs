@@ -168,7 +168,7 @@ fn default_inventory_timeout_ms() -> u64 {
 /// second layout engine beside GTK and makes the result depend on when fonts finish loading. A
 /// bounded label plus an item count gives the stable answer the eye actually needs: short vectors
 /// remain compact, medium ones balance over at most three lines, and long ones pan locally.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Layout {
     pub equal_columns: bool,

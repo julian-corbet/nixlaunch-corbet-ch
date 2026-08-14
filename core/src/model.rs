@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 // ── the model ───────────────────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct App {
     /// WHAT THIS APP IS, as opposed to what it calls itself. Placement and usage are both keyed on
     /// this and never on `name`, because a display name is not an identity: it is translated, it is
@@ -41,7 +41,7 @@ pub struct App {
 
 /// A line IS an appset: the apps on it are meant to be started together, and the fact that they
 /// sit on one line is the whole declaration. No separate "group" concept, no naming ceremony.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Line {
     /// What this row of the box is FOR, when it is for something in particular.
     ///
@@ -56,7 +56,7 @@ pub struct Line {
     pub apps: Vec<App>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Machine {
     pub name: String,
     /// Other things this machine may be called when typed at. A machine's NAME is what it is; an
@@ -503,11 +503,7 @@ impl State {
     /// (inventory, placement) to what is on screen.
     pub fn rebuild(&mut self) {
         self.machines = apply_placement(&self.base, &self.placement, &self.folders);
-        apply_visibility(
-            &mut self.machines,
-            &self.visibility,
-            self.layout.max_items_per_line,
-        );
+        apply_visibility(&mut self.machines, &self.visibility);
         // Placement decides MEMBERSHIP -- which folder, which line. Usage decides ORDER within
         // that, and only where the evidence justifies a move. Running it here rather than baking
         // it into the placement file keeps the two separable: the file stays a record of what the
@@ -520,6 +516,30 @@ impl State {
             self.half_life_days,
         );
         self.refilter();
+    }
+
+    /// Replace the model inputs returned by a background inventory refresh.
+    ///
+    /// A resident launcher normally receives the same inventory on every reveal. Rebuilding an
+    /// identical model allocates the derived grid and then makes GTK replace every widget in it,
+    /// even though not one visible byte changed. Equality here is exact -- including order,
+    /// errors, launch prefixes and layout -- so `false` is safe evidence that the cached grid is
+    /// already current, while any real change still takes the one ordinary rebuild path.
+    pub fn replace_inventory(
+        &mut self,
+        folders: Vec<String>,
+        layout: Layout,
+        base: Vec<Machine>,
+    ) -> bool {
+        if self.folders == folders && self.layout == layout && self.base == base {
+            return false;
+        }
+        self.folders = folders;
+        self.layout = layout;
+        self.base = base;
+        self.rebuild();
+        self.clamp();
+        true
     }
 
     /// Freeze a machine's CURRENT grid into the placement verbatim.
@@ -1044,67 +1064,22 @@ pub fn apply_placement(base: &[Machine], p: &Placement, folders: &[String]) -> V
         .collect()
 }
 
-/// Remove hidden ids from the derived grid without touching inventory or placement. The anonymous
-/// wrapped run that lost an application is repacked to the configured width, so hiding one item
-/// can turn two sparse display lines back into one. Named appsets are hard boundaries, and an
-/// untouched anonymous run is left byte-for-byte in its existing grouping.
-pub fn apply_visibility(machines: &mut [Machine], visibility: &Visibility, line_width: usize) {
-    let line_width = line_width.max(1);
+/// Remove hidden ids from the derived grid without touching inventory or placement.
+///
+/// This pass owns membership only. `reflow_vectors` owns presentation and immediately flattens
+/// each cell into the configured balanced lines or rail, so packing here as well merely allocated
+/// a temporary layout that the next pass discarded.
+pub fn apply_visibility(machines: &mut [Machine], visibility: &Visibility) {
     for machine in machines {
         let Some(hidden) = visibility.get(&machine.name) else {
             continue;
         };
         for cell in &mut machine.cells {
-            let old = std::mem::take(cell);
-            let mut packed = Vec::with_capacity(old.len());
-            let mut run: Vec<Line> = Vec::new();
-
-            let flush_run = |run: &mut Vec<Line>, packed: &mut Vec<Line>| {
-                if run.is_empty() {
-                    return;
-                }
-                let mut touched = false;
-                for line in run.iter_mut() {
-                    let before = line.apps.len();
-                    line.apps.retain(|app| !hidden.contains(&app.id));
-                    touched |= line.apps.len() != before;
-                }
-                if !touched {
-                    packed.append(run);
-                    return;
-                }
-
-                let apps = std::mem::take(run).into_iter().flat_map(|line| line.apps);
-                for app in apps {
-                    if packed
-                        .last()
-                        .is_none_or(|line| line.name.is_some() || line.apps.len() == line_width)
-                    {
-                        packed.push(Line {
-                            name: None,
-                            apps: Vec::with_capacity(line_width),
-                        });
-                    }
-                    packed
-                        .last_mut()
-                        .expect("line was just created")
-                        .apps
-                        .push(app);
-                }
-            };
-
-            for mut line in old {
-                if line.name.is_none() {
-                    run.push(line);
-                    continue;
-                }
-                flush_run(&mut run, &mut packed);
+            for line in cell.iter_mut() {
                 line.apps.retain(|app| !hidden.contains(&app.id));
-                // Named rows remain valid drop targets even when their final app is hidden.
-                packed.push(line);
             }
-            flush_run(&mut run, &mut packed);
-            *cell = packed;
+            // Named rows remain valid placement targets even when their final app is hidden.
+            cell.retain(|line| !line.apps.is_empty() || line.name.is_some());
         }
     }
 }
@@ -1406,6 +1381,19 @@ mod tests {
         s.machines = apply_placement(&s.base, &s.placement, &s.folders);
         s.refilter();
         s
+    }
+
+    #[test]
+    fn an_unchanged_inventory_refresh_is_a_noop() {
+        let mut s = state(vec![machine("m", 0, vec![vec!["alpha", "beta"]])]);
+        let before = s.view.clone();
+
+        assert!(!s.replace_inventory(s.folders.clone(), s.layout.clone(), s.base.clone()));
+        assert!(s.view == before, "the cached derived grid was retained");
+
+        let replacement = vec![machine("m", 0, vec![vec!["alpha", "gamma"]])];
+        assert!(s.replace_inventory(s.folders.clone(), s.layout.clone(), replacement));
+        assert_eq!(s.view[0].cells[0][0].apps[1].id, "gamma");
     }
 
     #[test]
