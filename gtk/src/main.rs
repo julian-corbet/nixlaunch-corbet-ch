@@ -81,7 +81,7 @@ fn insert_index_at(container: &GBox, x: f64) -> usize {
 // The per-machine accent on the column head is the same identity colour the window frames and
 // forwarded-window badges use, so a column is recognisable before you read its label.
 /// The stylesheet, generated from config values rather than written as a constant. See
-/// `config::Theme` -- a colour nobody can reach is this repo carrying one estate's taste.
+/// `config::Theme` -- a colour nobody can reach is this repo carrying one setup's taste.
 fn css(t: &config::Theme) -> String {
     format!(
         "
@@ -629,7 +629,7 @@ fn build(application: &Application) {
     // A real inventory is hundreds of applications, and "size to content" -- correct for the
     // fixture -- turns that into a window taller than the display, clipped at both ends with no
     // way to reach the middle. The grid keeps its natural size until it hits a ceiling and then
-    // scrolls, so a small estate still gets a window that hugs its content.
+    // scrolls, so a handful of machines still gets a window that hugs its content.
     let scroller = gtk::ScrolledWindow::new();
     // BOTH AXES. Horizontal was Never, which is only safe while the content happens to fit: add
     // machines until the grid is wider than the display and the far columns become unreachable by
@@ -1892,7 +1892,7 @@ fn build(application: &Application) {
 /// Config if there is one, fixture data if there is not.
 ///
 /// A MISSING config is not an error -- a bare checkout must still run, which is what keeps this
-/// repo testable by someone with no fleet. A config that EXISTS but does not parse is a different
+/// repo testable by someone with no machines. A config that EXISTS but does not parse is a different
 /// thing entirely and is reported rather than silently replaced by fixtures, because silently
 /// showing invented machines when the real ones failed to load is the worst of both.
 fn load_world() -> World {
@@ -2037,7 +2037,7 @@ fn inventory(
             // The machine reporting its own failure outranks anything inferred here.
             error = inv.error;
             for folder in inv.folders {
-                // A label this estate does not list falls into the inbox rather than being
+                // A label the config does not list falls into the inbox rather than being
                 // dropped: an app nobody categorised must still be reachable.
                 // WHICH ROW, and a declared subcategory beats the catch-all.
                 //

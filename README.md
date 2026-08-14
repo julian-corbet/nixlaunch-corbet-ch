@@ -75,7 +75,7 @@ about SSH, `.desktop` files, flatpaks, package managers or remote hosts, and it 
 "what programs exist on a machine" is a question with owners elsewhere, and a launcher is the wrong
 place to grow a second, competing answer to it.
 
-It also means you can run this with no fleet at all: point `inventory` at a script that echoes a
+It also means you can run this with no machines at all: point `inventory` at a script that echoes a
 fixed string and everything works.
 
 ```json
@@ -139,26 +139,6 @@ nixlaunch = {
 };
 ```
 
-## Which screen it opens on
-
-Nothing, by default: outputs are equal and the compositor decides, because it already knows which
-screen is being worked on. `outputs` is for the desk where that answer is reliably wrong — a large
-screen beside a small vertical one, where the launcher belongs on the large one every time
-whatever happened to hold focus.
-
-```nix
-nixlaunch.outputs = [ "DELL U4323QE" "eDP-1" ];   # first one attached wins
-```
-
-Entries match case-insensitively against a monitor's connector (`DP-1`, `HDMI-A-1`), its model, and
-`manufacturer model` joined. Anything not currently plugged in is skipped and a list matching
-nothing falls back to the compositor, so a laptop that is sometimes docked names the dock's screen
-first and needs no second configuration for the times it is carried away.
-
-Name the **model** rather than the connector where you can. One screen plugged into two machines is
-`DP-1` on one and `HDMI-A-1` on the other, and the connector moves when a cable does; the model is
-the same string everywhere and keeps meaning the same screen.
-
 `machines` and `folders` are **lists, not attrsets**, and that is load-bearing rather than
 stylistic. Column order decides which machine you open on; row order decides which row an app lands
 in, because grouping upstream is first-match-wins. An attrset would alphabetise both and silently
@@ -201,6 +181,26 @@ and each command is bounded by `inventory_timeout_ms`. Model inputs — folders,
 launch prefixes, and vector layout — update on that reveal. Settings bound to the existing
 GTK process or window — CSS/theme, key bindings, terminal wrapper, focus policy, and surface mode —
 take effect at the next ordinary process start instead of half-reconfiguring a mapped window.
+
+## Which screen it opens on
+
+Nothing, by default: outputs are equal and the compositor decides, because it already knows which
+screen is being worked on. `outputs` is for the desk where that answer is reliably wrong — a large
+screen beside a small vertical one, where the launcher belongs on the large one every time
+whatever happened to hold focus.
+
+```nix
+nixlaunch.outputs = [ "DELL U4323QE" "eDP-1" ];   # first one attached wins
+```
+
+Entries match case-insensitively against a monitor's connector (`DP-1`, `HDMI-A-1`), its model, and
+`manufacturer model` joined. Anything not currently plugged in is skipped and a list matching
+nothing falls back to the compositor, so a laptop that is sometimes docked names the dock's screen
+first and needs no second configuration for the times it is carried away.
+
+Name the **model** rather than the connector where you can. One screen plugged into two machines is
+`DP-1` on one and `HDMI-A-1` on the other, and the connector moves when a cable does; the model is
+the same string everywhere and keeps meaning the same screen.
 
 ## Status
 
