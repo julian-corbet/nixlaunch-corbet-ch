@@ -47,8 +47,13 @@ Every arrangement is saved.
 
 ## Visibility
 
-Right-click an application to reveal its compact inline eye-slash **Hide** action, then choose it
-to hide the application on that machine. Hiding is persistent user state, not an inventory or
+Right-click an application to arm it — a compact eye-slash marker appears over its icon — then
+click it to hide it on that machine. A primary click on anything else disarms and does what it
+always did, so changing your mind costs one ordinary click.
+
+The marker takes no input of its own. It is drawn over the icon and is deliberately inert: the
+application's own click gesture performs the hide, which is the same gesture that launches, so the
+two cannot contend for one press. Hiding is persistent user state, not an inventory or
 placement edit: the application stays hidden across refreshes and deployments, while its folder,
 line and position remain intact underneath. `Ctrl+Shift+H` shows every hidden application again,
 restored to those exact positions.

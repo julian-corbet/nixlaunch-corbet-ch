@@ -986,10 +986,10 @@ fn build(application: &Application) {
             };
             let hidden = s.hidden_count();
             if hidden == 0 {
-                hint.set_markup(&format!("{base_hint}   <b>right-click</b> hide"));
+                hint.set_markup(&format!("{base_hint}   <b>right-click</b> then click to hide"));
             } else {
                 hint.set_markup(&format!(
-                    "{base_hint}   <b>right-click</b> hide   <b>Ctrl+Shift+H</b> show all ({hidden})"
+                    "{base_hint}   <b>right-click</b> then click to hide   <b>Ctrl+Shift+H</b> show all ({hidden})"
                 ));
             }
 
@@ -1088,10 +1088,23 @@ fn build(application: &Application) {
     });
 
     // The currently revealed inline action, if any. Only one is shown at a time so right-clicking
-    // another application moves the affordance instead of leaving a trail of Hide buttons.
+    // another application moves the affordance instead of leaving a trail of Hide markers.
     // Inline is important: a GtkPopover creates a second Wayland surface, which makes the layer
     // window report focus loss and correctly triggers this launcher's dismiss-on-blur policy.
-    let visible_hide_action = Rc::new(RefCell::new(None::<gtk::Button>));
+    //
+    // A MARKER, NOT A BUTTON, and that is the fix to a bug rather than a matter of taste. It was a
+    // 20px GtkButton overlaid on the icon, inside an application box that already carries a drag
+    // source and a click gesture of its own -- three handlers contending for one press on one small
+    // square. The press was reliably eaten by one of the other two: the eye appeared, clicking it
+    // did nothing at all, and nothing was launched either, so there was not even a wrong outcome to
+    // notice. Making it inert and letting the ARMED application's own click gesture perform the
+    // hide removes the contention instead of trying to win it -- the same gesture that has always
+    // launched reliably, so the path is known good.
+    let visible_hide_action = Rc::new(RefCell::new(None::<Image>));
+
+    // WHICH application is armed, by identity rather than by widget: the grid is rebuilt whenever
+    // the query changes or a drag lands, so a widget handle would outlive the thing it stood for.
+    let armed_hide = Rc::new(RefCell::new(None::<(String, String)>));
 
     let render: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
@@ -1107,6 +1120,7 @@ fn build(application: &Application) {
         let icon_theme = icon_theme.clone();
         let icon_cache = icon_cache.clone();
         let visible_hide_action = visible_hide_action.clone();
+        let armed_hide = armed_hide.clone();
         // For the click path: launching needs the window to dismiss, the terminal wrapper for
         // programs that draw none, and the state to record the launch against.
         let window = window.clone();
@@ -1121,6 +1135,9 @@ fn build(application: &Application) {
             // way for the real selection to keep a highlight it should have lost.
             painted.borrow_mut().reset();
             *visible_hide_action.borrow_mut() = None;
+            // Disarmed with it. A rebuilt grid is a new set of widgets, and an application left
+            // armed across one would hide on a click the user meant as a launch.
+            *armed_hide.borrow_mut() = None;
 
             while let Some(c) = grid.first_child() {
                 grid.remove(&c);
@@ -1351,13 +1368,15 @@ fn build(application: &Application) {
                             icon_overlay.set_child(Some(&img));
                             icon_overlay.set_hexpand(false);
 
-                            let hide_action = gtk::Button::new();
-                            hide_action.set_has_frame(false);
+                            // INERT. It states that this application is armed and takes no input of
+                            // its own: `can_target(false)` puts it out of the picking pass
+                            // entirely, so a press on the icon reaches the box's own gesture the
+                            // way a press anywhere else on the application already does.
+                            let hide_action = Image::from_icon_name("view-conceal-symbolic");
                             hide_action.add_css_class("hide-action");
                             hide_action.set_tooltip_text(Some(&format!("Hide {}", app.name)));
-                            let hide_icon = Image::from_icon_name("view-conceal-symbolic");
-                            hide_icon.set_pixel_size(16);
-                            hide_action.set_child(Some(&hide_icon));
+                            hide_action.set_pixel_size(16);
+                            hide_action.set_can_target(false);
                             hide_action.set_size_request(icon_px, icon_px);
                             hide_action.set_halign(gtk::Align::Center);
                             hide_action.set_valign(gtk::Align::Center);
@@ -1393,26 +1412,10 @@ fn build(application: &Application) {
                                 // would by then name a different application.
                                 let id = app.id.clone();
 
-                                {
-                                    let st = st.clone();
-                                    let holder = holder2.clone();
-                                    let visible = visible_hide_action.clone();
-                                    let machine = m.name.clone();
-                                    let id = id.clone();
-                                    hide_action.connect_clicked(move |_| {
-                                        *visible.borrow_mut() = None;
-                                        let mut state = st.borrow_mut();
-                                        let changed = state.hide_app(&machine, &id);
-                                        state.clamp();
-                                        drop(state);
-                                        if changed && let Some(render) = holder.borrow().as_ref() {
-                                            render();
-                                        }
-                                    });
-                                }
-
                                 let hide_action_for_click = hide_action.clone();
                                 let visible = visible_hide_action.clone();
+                                let armed = armed_hide.clone();
+                                let machine_name = m.name.clone();
                                 let click = gtk::GestureClick::new();
                                 // Every button, so middle and right arrive here too rather than
                                 // only the primary one.
@@ -1431,10 +1434,42 @@ fn build(application: &Application) {
                                             previous.set_visible(false);
                                         }
                                         hide_action_for_click.set_visible(true);
+                                        *armed.borrow_mut() =
+                                            Some((machine_name.clone(), id.clone()));
                                         return;
                                     }
                                     if button != 1 && button != 2 {
                                         return;
+                                    }
+
+                                    // ARMED MEANS HIDE, and only for the application that was
+                                    // armed: a primary click anywhere else disarms and does what it
+                                    // always did, so changing your mind costs one ordinary click
+                                    // rather than a gesture nobody would guess.
+                                    let armed_here = armed
+                                        .borrow()
+                                        .as_ref()
+                                        .is_some_and(|(am, ai)| *am == machine_name && *ai == id);
+                                    if armed_here && button == 1 {
+                                        *armed.borrow_mut() = None;
+                                        *visible.borrow_mut() = None;
+                                        hide_action_for_click.set_visible(false);
+                                        let mut state = st.borrow_mut();
+                                        let changed = state.hide_app(&machine_name, &id);
+                                        state.clamp();
+                                        drop(state);
+                                        if changed && let Some(rf) = holder2.borrow().as_ref() {
+                                            rf();
+                                        }
+                                        return;
+                                    }
+                                    // Clicking a DIFFERENT application disarms the one that was
+                                    // armed, so the marker is taken from whichever widget is
+                                    // showing it rather than from this one.
+                                    if armed.borrow_mut().take().is_some()
+                                        && let Some(previous) = visible.borrow_mut().take()
+                                    {
+                                        previous.set_visible(false);
                                     }
 
                                     let mut st_mut = st.borrow_mut();
