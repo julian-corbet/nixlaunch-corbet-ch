@@ -41,6 +41,7 @@ use nixlaunch_core::{config, keymap, model, usage};
 
 type Callback = Rc<dyn Fn()>;
 type CallbackSlot = Rc<RefCell<Option<Callback>>>;
+type OutputPreference = Rc<dyn Fn(&[String])>;
 
 struct World {
     folders: Vec<String>,
@@ -431,9 +432,7 @@ fn preferred_monitor(outputs: &[String]) -> Option<gtk::gdk::Monitor> {
 /// Whether one already-lowercased configured name identifies this monitor.
 fn monitor_matches(monitor: &gtk::gdk::Monitor, wanted: &str) -> bool {
     let text = |value: Option<gtk::glib::GString>| {
-        value
-            .map(|s| s.trim().to_lowercase())
-            .unwrap_or_else(String::new)
+        value.map(|s| s.trim().to_lowercase()).unwrap_or_default()
     };
     if text(monitor.connector()) == wanted {
         return true;
@@ -820,7 +819,7 @@ fn build(application: &Application) {
     // make it work: a layer surface's output is decided at map time, and the size we want is the
     // one for the screen we are about to appear on -- computing it here means the first frame is
     // already the right size instead of being corrected a frame later, in front of you.
-    let prefer_output: Rc<dyn Fn(&[String])> = Rc::new({
+    let prefer_output: OutputPreference = Rc::new({
         let window = window.clone();
         let apply_monitor = apply_monitor.clone();
         let layered = surface_mode == "layer" && std::env::var_os("NIXLAUNCH_NO_LAYER").is_none();
