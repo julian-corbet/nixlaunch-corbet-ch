@@ -124,7 +124,8 @@ for line in lines:
         f = dict(p.split("=", 1) for p in line.split()[1:])
         cur.append(f)
     elif line.startswith("render "):
-        renders.append(int(line.split("ms=")[1]))
+        f = dict(p.split("=", 1) for p in line.split()[1:])
+        renders.append((int(f["us"]), int(f.get("apps", 0))))
     elif line.startswith("inventory "):
         refreshes.append(dict(p.split("=", 1) for p in line.split()[1:]))
 if cur: settles.append(cur)
@@ -141,25 +142,34 @@ for i, group in enumerate(settles):
         failures.append(f"map {i+1} settled {len(group)} times (max 2): "
                         + ", ".join(g.get("size", "?") for g in group))
 
-# A size past its own cap means the cap is not being applied -- the launcher hanging off the edge
-# of the screen it is on, which on a layer surface cannot be dragged back.
+# IT MUST FIT ON THE SCREEN. That is the invariant worth asserting: a layer surface has no titlebar,
+# so whatever hangs off the edge is unreachable by any means.
 #
-# UNLESS THE CONTENT CANNOT BE NARROWER. The window has an irreducible minimum: the search bar can
-# be squeezed only so far, and below that the label column and padding are all that is left. On a
-# screen small enough that the minimum exceeds the cap, exceeding it is the honest outcome and not
-# a defect -- so the trace carries the measured minimum and the assertion asks the exact question.
+# NOT against the cap. The cap bounds the SCROLLER's content, and the window is that content plus
+# its chrome -- so a grid that genuinely reaches its cap produces a window wider than the cap by the
+# root padding, every time, correctly. Asserting window-versus-cap fails such a grid for being
+# right, which is exactly what this check did until a realistic fixture showed a 1764px window
+# against a 1728px cap on a 1920px screen.
+#
+# UNLESS THE CONTENT CANNOT BE NARROWER: the search bar squeezes only so far, and on a screen
+# smaller than the irreducible minimum, overflowing is the honest outcome rather than a defect.
 for i, group in enumerate(settles):
     for f in group:
         w, _ = (int(x) for x in f["size"].split("x"))
-        cw, _ = (int(x) for x in f["cap"].split("x"))
+        sw, _ = (int(x) for x in f["screen"].split("x"))
         floor = int(f.get("min", 0))
-        if w > cw and w > floor:
+        if w > sw and w > floor:
             failures.append(
-                f"map {i+1} width {w} exceeds cap {cw} on {f.get('output')} "
+                f"map {i+1} width {w} overflows the {sw}px {f.get('output')} "
                 f"while the content could have been {floor}")
 
-if renders and max(renders) > 40:
-    failures.append(f"cached render took {max(renders)}ms (budget 40ms): {renders}")
+# Rebuilding the grid is the one thing that happens on every reveal AND on every keystroke, so it is
+# the number that decides whether this feels immediate. Measured on the real 199-application grid it
+# is 6-9ms; the budget is generous enough not to fail on a loaded builder, tight enough to catch a
+# change that makes it quadratic.
+worst = max((us for us, _ in renders), default=0)
+if worst > 40_000:
+    failures.append(f"a grid rebuild took {worst}us (budget 40000us): {renders}")
 
 # The fixture is a constant, so a refresh that reports a change is comparing something incidental
 # -- ordering, a timestamp -- and every open would pay a second full rebuild of the grid.
@@ -167,7 +177,8 @@ for r in refreshes:
     if r.get("changed") == "true":
         failures.append("a static inventory reported changed=true, forcing a second render")
 
-print(f"maps={maps} settles={[len(g) for g in settles]} render_ms={renders} refresh={refreshes}")
+print(f"maps={maps} settles={[len(g) for g in settles]} "
+      f"rebuilds={[f'{us}us/{n}apps' for us, n in renders]} refresh={refreshes}")
 if failures:
     for f in failures: print("FAIL:", f, file=sys.stderr)
     sys.exit(1)

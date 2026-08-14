@@ -745,6 +745,7 @@ fn build(application: &Application) {
         let width_fraction = theme.max_width_fraction;
         let height_fraction = theme.max_height_fraction;
         move |monitor: &gtk::gdk::Monitor| {
+            let t_settle = std::time::Instant::now();
             let geometry = monitor.geometry();
             if geometry.width() <= 0 || geometry.height() <= 0 {
                 return;
@@ -786,8 +787,11 @@ fn build(application: &Application) {
             let (_, height, _, _) = root.measure(gtk::Orientation::Vertical, width);
             window.set_default_size(width, height);
             trace(format_args!(
-                "settle output={} size={}x{} cap={}x{} min={}",
+                "settle us={} output={} screen={}x{} size={}x{} cap={}x{} min={}",
+                t_settle.elapsed().as_micros(),
                 monitor.connector().unwrap_or_default(),
+                geometry.width(),
+                geometry.height(),
                 width,
                 height,
                 width_cap,
@@ -1183,6 +1187,7 @@ fn build(application: &Application) {
         let terminal_cmd = terminal_cmd_outer.clone();
         let dismiss = dismiss.clone();
         move || {
+            let t_render = std::time::Instant::now();
             let s = state.borrow();
 
             // Every handle recorded below belongs to a widget that is about to be destroyed, so the
@@ -1623,8 +1628,18 @@ fn build(application: &Application) {
             // The selection classes are NOT set above. Painting them is the other function's job,
             // and doing it here as well would be a second implementation of the same rule, free to
             // disagree with the first the moment either changes.
+            let drawn: usize = s
+                .view
+                .iter()
+                .flat_map(|m| m.cells.iter().flatten())
+                .map(|l| l.apps.len())
+                .sum();
             drop(s);
             paint();
+            trace(format_args!(
+                "render us={} apps={drawn}",
+                t_render.elapsed().as_micros()
+            ));
         }
     });
     *render_holder.borrow_mut() = Some(render.clone());
@@ -1673,7 +1688,6 @@ fn build(application: &Application) {
                 s.clamp();
             }
             render();
-            trace(format_args!("render ms={}", t_reveal.elapsed().as_millis()));
 
             // Reading one small local JSON file is bounded work and belongs here on the GTK thread;
             // inventory remains in the worker below. Only model inputs reload live: folders,
