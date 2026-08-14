@@ -13,7 +13,7 @@
     {
       packages = forAll (pkgs: {
         nixlaunch = pkgs.callPackage ./package.nix { };
-        default = self.packages.${pkgs.system}.nixlaunch;
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.nixlaunch;
       });
 
       # The module takes `pkgs` from the consumer's own home-manager tree, not from this flake's
@@ -27,7 +27,7 @@
 
       checks = forAll (pkgs: {
         # `cargo test` runs as the package's own checkPhase, so building this IS running the suite.
-        build = self.packages.${pkgs.system}.nixlaunch;
+        build = self.packages.${pkgs.stdenv.hostPlatform.system}.nixlaunch;
 
         # The module's own behaviour, evaluated -- see checks/module.nix for what and why.
         module = import ./checks/module.nix { inherit pkgs; lib = pkgs.lib; };
