@@ -1040,7 +1040,9 @@ fn build(application: &Application) {
             };
             let hidden = s.hidden_count();
             if hidden == 0 {
-                hint.set_markup(&format!("{base_hint}   <b>right-click</b> then click to hide"));
+                hint.set_markup(&format!(
+                    "{base_hint}   <b>right-click</b> then click to hide"
+                ));
             } else {
                 hint.set_markup(&format!(
                     "{base_hint}   <b>right-click</b> then click to hide   <b>Ctrl+Shift+H</b> show all ({hidden})"
