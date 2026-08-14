@@ -104,6 +104,7 @@ window {{ background-color: {ground}; color: {fg}; }}
 .line.sel {{ background-color: alpha({accent}, 0.10); }}
 .app {{ padding: 3px 6px; border-radius: 4px; }}
 .app.sel {{ background-color: alpha({accent}, 0.20); }}
+.app.arming {{ background-color: alpha({error}, 0.22); box-shadow: inset 0 0 0 1px {error}; }}
 /* HOVER IS NOT SELECTION. Weaker than .sel and a different weight, so the thing the keyboard is
    on and the thing the pointer is over can never be mistaken for each other. */
 .app:hover {{ background-color: alpha({fg}, 0.10); }}
@@ -124,6 +125,7 @@ window {{ background-color: {ground}; color: {fg}; }}
         dim = t.dim,
         accent = t.accent,
         border = t.border,
+        error = t.error,
     )
 }
 
@@ -1190,7 +1192,11 @@ fn build(application: &Application) {
     // notice. Making it inert and letting the ARMED application's own click gesture perform the
     // hide removes the contention instead of trying to win it -- the same gesture that has always
     // launched reliably, so the path is known good.
-    let visible_hide_action = Rc::new(RefCell::new(None::<Image>));
+    // THE MARKER AND THE CHIP IT BELONGS TO. The chip is what gets clicked, so the chip is what has
+    // to look armed: an eye over a 20px icon says something is possible, not that this whole
+    // application is now the button. Both are held so arming the next one un-arms this one
+    // completely, rather than leaving a tinted chip with no marker on it.
+    let visible_hide_action = Rc::new(RefCell::new(None::<(Image, GBox)>));
 
     // WHICH application is armed, by identity rather than by widget: the grid is rebuilt whenever
     // the query changes or a drag lands, so a widget handle would outlive the thing it stood for.
@@ -1504,6 +1510,11 @@ fn build(application: &Application) {
                                 let id = app.id.clone();
 
                                 let hide_action_for_click = hide_action.clone();
+                                // WEAK, because this controller is attached to the very widget it
+                                // refers to. A strong handle would be a reference cycle, and the
+                                // grid is torn down and rebuilt on every render -- so it would leak
+                                // an application box per chip per render, not just once.
+                                let chip = b.downgrade();
                                 let visible = visible_hide_action.clone();
                                 let armed = armed_hide.clone();
                                 let machine_name = m.name.clone();
@@ -1518,13 +1529,16 @@ fn build(application: &Application) {
                                     g.set_state(gtk::EventSequenceState::Claimed);
 
                                     if button == 3 {
-                                        if let Some(previous) = visible
+                                        let Some(chip) = chip.upgrade() else { return };
+                                        if let Some((marker, previous)) = visible
                                             .borrow_mut()
-                                            .replace(hide_action_for_click.clone())
+                                            .replace((hide_action_for_click.clone(), chip.clone()))
                                         {
-                                            previous.set_visible(false);
+                                            marker.set_visible(false);
+                                            previous.remove_css_class("arming");
                                         }
                                         hide_action_for_click.set_visible(true);
+                                        chip.add_css_class("arming");
                                         *armed.borrow_mut() =
                                             Some((machine_name.clone(), id.clone()));
                                         return;
@@ -1543,8 +1557,10 @@ fn build(application: &Application) {
                                         .is_some_and(|(am, ai)| *am == machine_name && *ai == id);
                                     if armed_here && button == 1 {
                                         *armed.borrow_mut() = None;
-                                        *visible.borrow_mut() = None;
-                                        hide_action_for_click.set_visible(false);
+                                        if let Some((marker, chip)) = visible.borrow_mut().take() {
+                                            marker.set_visible(false);
+                                            chip.remove_css_class("arming");
+                                        }
                                         let mut state = st.borrow_mut();
                                         let changed = state.hide_app(&machine_name, &id);
                                         state.clamp();
@@ -1558,9 +1574,10 @@ fn build(application: &Application) {
                                     // armed, so the marker is taken from whichever widget is
                                     // showing it rather than from this one.
                                     if armed.borrow_mut().take().is_some()
-                                        && let Some(previous) = visible.borrow_mut().take()
+                                        && let Some((marker, chip)) = visible.borrow_mut().take()
                                     {
-                                        previous.set_visible(false);
+                                        marker.set_visible(false);
+                                        chip.remove_css_class("arming");
                                     }
 
                                     let mut st_mut = st.borrow_mut();
@@ -1827,6 +1844,8 @@ fn build(application: &Application) {
         let terminal_cmd = terminal_cmd_outer.clone();
         let keys_map = keys_map.clone();
         let layout = layout.clone();
+        let armed_hide = armed_hide.clone();
+        let visible_hide_action = visible_hide_action.clone();
         keys.connect_key_pressed(move |_, key, _, mods| {
             let shift = mods.contains(ModifierType::SHIFT_MASK);
             // WHAT the key means comes from the keymap, not from this match. GTK reports the
@@ -1868,6 +1887,18 @@ fn build(application: &Application) {
                     // Esc unwinds one layer at a time rather than always closing: a typed query is
                     // state the user can lose accidentally, so it gets its own step.
                     (_, Some(keymap::Action::Cancel)) => {
+                        // ARMED FIRST, and before the query, because it is the most recent thing the
+                        // user did and the only one that is about to remove something. Escape has
+                        // always meant "back out of the last step"; without this rung the way out of
+                        // arming was to click some other application, which is a strange thing to
+                        // have to know.
+                        if armed_hide.borrow_mut().take().is_some() {
+                            if let Some((marker, chip)) = visible_hide_action.borrow_mut().take() {
+                                marker.set_visible(false);
+                                chip.remove_css_class("arming");
+                            }
+                            return gtk::glib::Propagation::Stop;
+                        }
                         if !s.query.is_empty() {
                             s.set_query(String::new());
                         } else if s.focus == Focus::Inside {

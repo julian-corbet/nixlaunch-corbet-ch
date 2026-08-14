@@ -47,13 +47,14 @@ Every arrangement is saved.
 
 ## Visibility
 
-Right-click an application to arm it — a compact eye-slash marker appears over its icon — then
-click it to hide it on that machine. A primary click on anything else disarms and does what it
-always did, so changing your mind costs one ordinary click.
+Right-click an application to arm it: the whole entry takes on the error colour and an eye-slash
+marker appears over its icon. Click it to hide it on that machine. `Esc` disarms, and so does a
+click on anything else — which then does what it always did, so changing your mind is free.
 
-The marker takes no input of its own. It is drawn over the icon and is deliberately inert: the
-application's own click gesture performs the hide, which is the same gesture that launches, so the
-two cannot contend for one press. Hiding is persistent user state, not an inventory or
+The **whole entry** is the target, not the marker. The marker is inert by construction and takes no
+input at all: the application's own click gesture performs the hide, which is the same gesture that
+launches it, so the two cannot contend for one press. An affordance the size of an icon, overlapping
+a drag source, is how this went wrong the first time — the eye appeared and clicking it did nothing. Hiding is persistent user state, not an inventory or
 placement edit: the application stays hidden across refreshes and deployments, while its folder,
 line and position remain intact underneath. `Ctrl+Shift+H` shows every hidden application again,
 restored to those exact positions.
