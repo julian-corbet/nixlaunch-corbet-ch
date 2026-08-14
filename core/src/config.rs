@@ -362,6 +362,26 @@ pub struct Config {
     #[serde(default = "default_keyboard")]
     pub keyboard: String,
 
+    /// Which output to open on, in order of preference. EMPTY BY DEFAULT, and that default is the
+    /// honest one: outputs are equal, the compositor already knows which screen you are working
+    /// on, and a launcher that overrides that without being asked is worse than one that does not
+    /// try. This exists for the setup where the compositor's answer is not the wanted one.
+    ///
+    /// Each entry is matched, case-insensitively, against a monitor's CONNECTOR (`DP-1`,
+    /// `HDMI-A-1`), its MODEL (`DELL U4323QE`), and `manufacturer model` joined. The first entry
+    /// that matches a connected monitor wins; entries naming nothing currently attached are
+    /// skipped, and a list that matches nothing falls back to the compositor's choice. So a laptop
+    /// that is sometimes docked names the dock's screen first and needs no second configuration
+    /// for the times it is carried away.
+    ///
+    /// MATCHING THE MODEL IS WHY THIS IS NOT JUST A CONNECTOR LIST. One physical screen plugged
+    /// into two machines is `DP-1` on one and `HDMI-A-1` on the other, and the connector also moves
+    /// when a cable does -- so a connector list has to be rewritten per machine and re-checked
+    /// after every replug, while the model is the same string everywhere and keeps meaning the
+    /// same screen.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+
     /// argv that wraps a program declaring `Terminal=true` -- e.g. `["foot", "-e"]`.
     ///
     /// Not guessed, and not defaulted to some popular emulator: the right answer is whatever
@@ -452,6 +472,9 @@ impl Config {
             if !(0.0 < value && value <= 1.0) {
                 return Err(format!("theme.{name} must be greater than 0 and at most 1"));
             }
+        }
+        if self.outputs.iter().any(|o| o.trim().is_empty()) {
+            return Err("outputs must not contain empty names".to_string());
         }
         if self.machines.iter().any(|m| m.name.trim().is_empty()) {
             return Err("machine names must not be empty".to_string());
@@ -678,6 +701,30 @@ mod tests {
         .unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.contains("unique case-insensitively"), "{error}");
+    }
+
+    #[test]
+    fn no_configured_outputs_means_the_compositor_decides() {
+        let config: Config = serde_json::from_str(r#"{"machines":[]}"#).unwrap();
+        assert!(config.outputs.is_empty());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_output_preference_keeps_the_order_it_was_written_in() {
+        let config: Config =
+            serde_json::from_str(r#"{"machines":[],"outputs":["DELL U4323QE","eDP-1"]}"#).unwrap();
+        // The order IS the preference, so it must survive parsing exactly -- a set or a map here
+        // would silently make the second screen as good as the first.
+        assert_eq!(config.outputs, vec!["DELL U4323QE", "eDP-1"]);
+    }
+
+    #[test]
+    fn a_blank_output_name_is_rejected_rather_than_matching_everything() {
+        let config: Config =
+            serde_json::from_str(r#"{"machines":[],"outputs":["DP-1","  "]}"#).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("outputs"), "{error}");
     }
 
     #[test]

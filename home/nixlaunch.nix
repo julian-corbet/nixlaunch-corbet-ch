@@ -149,6 +149,34 @@ in
       '';
     };
 
+    outputs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "DELL U4323QE" "eDP-1" ];
+      description = ''
+        Which screen to open on, in order of preference. Empty — the default — means outputs are
+        equal and the compositor decides, which is the right default: it already knows which screen
+        is being worked on, and a launcher that overrides that uninvited is worse than one that
+        never tries.
+
+        Set it for the desk where that answer is reliably wrong. A large screen beside a small
+        vertical one is the usual case: the launcher belongs on the large one every time, whatever
+        happened to hold focus.
+
+        Each entry is matched case-insensitively against a monitor's connector (`DP-1`,
+        `HDMI-A-1`), its model (`DELL U4323QE`), and `manufacturer model` joined. The first entry
+        matching a connected monitor wins; entries naming nothing currently attached are skipped,
+        and a list matching nothing falls back to the compositor's choice — so a laptop that is
+        sometimes docked names the dock's screen first and needs no second configuration for the
+        times it is carried away.
+
+        PREFER THE MODEL over the connector. One physical screen plugged into two machines is
+        `DP-1` on one and `HDMI-A-1` on the other, and the connector moves when a cable does, so a
+        connector list has to be written per machine and re-checked after every replug. The model
+        is the same string everywhere and keeps meaning the same screen.
+      '';
+    };
+
     subrows = lib.mkOption {
       type = lib.types.attrsOf (lib.types.listOf (lib.types.submodule {
         options = {
@@ -542,7 +570,8 @@ in
     # schema, so anything that type-checks here serialises correctly by construction and there is
     # no second place for the two to disagree.
     xdg.configFile."nixlaunch/config.json".text = builtins.toJSON ({
-      inherit (cfg) folders subrows terminal keyboard surface exit_on_focus_loss keys theme layout;
+      inherit (cfg) folders subrows terminal keyboard surface exit_on_focus_loss keys theme layout
+        outputs;
       machines = map
         (m: { inherit (m) name aliases accent inventory inventory_timeout_ms launch; })
         cfg.machines;

@@ -376,6 +376,52 @@ fn main() {
     application.run_with_args(&argv);
 }
 
+/// The first configured output that is actually attached, if any.
+///
+/// Matched case-insensitively against three names for the same screen, because which one a person
+/// has to hand differs: the CONNECTOR (`DP-1`, `HDMI-A-1`) is what a compositor prints, the MODEL
+/// (`DELL U4323QE`) is what the screen calls itself, and `manufacturer model` is how a settings
+/// panel usually renders it. Only the model survives being plugged into another machine or another
+/// port, so accepting all three is what lets one configured value mean one physical screen.
+fn preferred_monitor(outputs: &[String]) -> Option<gtk::gdk::Monitor> {
+    if outputs.is_empty() {
+        return None;
+    }
+    let display = gtk::gdk::Display::default()?;
+    let monitors = display.monitors();
+    let attached: Vec<gtk::gdk::Monitor> = (0..monitors.n_items())
+        .filter_map(|i| monitors.item(i).and_downcast::<gtk::gdk::Monitor>())
+        .collect();
+    // ORDER COMES FROM THE CONFIG, not from the display list: the outer loop is the preference and
+    // the inner one is merely what is plugged in. Iterating the monitors outside would return
+    // whichever screen the compositor happens to list first among the matches, which is exactly the
+    // arbitrary answer this option exists to replace.
+    outputs.iter().find_map(|wanted| {
+        let wanted = wanted.trim().to_lowercase();
+        attached
+            .iter()
+            .find(|monitor| monitor_names(monitor).iter().any(|name| *name == wanted))
+            .cloned()
+    })
+}
+
+/// Every name one monitor answers to, lowercased, with the blanks dropped.
+fn monitor_names(monitor: &gtk::gdk::Monitor) -> Vec<String> {
+    let text = |value: Option<gtk::glib::GString>| {
+        value
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_else(String::new)
+    };
+    let connector = text(monitor.connector());
+    let model = text(monitor.model());
+    let manufacturer = text(monitor.manufacturer());
+    let full = format!("{manufacturer} {model}").trim().to_string();
+    [connector, model, full]
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 fn build(application: &Application) {
     let World {
         folders,
@@ -589,84 +635,153 @@ fn build(application: &Application) {
     // the top and bottom are simply unreachable, since a layer surface has no titlebar to drag.
     // Two thirds leaves the session visible behind it, which is most of why this is an overlay
     // rather than a window.
-    // Before the surface maps GTK cannot tell us which output the compositor will choose. Use the
-    // largest as the initial width so a launcher on that output does not map narrow and stay
-    // narrow (GTK top levels do not grow merely because a ScrolledWindow's maximum increases).
-    // The output-enter handler below then shrinks the mapped surface when the compositor chose a
-    // smaller one. Height remains conservative from the outset because covering the display
-    // vertically is the less recoverable failure.
-    let extreme = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32, want_max: bool| {
+    // Before the surface maps GTK cannot tell us which output the compositor will choose, so the
+    // opening cap is the SMALLEST attached one on BOTH axes. Overflowing a panel is the failure
+    // with no way out -- a layer surface has no titlebar to drag, so whatever went past the edge
+    // is simply gone -- where a window that maps too small corrects itself one signal later, as
+    // soon as the compositor names the output it actually put us on.
+    let smallest = |pick: fn(&gtk::gdk::Rectangle) -> i32, fallback: i32| {
         gtk::gdk::Display::default()
             .map(|d| {
                 let ms = d.monitors();
-                let values = (0..ms.n_items())
+                (0..ms.n_items())
                     .filter_map(|i| ms.item(i).and_downcast::<gtk::gdk::Monitor>())
                     .map(|m| pick(&m.geometry()))
-                    .filter(|v| *v > 0);
-                if want_max {
-                    values.max().unwrap_or(fallback)
-                } else {
-                    values.min().unwrap_or(fallback)
-                }
+                    .filter(|v| *v > 0)
+                    .min()
+                    .unwrap_or(fallback)
             })
             .unwrap_or(fallback)
     };
-    let screen_h = extreme(|g| g.height(), 1080, false);
-    let screen_w = extreme(|g| g.width(), 1920, true);
+    let screen_h = smallest(|g| g.height(), 1080);
+    let screen_w = smallest(|g| g.width(), 1920);
     scroller.set_max_content_height((screen_h as f64 * theme.max_height_fraction) as i32);
     // The width cap is the same rule as the height one and exists for the same reason: content is
     // allowed to decide the window's size right up to the point where it would put part of itself
     // off the screen, and past that it scrolls instead.
     scroller.set_max_content_width((screen_w as f64 * theme.max_width_fraction) as i32);
 
-    // Once realised, listen for the compositor assigning the surface to an output. Replace the
-    // conservative initial cap with that output's width rather than the largest output attached
-    // to the session. Using the largest made a launcher opened on a smaller panel wider than the
-    // panel itself; using the smallest forever needlessly hid columns on a larger screen.
-    // `enter-monitor` is authoritative when the backend emits it after our handler is connected.
-    // Some Wayland backends deliver the first enter while the surface is being realised, so a
-    // one-shot probe after the initial layer configure covers that ordering without making every
-    // reveal pay for polling.
-    {
+    // THE OUTPUT WE ARE ACTUALLY ON -- on every map, on both axes, in both directions.
+    //
+    // This ran once from `realize` and could only ever make the window smaller. Both halves were
+    // wrong for a resident daemon, and together they left the launcher stuck at the size of the
+    // smallest screen attached to the session:
+    //
+    //   * A daemon starts HIDDEN, so its surface is realised without ever being mapped. Asking an
+    //     unmapped surface which output it is on does not fail, it answers -- with whichever
+    //     output owns the origin. Beside a large landscape screen, a small portrait panel at 0,0
+    //     won that question every time, and nothing about the answer looked wrong.
+    //   * The cap was then applied with `set_default_width`, which PINS a toplevel's size. A later
+    //     reveal on the large output could raise the ScrolledWindow's maximum all it liked; the
+    //     window had a remembered size and kept it, holding whole machine columns off the right
+    //     edge for the rest of the session.
+    //
+    // `enter-monitor` is the authority now and it fires on every map, height comes from that same
+    // output instead of a global minimum, and the new size is requested by dropping the remembered
+    // one and re-measuring -- the same mechanism that sized the window in the first place, which
+    // is why it grows as readily as it shrinks.
+    let apply_monitor: Rc<dyn Fn(&gtk::gdk::Monitor)> = Rc::new({
         let scroller = scroller.clone();
-        let fraction = theme.max_width_fraction;
+        let root = root.clone();
+        let window = window.clone();
+        let width_fraction = theme.max_width_fraction;
+        let height_fraction = theme.max_height_fraction;
+        move |monitor: &gtk::gdk::Monitor| {
+            let geometry = monitor.geometry();
+            if geometry.width() <= 0 || geometry.height() <= 0 {
+                return;
+            }
+            scroller.set_max_content_width((geometry.width() as f64 * width_fraction) as i32);
+            scroller.set_max_content_height((geometry.height() as f64 * height_fraction) as i32);
+            // MEASURE, THEN ASK FOR EXACTLY THAT -- rather than clearing the size and hoping the
+            // window follows its content down.
+            //
+            // It will not. Dropping the default size lets a toplevel GROW, because GTK has to
+            // honour a minimum that just increased, and that half works on its own. Shrinking is
+            // not symmetric: a mapped toplevel keeps whatever size it has, and a smaller cap
+            // merely leaves the ScrolledWindow with room to spare, so the window sails on at its
+            // old width with most of it hanging off the side of a smaller screen. Only an explicit
+            // request moves it in both directions, and the size to request is the one the content
+            // would have chosen anyway, now that the caps describe the output we are really on.
+            let (_, width, _, _) = root.measure(gtk::Orientation::Horizontal, -1);
+            let (_, height, _, _) = root.measure(gtk::Orientation::Vertical, width);
+            window.set_default_size(width, height);
+        }
+    });
+
+    {
+        let apply_monitor = apply_monitor.clone();
         window.connect_realize(move |w| {
             let Some(surface) = w.surface() else { return };
-            let apply_monitor: Rc<dyn Fn(&gtk::gdk::Monitor)> = Rc::new({
-                let scroller = scroller.clone();
-                let window = w.clone();
-                move |monitor| {
-                    let width = monitor.geometry().width();
-                    if width <= 0 {
-                        return;
-                    }
-                    let cap = (width as f64 * fraction) as i32;
-                    scroller.set_max_content_width(cap);
-                    scroller.queue_resize();
-                    if window.width() > cap {
-                        window.set_default_width(cap);
-                    }
-                }
-            });
             surface.connect_enter_monitor({
                 let apply_monitor = apply_monitor.clone();
                 move |_, monitor| apply_monitor(monitor)
             });
-            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(100), {
-                let surface = surface.clone();
+            // A BACKSTOP FOR BACKENDS THAT ENTER EARLY. Some deliver the first `enter` while the
+            // surface is still being realised -- before the handler above exists -- so that map
+            // would keep the pre-map guess with no signal ever arriving to correct it. Probing
+            // shortly after each map covers that ordering, and it is guarded on being mapped
+            // because an unmapped surface is exactly the question that produced the wrong answer
+            // above.
+            w.connect_map({
                 let apply_monitor = apply_monitor.clone();
-                move || {
-                    let Some(display) = gtk::gdk::Display::default() else {
-                        return;
-                    };
-                    let Some(monitor) = display.monitor_at_surface(&surface) else {
-                        return;
-                    };
-                    apply_monitor(&monitor);
+                move |w| {
+                    let window = w.clone();
+                    let apply_monitor = apply_monitor.clone();
+                    gtk::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(100),
+                        move || {
+                            if !window.is_mapped() {
+                                return;
+                            }
+                            let (Some(surface), Some(display)) =
+                                (window.surface(), gtk::gdk::Display::default())
+                            else {
+                                return;
+                            };
+                            if let Some(monitor) = display.monitor_at_surface(&surface) {
+                                apply_monitor(&monitor);
+                            }
+                        },
+                    );
                 }
             });
         });
     }
+
+    // WHICH SCREEN IT OPENS ON, when the compositor's answer is not the wanted one.
+    //
+    // Nothing configured is the default and means the compositor decides, which is right: it knows
+    // where you are working and a launcher that overrides that uninvited is worse than one that
+    // never tries. `outputs` is for the desk where that answer is reliably wrong -- a big screen
+    // beside a small vertical one, where the launcher wants to be on the big one every time
+    // regardless of which window happened to have focus.
+    //
+    // Applied on EVERY reveal rather than once, and before `present`, because both halves are what
+    // make it work: a layer surface's output is decided at map time, and the size we want is the
+    // one for the screen we are about to appear on -- computing it here means the first frame is
+    // already the right size instead of being corrected a frame later, in front of you.
+    let prefer_output: Rc<dyn Fn(&[String])> = Rc::new({
+        let window = window.clone();
+        let apply_monitor = apply_monitor.clone();
+        let layered = surface_mode == "layer" && std::env::var_os("NIXLAUNCH_NO_LAYER").is_none();
+        move |outputs: &[String]| {
+            let Some(monitor) = preferred_monitor(outputs) else {
+                // Either nothing is configured, or what is configured is not plugged in right now.
+                // Hand the decision back rather than pinning the launcher to a screen that is not
+                // there -- which is how a docked-desk preference would otherwise open a window
+                // nobody can see once the laptop is carried away.
+                if layered {
+                    window.set_monitor(None);
+                }
+                return;
+            };
+            if layered {
+                window.set_monitor(Some(&monitor));
+            }
+            apply_monitor(&monitor);
+        }
+    });
 
     let grid = gtk::Grid::new();
     // NOT column-homogeneous. That makes EVERY column the same width including column 0, which
@@ -1386,6 +1501,7 @@ fn build(application: &Application) {
         let render = render.clone();
         let arm_focus = arm_focus.clone();
         let layout = layout.clone();
+        let prefer_output = prefer_output.clone();
         // LAST KNOWN GOOD. Home Manager replaces the file atomically, but direct editors need not;
         // a parse failure during a save must not replace the coherent grid with fixtures or empty
         // columns. The next reveal tries again. This also lets a daemon started before config.json
@@ -1427,6 +1543,10 @@ fn build(application: &Application) {
             let Some(cfg) = latest_config else {
                 return;
             };
+            // BEFORE THE `present` that follows this closure returns to. A layer surface's output
+            // is decided at map time, so an output preference applied afterwards would not take
+            // effect until the reveal after the one that read it.
+            prefer_output(&cfg.outputs);
             let generation = refresh_generation.get().wrapping_add(1);
             refresh_generation.set(generation);
             let latest = refresh_generation.clone();
@@ -1729,6 +1849,14 @@ fn build(application: &Application) {
     // happened to be added at the same moment as the change that actually worked.
     if !start_hidden() {
         arm_focus();
+        // The daemon reaches this through `reveal` instead; a one-shot start has no reveal to be
+        // carried by, so it applies the preference for itself before its only map.
+        prefer_output(
+            &loaded_config
+                .as_ref()
+                .map(|c| c.outputs.clone())
+                .unwrap_or_default(),
+        );
         window.present();
     }
 }
