@@ -771,9 +771,27 @@ fn build(application: &Application) {
         let apply_monitor = apply_monitor.clone();
         window.connect_realize(move |w| {
             let Some(surface) = w.surface() else { return };
+            // ONCE PER MAP, and this guard is load-bearing rather than tidiness.
+            //
+            // A window large enough to overlap two outputs gets `enter-monitor` for both. Sizing
+            // for the second changes which outputs it overlaps, which delivers another enter, which
+            // resizes it back: measured on a two-output session, one open resized the window five
+            // times, alternating between the two caps before settling. Every one of those is a full
+            // re-measure and relayout of the whole grid, and it is visible.
+            //
+            // The surface does not migrate while it is up -- a launcher is opened, used and
+            // dismissed -- so the first output named after a map is the answer, and later enters
+            // for the same showing have nothing to add. The flag reopens on the next map.
+            let settled = Rc::new(std::cell::Cell::new(false));
             surface.connect_enter_monitor({
                 let apply_monitor = apply_monitor.clone();
-                move |_, monitor| apply_monitor(monitor)
+                let settled = settled.clone();
+                move |_, monitor| {
+                    if settled.replace(true) {
+                        return;
+                    }
+                    apply_monitor(monitor);
+                }
             });
             // A BACKSTOP FOR BACKENDS THAT ENTER EARLY. Some deliver the first `enter` while the
             // surface is still being realised -- before the handler above exists -- so that map
@@ -783,7 +801,12 @@ fn build(application: &Application) {
             // above.
             w.connect_map({
                 let apply_monitor = apply_monitor.clone();
+                let settled = settled.clone();
                 move |w| {
+                    // A new showing is a new question: the launcher may well be opened on a
+                    // different screen than it was last time, and the guard above must not answer
+                    // for a map it never saw.
+                    settled.set(false);
                     let window = w.clone();
                     let apply_monitor = apply_monitor.clone();
                     gtk::glib::timeout_add_local_once(
