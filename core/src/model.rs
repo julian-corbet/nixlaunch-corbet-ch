@@ -692,18 +692,31 @@ impl State {
         });
 
         let lines = folders.entry(target_label).or_default();
-        match target_line {
-            Some(li) => {
-                // An unfindable neighbour appends rather than panicking. It happens legitimately:
-                // `before` names what was rendered next, and that app may be filtered out of the
-                // stored line, or on a different one entirely.
-                let at = before
-                    .and_then(|b| lines[li].apps().iter().position(|n| n == b))
-                    .unwrap_or(lines[li].apps().len());
-                lines[li].apps_mut().insert(at, app.to_string());
-            }
-            // No anchor, or the line it named is gone: give the app a line of its own, which is
-            // also what dropping on a cell's background means.
+        // THE GAP IS RESOLVED IN THE VECTOR, NOT INSIDE THE ANCHOR'S STORED LINE.
+        //
+        // A row is one ordered vector and its visual lines are presentation: `reflow_vectors`
+        // concatenates the folder's stored lines and re-splits the result into whatever shape the
+        // layout asks for. One visual line therefore spans several stored ones as soon as the
+        // vector is long enough, and `before` -- the app the pointer landed in front of -- is then
+        // routinely on a different stored line from the anchor. Looking for it only inside the
+        // anchor's line found nothing and fell through to "append", so the app landed at the end
+        // of a line the user never pointed at. A name is unique within a folder, so searching the
+        // whole of it puts the app exactly in the gap that was chosen.
+        let at = before
+            .and_then(|b| {
+                lines
+                    .iter()
+                    .enumerate()
+                    .find_map(|(li, l)| l.apps().iter().position(|n| n == b).map(|i| (li, i)))
+            })
+            // An unfindable neighbour appends to the anchor's line rather than panicking. It
+            // happens legitimately: `before` names what was rendered next, and that app may be
+            // filtered out of the stored arrangement, or in another folder entirely.
+            .or_else(|| target_line.map(|li| (li, lines[li].apps().len())));
+        match at {
+            Some((li, i)) => lines[li].apps_mut().insert(i, app.to_string()),
+            // No anchor and no neighbour to sit in front of: give the app a line of its own, which
+            // is also what dropping on a cell's background means.
             None => lines.push(StoredLine::Bare(vec![app.to_string()])),
         }
 
@@ -1171,12 +1184,18 @@ pub fn launch_argv(machine: &Machine, app: &App, terminal: &[String]) -> Option<
     Some(argv)
 }
 
-/// Order each cell by how often things are actually used -- WITHOUT sorting it.
+/// Order each cell's vector by how often things are actually used -- WITHOUT sorting it.
 ///
-/// Two levels, both through the same significance gate, so nothing moves on noise:
-///   * items on a line, by their own score;
-///   * lines within a cell, by the sum of their apps -- an appset you start often should rise as
-///     a unit, since starting the line is one action;
+/// ONE PASS OVER THE WHOLE CELL, by each app's own score and through the significance gate, so
+/// nothing moves on noise. A cell IS one ordered vector: `reflow_vectors` concatenates its stored
+/// lines and re-splits the result into the visual lines the layout asks for, so a stored line is
+/// bookkeeping rather than anything a person can see. Ranking those lines by the sum of their apps
+/// therefore ordered invisible chunks -- two cells holding the same apps with the same scores came
+/// out in different orders purely because the arrangement happened to split them differently, and
+/// nothing the user had done explained the difference.
+///
+/// The stored lines keep their lengths and their names: this pass owns ORDER, and `reflow_vectors`
+/// owns presentation.
 ///
 /// Folder order never participates. It is explicitly declared configuration and therefore part of
 /// the launcher's learnable spatial layout; statistics may arrange a folder's contents, not move
@@ -1185,23 +1204,16 @@ pub fn apply_usage(machines: &mut [Machine], u: &Usage, now: u64, z: f64, hl: f6
     for m in machines.iter_mut() {
         let name = m.name.clone();
         for cell in m.cells.iter_mut() {
-            for line in cell.iter_mut() {
-                usage::reorder_stable(
-                    &mut line.apps,
-                    |a| usage::score_of(u, &name, &a.id, now, hl),
-                    z,
-                );
+            let lengths: Vec<usize> = cell.iter().map(|l| l.apps.len()).collect();
+            let mut apps: Vec<App> = cell
+                .iter_mut()
+                .flat_map(|l| std::mem::take(&mut l.apps))
+                .collect();
+            usage::reorder_stable(&mut apps, |a| usage::score_of(u, &name, &a.id, now, hl), z);
+            let mut apps = apps.into_iter();
+            for (line, length) in cell.iter_mut().zip(lengths) {
+                line.apps = apps.by_ref().take(length).collect();
             }
-            usage::reorder_stable(
-                cell,
-                |l| {
-                    l.apps
-                        .iter()
-                        .map(|a| usage::score_of(u, &name, &a.id, now, hl))
-                        .sum::<f64>()
-                },
-                z,
-            );
         }
     }
 }
@@ -1893,6 +1905,74 @@ mod tests {
         assert!(
             !with_alpha.apps().contains(&"delta".to_string()),
             "did NOT join the filtered-away one: {lines:?}"
+        );
+    }
+
+    /// A drop lands in the gap the pointer chose, even when that gap is on another stored line.
+    ///
+    /// The row here is three stored lines and one visual line, which is the ordinary case for any
+    /// short vector the user has arranged in pieces. `before` names the app the pointer sat in
+    /// front of, and it belongs to the last of those stored lines while the anchor belongs to the
+    /// first -- so a position resolved inside the anchor's line does not exist, and the app is
+    /// appended to a line nobody pointed at instead of landing where it was dropped.
+    #[test]
+    fn a_drop_lands_at_the_pointer_across_stored_lines() {
+        let mut m = machine("m", 0, vec![vec!["a"], vec!["b"], vec!["c"]]);
+        m.cells[6] = vec![Line {
+            name: None,
+            apps: vec![app("x")],
+        }];
+        let mut s = state(vec![m]);
+        assert_eq!(
+            s.view[0].cells[0].len(),
+            1,
+            "precondition: three stored lines are drawn as one visual line"
+        );
+
+        s.place_app(0, "x", 0, Some(&on(&["a", "b", "c"])), Some("c"));
+
+        let order: Vec<&str> = s.view[0].cells[0]
+            .iter()
+            .flat_map(|l| l.apps.iter())
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(order, vec!["a", "b", "x", "c"], "landed in front of c");
+    }
+
+    /// Frecency orders the row's vector, and a stored line is not something the user can see.
+    ///
+    /// Both machines hold the same three applications with the same scores and differ only in how
+    /// the arrangement splits them. Ranking whole stored lines by their summed scores let that
+    /// invisible split decide the outcome, so two identical rows came out in two different orders.
+    #[test]
+    fn frecency_orders_the_vector_not_the_stored_lines() {
+        let mut s = state(vec![
+            machine("one", 0, vec![vec!["rare", "popular", "mid"]]),
+            machine("two", 0, vec![vec!["rare"], vec!["popular", "mid"]]),
+        ]);
+        // Enough launches that the significance gate is cleared and the order really does move.
+        for _ in 0..60 {
+            s.record_launch_for_test("one", "popular");
+            s.record_launch_for_test("two", "popular");
+        }
+        s.rebuild();
+
+        let order = |m: &Machine| -> Vec<String> {
+            m.cells[0]
+                .iter()
+                .flat_map(|l| l.apps.iter())
+                .map(|a| a.name.clone())
+                .collect()
+        };
+        assert_eq!(
+            order(&s.view[0]),
+            ["popular", "rare", "mid"],
+            "popular rose past the one it beats, and no further"
+        );
+        assert_eq!(
+            order(&s.view[1]),
+            order(&s.view[0]),
+            "the same vector with the same scores, however it happens to be stored"
         );
     }
 
