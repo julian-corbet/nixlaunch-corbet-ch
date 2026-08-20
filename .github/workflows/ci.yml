@@ -20,6 +20,9 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A job that hangs must fail on its own clock instead of holding a runner until GitHub's
+    # six-hour default gives up. Sized at roughly 3x this job's observed p95 duration.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -48,4 +51,9 @@ jobs:
       # -L streams build logs. Without it a failed test or lint surfaces as "derivation failed"
       # with the useful assertion folded away, which is the difference between reading CI and
       # rerunning it.
-      - run: nix flake check -L
+      #
+      # --keep-going stops the first failing check from aborting the ones that have not run yet.
+      # Tests, rustfmt, clippy and the module suite are independent gates; without it a clippy
+      # lint hides whether the tests pass, so a red run costs one rerun per problem. The run
+      # still goes red -- the other gates just get to report their own result too.
+      - run: nix flake check -L --keep-going
