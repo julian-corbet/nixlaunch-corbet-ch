@@ -5,3 +5,5 @@ The default selection is `native,headless`. Native Linux success does not certif
 Additional coverage limits:
 
 - Existing Crow performs real headless compositor behavior only; preserve safe private compositor socket proof and add native package checks separately.
+
+Hosted Actions keeps the full portable workflow available for manual fallback.
